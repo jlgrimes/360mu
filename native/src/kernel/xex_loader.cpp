@@ -248,7 +248,7 @@ Status XexLoader::parse_optional_headers(const u8* data, u32 size, u32 count) {
                 break;
                 
             case XexHeaderId::kImportLibraries:
-                parse_import_libraries(data, value);
+                parse_import_libraries(data, value, size);
                 break;
                 
             case XexHeaderId::kOriginalPeName:
@@ -300,20 +300,38 @@ Status XexLoader::parse_security_info(const u8* data, u32 offset) {
     return Status::Ok;
 }
 
-Status XexLoader::parse_import_libraries(const u8* data, u32 offset) {
+Status XexLoader::parse_import_libraries(const u8* data, u32 offset, u32 data_size) {
+    if (offset + 8 > data_size) {
+        LOGW("Import table offset 0x%08X exceeds data size", offset);
+        return Status::Ok;  // Not fatal, just skip imports
+    }
+    
     const u8* ptr = data + offset;
+    const u8* data_end = data + data_size;
     
     u32 string_table_size = read_u32_be(ptr); ptr += 4;
     u32 library_count = read_u32_be(ptr); ptr += 4;
+    
+    // Sanity check
+    if (library_count > 100 || string_table_size > 0x10000) {
+        LOGW("Suspicious import table values: %u libs, %u string bytes (possibly encrypted XEX)",
+             library_count, string_table_size);
+        return Status::Ok;  // Skip imports
+    }
     
     // String table follows
     const char* strings = reinterpret_cast<const char*>(ptr);
     ptr += string_table_size;
     
+    if (ptr >= data_end) {
+        LOGW("Import string table exceeds data");
+        return Status::Ok;
+    }
+    
     LOGD("Import libraries: %u libraries, %u bytes of strings",
          library_count, string_table_size);
     
-    for (u32 i = 0; i < library_count; i++) {
+    for (u32 i = 0; i < library_count && ptr + 40 <= data_end; i++) {
         XexImportLibrary lib;
         
         u32 name_offset = read_u32_be(ptr); ptr += 4;
@@ -331,8 +349,14 @@ Status XexLoader::parse_import_libraries(const u8* data, u32 offset) {
         
         lib.import_count = read_u32_be(ptr); ptr += 4;
         
+        // Sanity check import count
+        if (lib.import_count > 10000) {
+            LOGW("Suspicious import count %u for %s", lib.import_count, lib.name.c_str());
+            break;
+        }
+        
         // Read imports
-        for (u32 j = 0; j < lib.import_count; j++) {
+        for (u32 j = 0; j < lib.import_count && ptr + 4 <= data_end; j++) {
             u32 import_addr = read_u32_be(ptr); ptr += 4;
             lib.imports.push_back(import_addr);
         }

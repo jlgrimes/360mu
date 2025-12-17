@@ -284,6 +284,11 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
     )
     target_link_libraries(test_iso x360mu_core)
     
+    add_executable(extract_xex
+        tools/extract_xex.cpp
+    )
+    target_link_libraries(extract_xex x360mu_core)
+    
     # Level 2: XEX Load Test
     add_executable(test_xex_load
         tools/test_xex_load.cpp

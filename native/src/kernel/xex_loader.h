@@ -282,7 +282,7 @@ private:
     Status parse_headers(const u8* data, u32 size);
     Status parse_optional_headers(const u8* data, u32 size, u32 count);
     Status parse_security_info(const u8* data, u32 offset);
-    Status parse_import_libraries(const u8* data, u32 offset);
+    Status parse_import_libraries(const u8* data, u32 offset, u32 data_size);
     Status parse_pe_image(const u8* data, u32 offset, u32 size);
     
     // Decompression
