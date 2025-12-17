@@ -414,6 +414,19 @@ TEST_F(ThreadingTest, TlsAllocFree) {
 }
 
 TEST_F(ThreadingTest, TlsSetGetValue) {
+    // TLS requires a current thread - create one first
+    u32 handle = 0;
+    u32 thread_id = 0;
+    u32 status = thread_mgr_->create_thread(
+        &handle, 64 * 1024, &thread_id,
+        0, 0x82000000, 0, 0  // Entry point, no suspend
+    );
+    ASSERT_EQ(status, nt::STATUS_SUCCESS);
+    ASSERT_NE(handle, 0u);
+    
+    // Run the scheduler to make the thread "current"
+    scheduler_->run(1);  // Run 1 cycle to pick up the thread
+    
     u32 slot = thread_mgr_->tls_alloc();
     ASSERT_NE(slot, nt::TLS_OUT_OF_INDEXES);
     
@@ -424,6 +437,9 @@ TEST_F(ThreadingTest, TlsSetGetValue) {
     // Get value back
     u64 value = thread_mgr_->tls_get_value(slot);
     EXPECT_EQ(value, 0xDEADBEEF12345678ULL);
+    
+    // Clean up
+    thread_mgr_->close_handle(handle);
 }
 
 //=============================================================================

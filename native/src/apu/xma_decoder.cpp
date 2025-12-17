@@ -1103,8 +1103,10 @@ void XmaProcessor::enable_context(u32 context_id) {
     ctx.input_buffer_read_offset = 0;
     ctx.samples_decoded = 0;
     ctx.frames_decoded = 0;
-    hw_ctx.buffer_0_consumed = false;
-    hw_ctx.buffer_1_consumed = false;
+    
+    // Mark empty buffers (size 0) as consumed immediately
+    hw_ctx.buffer_0_consumed = (ctx.input_buffer_0_size == 0);
+    hw_ctx.buffer_1_consumed = (ctx.input_buffer_1_size == 0);
     
     // Create mixer voice if not already created
     if (mixer_ && hw_ctx.voice_id == UINT32_MAX) {
@@ -1327,7 +1329,17 @@ void XmaProcessor::write_pcm_output(HardwareContext& hw_ctx, const s16* pcm_data
 }
 
 XmaProcessor::Stats XmaProcessor::get_stats() const {
-    return stats_;
+    Stats current_stats = stats_;
+    
+    // Count active contexts on demand
+    current_stats.active_contexts = 0;
+    for (u32 i = 0; i < MAX_CONTEXTS; i++) {
+        if (contexts_[i] && contexts_[i]->ctx->active) {
+            current_stats.active_contexts++;
+        }
+    }
+    
+    return current_stats;
 }
 
 } // namespace x360mu

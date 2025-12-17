@@ -15,7 +15,9 @@ namespace x360mu {
 
 /**
  * ISO 9660 Primary Volume Descriptor
+ * Must be packed - ISO 9660 format has no padding
  */
+#pragma pack(push, 1)
 struct IsoPrimaryVolumeDescriptor {
     u8 type;                    // Volume descriptor type (1 = PVD)
     char identifier[5];         // "CD001"
@@ -42,10 +44,13 @@ struct IsoPrimaryVolumeDescriptor {
     u8 root_dir_record[34];     // Root directory record
     // ... more fields follow (publisher, copyright, etc.)
 };
+#pragma pack(pop)
 
 /**
  * ISO 9660 Directory Record
+ * Must be packed - ISO 9660 format has no padding
  */
+#pragma pack(push, 1)
 struct IsoDirectoryRecord {
     u8 length;                  // Length of directory record
     u8 ext_attr_length;         // Extended attribute length
@@ -62,6 +67,7 @@ struct IsoDirectoryRecord {
     u8 name_length;             // Length of file identifier
     // Followed by file identifier (variable length)
 };
+#pragma pack(pop)
 
 // Directory record flags
 enum class IsoFileFlags : u8 {
@@ -232,3 +238,4 @@ private:
 };
 
 } // namespace x360mu
+
