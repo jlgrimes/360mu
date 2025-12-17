@@ -32,46 +32,132 @@ struct GpuConfig {
 };
 
 /**
- * Xenos register addresses (subset)
+ * Xenos register addresses (complete list)
  */
 namespace xenos_reg {
-    // Ring buffer
+    // Ring buffer control
     constexpr u32 CP_RB_BASE = 0x0700;
     constexpr u32 CP_RB_CNTL = 0x0701;
     constexpr u32 CP_RB_RPTR_ADDR = 0x070C;
     constexpr u32 CP_RB_RPTR = 0x070D;
     constexpr u32 CP_RB_WPTR = 0x070E;
+    constexpr u32 CP_RB_WPTR_DELAY = 0x070F;
     
-    // Render state
+    // Command processor
+    constexpr u32 CP_ME_CNTL = 0x0000;
+    constexpr u32 CP_ME_STATUS = 0x0001;
+    constexpr u32 CP_RB_RPTR_WR = 0x0702;
+    constexpr u32 CP_IB1_BASE = 0x0705;
+    constexpr u32 CP_IB1_BUFSZ = 0x0706;
+    constexpr u32 CP_IB2_BASE = 0x0707;
+    constexpr u32 CP_IB2_BUFSZ = 0x0708;
+    constexpr u32 CP_ST_BASE = 0x044D;
+    constexpr u32 CP_ST_BUFSZ = 0x044E;
+    
+    // Render backend
     constexpr u32 RB_MODECONTROL = 0x2210;
     constexpr u32 RB_SURFACE_INFO = 0x2211;
     constexpr u32 RB_COLORCONTROL = 0x2212;
     constexpr u32 RB_COLOR_INFO = 0x2213;
     constexpr u32 RB_DEPTH_INFO = 0x2214;
+    constexpr u32 RB_STENCILREFMASK = 0x2215;
+    constexpr u32 RB_COLOR_MASK = 0x2216;
+    constexpr u32 RB_BLENDCONTROL = 0x2217;
+    constexpr u32 RB_COLOR1_INFO = 0x221A;
+    constexpr u32 RB_COLOR2_INFO = 0x221B;
+    constexpr u32 RB_COLOR3_INFO = 0x221C;
+    constexpr u32 RB_ALPHA_REF = 0x221E;
+    constexpr u32 RB_DEPTHCONTROL = 0x2230;
+    constexpr u32 RB_BLEND_RED = 0x2231;
+    constexpr u32 RB_BLEND_GREEN = 0x2232;
+    constexpr u32 RB_BLEND_BLUE = 0x2233;
+    constexpr u32 RB_BLEND_ALPHA = 0x2234;
+    constexpr u32 RB_COPY_CONTROL = 0x2238;
+    constexpr u32 RB_COPY_DEST_BASE = 0x2239;
+    constexpr u32 RB_COPY_DEST_PITCH = 0x223A;
+    constexpr u32 RB_COPY_DEST_INFO = 0x223B;
+    constexpr u32 RB_SAMPLE_COUNT_CTL = 0x2243;
+    constexpr u32 RB_EDRAM_INFO = 0x2244;
     
-    // Shader control
-    constexpr u32 SQ_PROGRAM_CNTL = 0x2280;
+    // Shader sequencer
+    constexpr u32 SQ_PROGRAM_CNTL = 0x2180;
+    constexpr u32 SQ_CONTEXT_MISC = 0x2181;
+    constexpr u32 SQ_INTERPOLATOR_CNTL = 0x2182;
     constexpr u32 SQ_VS_PROGRAM = 0x2200;
     constexpr u32 SQ_PS_PROGRAM = 0x2201;
+    constexpr u32 SQ_VS_CONST = 0x2308;
+    constexpr u32 SQ_PS_CONST = 0x2309;
+    constexpr u32 SQ_CF_BOOLEANS = 0x2310;
+    constexpr u32 SQ_CF_LOOP = 0x2311;
+    constexpr u32 SQ_WRAPPING_0 = 0x2312;
+    constexpr u32 SQ_WRAPPING_1 = 0x2313;
     
     // Texture state
     constexpr u32 FETCH_CONST_BASE = 0x4800;
+    constexpr u32 SQ_TEX_SAMPLER_0 = 0x5000;
     
-    // Vertex format
+    // Vertex generation
+    constexpr u32 VGT_MAX_VTX_INDX = 0x2300;
+    constexpr u32 VGT_MIN_VTX_INDX = 0x2301;
+    constexpr u32 VGT_INDX_OFFSET = 0x2302;
+    constexpr u32 VGT_OUTPUT_PATH_CNTL = 0x2303;
+    constexpr u32 VGT_HOS_CNTL = 0x2304;
+    constexpr u32 VGT_HOS_MAX_TESS_LEVEL = 0x2305;
+    constexpr u32 VGT_HOS_MIN_TESS_LEVEL = 0x2306;
+    constexpr u32 VGT_HOS_REUSE_DEPTH = 0x2307;
+    constexpr u32 VGT_GROUP_PRIM_TYPE = 0x2308;
+    constexpr u32 VGT_GROUP_FIRST_DECR = 0x2309;
+    constexpr u32 VGT_GROUP_DECR = 0x230A;
+    constexpr u32 VGT_GROUP_VECT_0_CNTL = 0x230B;
+    constexpr u32 VGT_GROUP_VECT_1_CNTL = 0x230C;
+    constexpr u32 VGT_GROUP_VECT_0_FMT_CNTL = 0x230D;
+    constexpr u32 VGT_GROUP_VECT_1_FMT_CNTL = 0x230E;
+    constexpr u32 VGT_DRAW_INITIATOR = 0x2314;
+    constexpr u32 VGT_IMMED_DATA = 0x2315;
     constexpr u32 VGT_VERTEX_REUSE_BLOCK_CNTL = 0x2316;
-    constexpr u32 VGT_OUTPUT_PATH_CNTL = 0x2300;
+    constexpr u32 VGT_OUT_DEALLOC_CNTL = 0x2317;
+    constexpr u32 VGT_MULTI_PRIM_IB_RESET_INDX = 0x2318;
     
-    // Viewport
+    // Viewport/clip
+    constexpr u32 PA_CL_VTE_CNTL = 0x2006;
     constexpr u32 PA_CL_VPORT_XSCALE = 0x2100;
     constexpr u32 PA_CL_VPORT_XOFFSET = 0x2101;
     constexpr u32 PA_CL_VPORT_YSCALE = 0x2102;
     constexpr u32 PA_CL_VPORT_YOFFSET = 0x2103;
     constexpr u32 PA_CL_VPORT_ZSCALE = 0x2104;
     constexpr u32 PA_CL_VPORT_ZOFFSET = 0x2105;
+    constexpr u32 PA_CL_CLIP_CNTL = 0x2110;
+    constexpr u32 PA_CL_GB_VERT_CLIP_ADJ = 0x2120;
+    constexpr u32 PA_CL_GB_VERT_DISC_ADJ = 0x2121;
+    constexpr u32 PA_CL_GB_HORZ_CLIP_ADJ = 0x2122;
+    constexpr u32 PA_CL_GB_HORZ_DISC_ADJ = 0x2123;
     
-    // Screen scissor
+    // Scissor
     constexpr u32 PA_SC_SCREEN_SCISSOR_TL = 0x2080;
     constexpr u32 PA_SC_SCREEN_SCISSOR_BR = 0x2081;
+    constexpr u32 PA_SC_WINDOW_OFFSET = 0x2082;
+    constexpr u32 PA_SC_WINDOW_SCISSOR_TL = 0x2083;
+    constexpr u32 PA_SC_WINDOW_SCISSOR_BR = 0x2084;
+    constexpr u32 PA_SC_CLIPRECT_RULE = 0x2085;
+    constexpr u32 PA_SC_CLIPRECT_0_TL = 0x2086;
+    constexpr u32 PA_SC_CLIPRECT_0_BR = 0x2087;
+    constexpr u32 PA_SC_VIZ_QUERY = 0x20C0;
+    
+    // Setup unit
+    constexpr u32 PA_SU_SC_MODE_CNTL = 0x2200;
+    constexpr u32 PA_SU_POLY_OFFSET_FRONT_SCALE = 0x2201;
+    constexpr u32 PA_SU_POLY_OFFSET_FRONT_OFFSET = 0x2202;
+    constexpr u32 PA_SU_POLY_OFFSET_BACK_SCALE = 0x2203;
+    constexpr u32 PA_SU_POLY_OFFSET_BACK_OFFSET = 0x2204;
+    constexpr u32 PA_SU_POINT_SIZE = 0x2205;
+    constexpr u32 PA_SU_POINT_MINMAX = 0x2206;
+    constexpr u32 PA_SU_LINE_CNTL = 0x2207;
+    constexpr u32 PA_SU_VTX_CNTL = 0x2208;
+    constexpr u32 PA_SU_PERFCOUNTER0_SELECT = 0x2300;
+    
+    // eDRAM
+    constexpr u32 RB_EDRAM_BASE = 0x0040;
+    constexpr u32 RB_BC_CONTROL = 0x0041;
 }
 
 /**

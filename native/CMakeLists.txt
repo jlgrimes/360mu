@@ -52,6 +52,8 @@ set(CPU_SOURCES
     src/cpu/xenon/cpu.cpp
     src/cpu/xenon/decoder.cpp
     src/cpu/xenon/interpreter.cpp
+    src/cpu/xenon/interpreter_extended.cpp
+    src/cpu/xenon/threading.cpp
     src/cpu/vmx128/vmx.cpp
 )
 
@@ -66,6 +68,7 @@ endif()
 set(GPU_SOURCES
     src/gpu/xenos/command_processor.cpp
     src/gpu/xenos/shader_translator.cpp
+    src/gpu/xenos/spirv_builder.cpp
     src/gpu/xenos/edram.cpp
     src/gpu/xenos/texture.cpp
     src/gpu/vulkan/vulkan_backend.cpp
@@ -78,8 +81,10 @@ set(APU_SOURCES
 
 set(KERNEL_SOURCES
     src/kernel/hle/xboxkrnl.cpp
+    src/kernel/hle/xboxkrnl_extended.cpp
     src/kernel/hle/xam.cpp
     src/kernel/xex_loader.cpp
+    src/kernel/xex_crypto.cpp
 )
 
 set(MEMORY_SOURCES

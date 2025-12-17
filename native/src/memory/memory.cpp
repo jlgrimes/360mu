@@ -564,6 +564,40 @@ void Memory::notify_write(GuestAddr addr, u64 size) {
             track.callback(addr, size);
         }
     }
+    
+    // Clear reservation if write overlaps
+    if (has_reservation_) {
+        if (addr < reservation_addr_ + reservation_size_ && 
+            addr + size > reservation_addr_) {
+            has_reservation_ = false;
+        }
+    }
+}
+
+// Atomic reservation support
+void Memory::set_reservation(GuestAddr addr, u32 size) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    reservation_addr_ = addr;
+    reservation_size_ = size;
+    has_reservation_ = true;
+}
+
+bool Memory::check_reservation(GuestAddr addr, u32 size) const {
+    if (!has_reservation_) return false;
+    return (addr == reservation_addr_ && size == reservation_size_);
+}
+
+void Memory::clear_reservation() {
+    has_reservation_ = false;
+}
+
+// Time base support
+u64 Memory::get_time_base() const {
+    return time_base_.load(std::memory_order_relaxed);
+}
+
+void Memory::advance_time_base(u64 cycles) {
+    time_base_.fetch_add(cycles, std::memory_order_relaxed);
 }
 
 } // namespace x360mu

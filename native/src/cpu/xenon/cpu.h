@@ -240,9 +240,13 @@ private:
     
     // Instruction handlers
     void exec_integer(ThreadContext& ctx, const DecodedInst& inst);
+    void exec_integer_ext31(ThreadContext& ctx, const DecodedInst& inst);
     void exec_load_store(ThreadContext& ctx, const DecodedInst& inst);
+    void exec_load_store_ds(ThreadContext& ctx, const DecodedInst& inst);
     void exec_branch(ThreadContext& ctx, const DecodedInst& inst);
     void exec_float(ThreadContext& ctx, const DecodedInst& inst);
+    void exec_float_complete(ThreadContext& ctx, const DecodedInst& inst);
+    void exec_rotate64(ThreadContext& ctx, const DecodedInst& inst);
     void exec_vector(ThreadContext& ctx, const DecodedInst& inst);
     void exec_system(ThreadContext& ctx, const DecodedInst& inst);
     

@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <functional>
 #include <mutex>
+#include <atomic>
 
 namespace x360mu {
 
@@ -157,6 +158,35 @@ public:
      */
     void untrack_writes(GuestAddr base);
     
+    // ----- Atomic/reservation support -----
+    
+    /**
+     * Set reservation for lwarx/ldarx
+     */
+    void set_reservation(GuestAddr addr, u32 size);
+    
+    /**
+     * Check reservation for stwcx./stdcx.
+     */
+    bool check_reservation(GuestAddr addr, u32 size) const;
+    
+    /**
+     * Clear reservation
+     */
+    void clear_reservation();
+    
+    // ----- Time base -----
+    
+    /**
+     * Get current time base value (64-bit counter)
+     */
+    u64 get_time_base() const;
+    
+    /**
+     * Increment time base by cycles
+     */
+    void advance_time_base(u64 cycles);
+    
     // ----- Fastmem support -----
     
     /**
@@ -205,6 +235,14 @@ private:
     
     // Thread safety
     mutable std::mutex mutex_;
+    
+    // Reservation for atomic ops
+    GuestAddr reservation_addr_ = 0;
+    u32 reservation_size_ = 0;
+    bool has_reservation_ = false;
+    
+    // Time base counter
+    std::atomic<u64> time_base_{0};
     
     // Internal helpers
     bool is_mmio(GuestAddr addr) const;
