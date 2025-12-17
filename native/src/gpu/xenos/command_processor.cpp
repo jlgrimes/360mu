@@ -1,27 +1,79 @@
 /**
  * 360μ - Xbox 360 Emulator for Android
  * 
- * Xenos GPU Command Processor Implementation
+ * GPU Command Processor Implementation
+ * Parses and executes PM4 command packets from the GPU ring buffer
+ * 
+ * PM4 is the packet format used by ATI/AMD GPUs (inherited from R500)
  */
 
 #include "command_processor.h"
-#include "../vulkan/vulkan_backend.h"
-#include "../../memory/memory.h"
+#include "shader_translator.h"
+#include "texture.h"
+#include "gpu/vulkan/vulkan_backend.h"
+#include "memory/memory.h"
+#include <cstring>
 
 #ifdef __ANDROID__
 #include <android/log.h>
-#define LOG_TAG "360mu-gpu"
+#define LOG_TAG "360mu-cmdproc"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #else
 #include <cstdio>
-#define LOGI(...) printf("[GPU] " __VA_ARGS__); printf("\n")
-#define LOGE(...) fprintf(stderr, "[GPU ERROR] " __VA_ARGS__); fprintf(stderr, "\n")
-#define LOGD(...)
+#define LOGI(...) printf("[CMDPROC] " __VA_ARGS__); printf("\n")
+#define LOGE(...) fprintf(stderr, "[CMDPROC ERROR] " __VA_ARGS__); fprintf(stderr, "\n")
+#define LOGD(...) /* debug disabled */
 #endif
 
 namespace x360mu {
+
+//=============================================================================
+// PM4 Packet Types
+//=============================================================================
+
+// Extract packet type from header (bits 30-31)
+inline PacketType get_packet_type(u32 header) {
+    return static_cast<PacketType>((header >> 30) & 0x3);
+}
+
+// Type 0: Register write
+// Bits 0-15: Base register address
+// Bits 16-29: Count - 1
+inline u32 type0_base_index(u32 header) {
+    return header & 0x7FFF;
+}
+
+inline u32 type0_count(u32 header) {
+    return ((header >> 16) & 0x3FFF) + 1;
+}
+
+inline bool type0_one_reg_wr(u32 header) {
+    return (header >> 15) & 1;  // Write same register multiple times
+}
+
+// Type 2: NOP (padding)
+// No data
+
+// Type 3: Command packet
+// Bits 0-7: Opcode
+// Bits 16-29: Count (dwords of data following header)
+inline PM4Opcode type3_opcode(u32 header) {
+    return static_cast<PM4Opcode>(header & 0xFF);
+}
+
+inline u32 type3_count(u32 header) {
+    return ((header >> 16) & 0x3FFF);
+}
+
+inline bool type3_predicate(u32 header) {
+    return (header >> 8) & 1;
+}
+
+//=============================================================================
+// CommandProcessor Implementation
+//=============================================================================
 
 CommandProcessor::CommandProcessor() {
     registers_.fill(0);
@@ -31,22 +83,29 @@ CommandProcessor::CommandProcessor() {
     loop_constants_.fill(0);
 }
 
-CommandProcessor::~CommandProcessor() = default;
+CommandProcessor::~CommandProcessor() {
+    shutdown();
+}
 
 Status CommandProcessor::initialize(Memory* memory, VulkanBackend* vulkan,
-                                   ShaderTranslator* shader_translator,
-                                   TextureCache* texture_cache) {
+                                    ShaderTranslator* shader_translator,
+                                    TextureCache* texture_cache) {
     memory_ = memory;
     vulkan_ = vulkan;
     shader_translator_ = shader_translator;
     texture_cache_ = texture_cache;
+    
+    reset();
     
     LOGI("Command processor initialized");
     return Status::Ok;
 }
 
 void CommandProcessor::shutdown() {
-    LOGI("Command processor shutdown");
+    memory_ = nullptr;
+    vulkan_ = nullptr;
+    shader_translator_ = nullptr;
+    texture_cache_ = nullptr;
 }
 
 void CommandProcessor::reset() {
@@ -55,28 +114,46 @@ void CommandProcessor::reset() {
     pixel_constants_.fill(0.0f);
     bool_constants_.fill(0);
     loop_constants_.fill(0);
+    
+    render_state_ = {};
     frame_complete_ = false;
     in_frame_ = false;
     packets_processed_ = 0;
     draws_this_frame_ = 0;
 }
 
+void CommandProcessor::set_register(u32 index, u32 value) {
+    if (index < registers_.size()) {
+        registers_[index] = value;
+    }
+}
+
+void CommandProcessor::write_register(u32 index, u32 value) {
+    set_register(index, value);
+    on_register_write(index, value);
+}
+
 bool CommandProcessor::process(GuestAddr ring_base, u32 ring_size, u32& read_ptr, u32 write_ptr) {
     frame_complete_ = false;
-    draws_this_frame_ = 0;
     
-    // Process packets until we catch up with write pointer
+    // Process packets until read catches up to write
     while (read_ptr != write_ptr) {
+        // Calculate address in ring buffer (ring buffer wraps)
         GuestAddr packet_addr = ring_base + (read_ptr * 4);
         
+        // Execute packet and get number of dwords consumed
         u32 packets_consumed = 0;
         execute_packet(packet_addr, packets_consumed);
         
-        // Advance read pointer (wrap around ring buffer)
-        read_ptr = (read_ptr + packets_consumed) % (ring_size / 4);
+        if (packets_consumed == 0) {
+            LOGE("Packet processing stalled at %08X", packet_addr);
+            packets_consumed = 1;  // Skip to prevent infinite loop
+        }
+        
+        // Advance read pointer (with wrap)
+        read_ptr = (read_ptr + packets_consumed) % ring_size;
         packets_processed_++;
         
-        // Check if frame was completed
         if (frame_complete_) {
             break;
         }
@@ -87,14 +164,18 @@ bool CommandProcessor::process(GuestAddr ring_base, u32 ring_size, u32& read_ptr
 
 u32 CommandProcessor::execute_packet(GuestAddr addr, u32& packets_consumed) {
     u32 header = read_cmd(addr);
-    
-    PacketType type = static_cast<PacketType>((header >> 30) & 0x3);
+    PacketType type = get_packet_type(header);
     
     switch (type) {
         case PacketType::Type0:
             execute_type0(header, addr + 4);
-            // Count is in bits 15:0
-            packets_consumed = 1 + (header & 0x3FFF) + 1;
+            packets_consumed = 1 + type0_count(header);
+            break;
+            
+        case PacketType::Type1:
+            // Reserved - shouldn't encounter
+            LOGE("Type 1 packet encountered (reserved)");
+            packets_consumed = 1;
             break;
             
         case PacketType::Type2:
@@ -104,12 +185,11 @@ u32 CommandProcessor::execute_packet(GuestAddr addr, u32& packets_consumed) {
             
         case PacketType::Type3:
             execute_type3(header, addr + 4);
-            // Count is in bits 15:0
-            packets_consumed = 1 + ((header >> 16) & 0x3FFF) + 1;
+            packets_consumed = 1 + type3_count(header);
             break;
             
         default:
-            LOGE("Unknown packet type: %d at 0x%08X", static_cast<int>(type), addr);
+            LOGE("Unknown packet type %d", static_cast<int>(type));
             packets_consumed = 1;
             break;
     }
@@ -118,45 +198,58 @@ u32 CommandProcessor::execute_packet(GuestAddr addr, u32& packets_consumed) {
 }
 
 void CommandProcessor::execute_type0(u32 header, GuestAddr data_addr) {
-    // Type 0: Register write
-    // bits 13:0 = base register index
-    // bits 15:14 = reserved
-    // bits 29:16 = count - 1
-    
-    u32 base_reg = header & 0x3FFF;
-    u32 count = ((header >> 16) & 0x3FFF) + 1;
+    u32 base_index = type0_base_index(header);
+    u32 count = type0_count(header);
+    bool one_reg = type0_one_reg_wr(header);
     
     for (u32 i = 0; i < count; i++) {
         u32 value = read_cmd(data_addr + i * 4);
-        write_register(base_reg + i, value);
+        u32 reg_index = one_reg ? base_index : (base_index + i);
+        
+        write_register(reg_index, value);
     }
 }
 
-void CommandProcessor::execute_type2(u32 header) {
-    // Type 2: NOP packet
-    // Just skip it
+void CommandProcessor::execute_type2(u32 /*header*/) {
+    // NOP - nothing to do
 }
 
 void CommandProcessor::execute_type3(u32 header, GuestAddr data_addr) {
-    // Type 3: IT_OPCODE packet
-    // bits 7:0 = opcode
-    // bits 15:8 = reserved
-    // bits 29:16 = count - 1
+    PM4Opcode opcode = type3_opcode(header);
+    u32 count = type3_count(header);
     
-    PM4Opcode opcode = static_cast<PM4Opcode>(header & 0xFF);
-    u32 count = ((header >> 16) & 0x3FFF) + 1;
+    // Check predication
+    if (type3_predicate(header)) {
+        // TODO: Check predicate register
+    }
     
     switch (opcode) {
         case PM4Opcode::NOP:
             // Nothing to do
             break;
             
-        case PM4Opcode::DRAW_INDX:
-            handle_draw_indx(data_addr, count);
+        case PM4Opcode::INTERRUPT:
+            // Signal interrupt to CPU
+            LOGD("GPU interrupt");
             break;
             
-        case PM4Opcode::DRAW_INDX_2:
-            handle_draw_indx_2(data_addr, count);
+        case PM4Opcode::WAIT_FOR_IDLE:
+            // Wait for GPU to finish - nothing to do in emulation
+            break;
+            
+        case PM4Opcode::WAIT_REG_MEM:
+            handle_wait_reg_mem(data_addr, count);
+            break;
+            
+        case PM4Opcode::REG_RMW:
+            // Read-modify-write register
+            {
+                u32 reg = read_cmd(data_addr);
+                u32 and_mask = read_cmd(data_addr + 4);
+                u32 or_mask = read_cmd(data_addr + 8);
+                u32 value = (registers_[reg] & and_mask) | or_mask;
+                write_register(reg, value);
+            }
             break;
             
         case PM4Opcode::LOAD_ALU_CONSTANT:
@@ -173,8 +266,29 @@ void CommandProcessor::execute_type3(u32 header, GuestAddr data_addr) {
             
         case PM4Opcode::SET_CONSTANT:
         case PM4Opcode::SET_CONSTANT2:
-        case PM4Opcode::SET_SHADER_CONSTANTS:
             handle_set_constant(data_addr, count);
+            break;
+            
+        case PM4Opcode::SET_SHADER_CONSTANTS:
+            // Similar to SET_CONSTANT but different format
+            handle_set_constant(data_addr, count);
+            break;
+            
+        case PM4Opcode::DRAW_INDX:
+            handle_draw_indx(data_addr, count);
+            break;
+            
+        case PM4Opcode::DRAW_INDX_2:
+            handle_draw_indx_2(data_addr, count);
+            break;
+            
+        case PM4Opcode::DRAW_INDX_IMMD:
+            // Draw with immediate indices
+            handle_draw_indx(data_addr, count);
+            break;
+            
+        case PM4Opcode::MEM_WRITE:
+            handle_mem_write(data_addr, count);
             break;
             
         case PM4Opcode::EVENT_WRITE:
@@ -183,449 +297,470 @@ void CommandProcessor::execute_type3(u32 header, GuestAddr data_addr) {
             handle_event_write(data_addr, count);
             break;
             
-        case PM4Opcode::MEM_WRITE:
-            handle_mem_write(data_addr, count);
-            break;
-            
-        case PM4Opcode::WAIT_REG_MEM:
-            handle_wait_reg_mem(data_addr, count);
-            break;
-            
-        case PM4Opcode::WAIT_FOR_IDLE:
-            // GPU synchronization - no-op in emulator
-            break;
-            
         case PM4Opcode::INDIRECT_BUFFER:
         case PM4Opcode::INDIRECT_BUFFER_PFD:
             handle_indirect_buffer(data_addr, count);
             break;
             
-        case PM4Opcode::INTERRUPT:
-            // Signal frame complete
-            frame_complete_ = true;
+        case PM4Opcode::ME_INIT:
+            // Microengine init - reset state
+            LOGD("ME_INIT");
             break;
             
-        case PM4Opcode::ME_INIT:
         case PM4Opcode::CP_INVALIDATE_STATE:
+            // Invalidate CP state cache
+            break;
+            
+        case PM4Opcode::VIZ_QUERY:
+            // Visibility query
+            break;
+            
         case PM4Opcode::CONTEXT_UPDATE:
-            // State management - mostly no-op
+            // Context update
             break;
             
         default:
-            LOGD("Unhandled PM4 opcode: 0x%02X", static_cast<u32>(opcode));
+            LOGD("Unhandled PM4 opcode: 0x%02X, count: %u", 
+                 static_cast<u32>(opcode), count);
             break;
     }
 }
 
+//=============================================================================
+// Type 3 Packet Handlers
+//=============================================================================
+
 void CommandProcessor::handle_draw_indx(GuestAddr data_addr, u32 count) {
-    // DRAW_INDX packet format:
-    // dword 0: VGT_DRAW_INITIATOR
-    // dword 1: size / primitive type
-    // dword 2: index base (for indexed draws)
-    // dword 3: index size
+    if (count < 2) return;
     
-    u32 dw0 = read_cmd(data_addr);
-    u32 dw1 = read_cmd(data_addr + 4);
+    // Parse draw command
+    u32 dword0 = read_cmd(data_addr);
+    u32 dword1 = read_cmd(data_addr + 4);
     
     DrawCommand cmd = {};
-    cmd.primitive_type = static_cast<PrimitiveType>((dw1 >> 8) & 0x3F);
-    cmd.index_count = dw1 & 0xFFFF;
-    cmd.indexed = (dw0 & 0x1) != 0;
+    cmd.primitive_type = static_cast<PrimitiveType>((dword0 >> 0) & 0x3F);
+    cmd.indexed = (dword0 >> 11) & 1;
+    cmd.index_count = dword1 & 0xFFFFFF;
+    cmd.index_size = ((dword0 >> 6) & 1) ? 4 : 2;  // 32-bit or 16-bit indices
     
     if (cmd.indexed && count >= 3) {
         cmd.index_base = read_cmd(data_addr + 8);
-        u32 dw3 = read_cmd(data_addr + 12);
-        cmd.index_size = ((dw3 >> 6) & 1) ? 4 : 2;
     }
     
+    // Update render state before drawing
+    update_render_state();
+    update_shaders();
+    update_textures();
+    update_vertex_buffers();
+    
+    // Execute the draw
     execute_draw(cmd);
 }
 
 void CommandProcessor::handle_draw_indx_2(GuestAddr data_addr, u32 count) {
-    // DRAW_INDX_2: Immediate indices in packet
-    u32 dw0 = read_cmd(data_addr);
+    if (count < 1) return;
+    
+    u32 dword0 = read_cmd(data_addr);
     
     DrawCommand cmd = {};
-    cmd.primitive_type = static_cast<PrimitiveType>((dw0 >> 8) & 0x3F);
-    cmd.index_count = dw0 & 0xFFFF;
-    cmd.indexed = true;
-    cmd.index_base = data_addr + 4;  // Indices follow in packet
-    cmd.index_size = 2;  // Always 16-bit for immediate
+    cmd.primitive_type = static_cast<PrimitiveType>((dword0 >> 0) & 0x3F);
+    cmd.indexed = false;
+    cmd.vertex_count = (dword0 >> 16) & 0xFFFF;
     
+    update_render_state();
+    update_shaders();
     execute_draw(cmd);
 }
 
 void CommandProcessor::handle_load_alu_constant(GuestAddr data_addr, u32 count) {
-    // Load shader constants from memory
-    u32 dw0 = read_cmd(data_addr);
+    if (count < 1) return;
+    
+    u32 info = read_cmd(data_addr);
+    u32 start_offset = info & 0x1FF;         // Starting constant index
+    u32 size_vec4 = ((info >> 16) & 0x1FF);  // Number of vec4s
     GuestAddr src_addr = read_cmd(data_addr + 4);
     
-    u32 start_reg = dw0 & 0x1FF;
-    u32 num_regs = (dw0 >> 16) & 0x1FF;
-    bool vertex = (dw0 >> 31) == 0;
+    // Determine if this is vertex or pixel constants
+    bool is_pixel = (info >> 31) & 1;
+    f32* dest = is_pixel ? pixel_constants_.data() : vertex_constants_.data();
     
-    f32* dest = vertex ? vertex_constants_.data() : pixel_constants_.data();
-    
-    for (u32 i = 0; i < num_regs * 4; i++) {
-        u32 raw = memory_->read_u32(src_addr + i * 4);
-        dest[(start_reg * 4) + i] = *reinterpret_cast<f32*>(&raw);
+    // Load constants from memory
+    for (u32 i = 0; i < size_vec4 && (start_offset + i) < 256; i++) {
+        u32 offset = (start_offset + i) * 4;
+        for (u32 j = 0; j < 4; j++) {
+            u32 raw = memory_->read_u32(src_addr + (i * 16) + (j * 4));
+            memcpy(&dest[offset + j], &raw, sizeof(f32));
+        }
     }
 }
 
 void CommandProcessor::handle_load_bool_constant(GuestAddr data_addr, u32 count) {
-    u32 dw0 = read_cmd(data_addr);
+    if (count < 1) return;
+    
+    u32 info = read_cmd(data_addr);
+    u32 start_bit = info & 0xFF;
     GuestAddr src_addr = read_cmd(data_addr + 4);
     
-    u32 start_reg = dw0 & 0xFF;
-    u32 num_regs = ((dw0 >> 16) & 0xFF) + 1;
-    
-    for (u32 i = 0; i < num_regs; i++) {
-        bool_constants_[start_reg + i] = memory_->read_u32(src_addr + i * 4);
+    // Load boolean constants (packed as bits)
+    u32 words_to_load = (count - 1);
+    for (u32 i = 0; i < words_to_load && (start_bit / 32 + i) < bool_constants_.size(); i++) {
+        bool_constants_[start_bit / 32 + i] = memory_->read_u32(src_addr + i * 4);
     }
 }
 
 void CommandProcessor::handle_load_loop_constant(GuestAddr data_addr, u32 count) {
-    u32 dw0 = read_cmd(data_addr);
+    if (count < 1) return;
+    
+    u32 info = read_cmd(data_addr);
+    u32 start_index = info & 0x1F;
     GuestAddr src_addr = read_cmd(data_addr + 4);
     
-    u32 start_reg = dw0 & 0x1F;
-    u32 num_regs = ((dw0 >> 16) & 0x1F) + 1;
-    
-    for (u32 i = 0; i < num_regs; i++) {
-        loop_constants_[start_reg + i] = memory_->read_u32(src_addr + i * 4);
+    // Load loop constants
+    for (u32 i = 0; i < (count - 1) && (start_index + i) < loop_constants_.size(); i++) {
+        loop_constants_[start_index + i] = memory_->read_u32(src_addr + i * 4);
     }
 }
 
 void CommandProcessor::handle_set_constant(GuestAddr data_addr, u32 count) {
-    // SET_CONSTANT: Write shader constants directly
-    u32 dw0 = read_cmd(data_addr);
+    if (count < 1) return;
     
-    u32 const_offset = dw0 & 0xFFFF;
+    u32 info = read_cmd(data_addr);
+    u32 type = (info >> 16) & 0x3;  // 0=ALU, 1=Fetch, 2=Bool, 3=Loop
+    u32 index = info & 0x1FF;
     
-    // Determine target based on offset range
-    // 0x000-0x0FF: Vertex shader constants
-    // 0x100-0x1FF: Pixel shader constants
-    // 0x200-0x2FF: Fetch constants
-    
+    // Read constant values
     for (u32 i = 1; i < count; i++) {
         u32 value = read_cmd(data_addr + i * 4);
-        u32 reg = const_offset + (i - 1);
+        u32 const_index = index + i - 1;
         
-        if (reg < 0x100) {
-            // Vertex constant
-            u32 raw = value;
-            vertex_constants_[reg * 4] = *reinterpret_cast<f32*>(&raw);
-        } else if (reg < 0x200) {
-            // Pixel constant
-            u32 raw = value;
-            pixel_constants_[(reg - 0x100) * 4] = *reinterpret_cast<f32*>(&raw);
-        } else if (reg < 0x300) {
-            // Fetch constant
-            u32 fetch_idx = (reg - 0x200) / 6;
-            u32 fetch_word = (reg - 0x200) % 6;
-            if (fetch_idx < 96) {
-                vertex_fetch_[fetch_idx].data[fetch_word] = value;
-            }
+        switch (type) {
+            case 0:  // ALU (float) constants
+                if (const_index < 256 * 4) {
+                    memcpy(&vertex_constants_[const_index], &value, sizeof(f32));
+                }
+                break;
+                
+            case 1:  // Fetch constants
+                // Store in appropriate fetch constant array
+                if (const_index < 96 * 6) {
+                    u32 fetch_idx = const_index / 6;
+                    u32 word_idx = const_index % 6;
+                    vertex_fetch_[fetch_idx].data[word_idx] = value;
+                }
+                break;
+                
+            case 2:  // Bool constants
+                if (const_index < bool_constants_.size()) {
+                    bool_constants_[const_index] = value;
+                }
+                break;
+                
+            case 3:  // Loop constants
+                if (const_index < loop_constants_.size()) {
+                    loop_constants_[const_index] = value;
+                }
+                break;
         }
     }
 }
 
 void CommandProcessor::handle_event_write(GuestAddr data_addr, u32 count) {
-    u32 dw0 = read_cmd(data_addr);
-    u32 event = dw0 & 0xFF;
+    if (count < 1) return;
     
-    // Event types:
-    // 0x16 = VS_DONE
-    // 0x17 = PS_DONE
-    // 0x2B = CACHE_FLUSH_TS (texture cache flush with timestamp)
-    // 0x2C = CONTEXT_DONE
+    u32 event_info = read_cmd(data_addr);
+    u32 event_type = event_info & 0x3F;
     
-    switch (event) {
-        case 0x16: // VS_DONE
-        case 0x17: // PS_DONE
-        case 0x2C: // CONTEXT_DONE
-            // Synchronization events - mostly handled implicitly
+    // Event types we care about
+    constexpr u32 EVENT_SWAP = 0x14;      // Swap buffers
+    constexpr u32 EVENT_CACHE_FLUSH = 0x16;
+    constexpr u32 EVENT_VS_DONE = 0x28;
+    constexpr u32 EVENT_PS_DONE = 0x29;
+    
+    switch (event_type) {
+        case EVENT_SWAP:
+            // Frame complete
+            frame_complete_ = true;
+            in_frame_ = false;
+            LOGD("Frame complete: %llu draws", draws_this_frame_);
+            draws_this_frame_ = 0;
             break;
             
-        case 0x2B: // CACHE_FLUSH_TS
-            // Flush texture cache and write timestamp
-            if (count >= 3) {
-                GuestAddr addr = read_cmd(data_addr + 4);
-                u32 timestamp = read_cmd(data_addr + 8);
-                memory_->write_u32(static_cast<GuestAddr>(addr), timestamp);
-            }
+        case EVENT_CACHE_FLUSH:
+            // Flush caches
             break;
-    }
-    
-    // Check for frame-ending events
-    if (event == 0x17 || event == 0x2C) {
-        // Potentially end of frame
-        // Check if we should signal frame complete based on render target state
+            
+        case EVENT_VS_DONE:
+        case EVENT_PS_DONE:
+            // Shader done events
+            break;
+            
+        default:
+            break;
     }
 }
 
 void CommandProcessor::handle_mem_write(GuestAddr data_addr, u32 count) {
-    // Write value to memory address
-    GuestAddr addr = read_cmd(data_addr);
+    if (count < 2) return;
+    
+    GuestAddr dest_addr = read_cmd(data_addr);
     u32 value = read_cmd(data_addr + 4);
     
-    memory_->write_u32(static_cast<GuestAddr>(addr), value);
+    // Write value to memory
+    memory_->write_u32(dest_addr, value);
 }
 
 void CommandProcessor::handle_wait_reg_mem(GuestAddr data_addr, u32 count) {
-    // Wait for register/memory value
-    // In emulation, we generally don't need to actually wait
-    // since we execute sequentially
+    if (count < 5) return;
+    
+    u32 wait_info = read_cmd(data_addr);
+    u32 poll_addr_lo = read_cmd(data_addr + 4);
+    u32 poll_addr_hi = read_cmd(data_addr + 8);
+    u32 reference = read_cmd(data_addr + 12);
+    u32 mask = read_cmd(data_addr + 16);
+    
+    bool mem_space = (wait_info >> 4) & 1;  // 0=register, 1=memory
+    u32 function = wait_info & 0x7;
+    
+    // In emulation, we assume the condition is already met
+    // Real hardware would spin until condition is satisfied
+    (void)poll_addr_lo;
+    (void)poll_addr_hi;
+    (void)reference;
+    (void)mask;
+    (void)mem_space;
+    (void)function;
 }
 
 void CommandProcessor::handle_indirect_buffer(GuestAddr data_addr, u32 count) {
-    // Execute commands from indirect buffer
+    if (count < 2) return;
+    
     GuestAddr ib_addr = read_cmd(data_addr);
     u32 ib_size = read_cmd(data_addr + 4) & 0xFFFFF;  // Size in dwords
     
-    // Process the indirect buffer
-    u32 read_ptr = 0;
-    while (read_ptr < ib_size) {
-        u32 packets_consumed = 0;
-        execute_packet(ib_addr + read_ptr * 4, packets_consumed);
-        read_ptr += packets_consumed;
+    // Execute commands from indirect buffer
+    u32 ib_read = 0;
+    while (ib_read < ib_size) {
+        u32 consumed = 0;
+        execute_packet(ib_addr + ib_read * 4, consumed);
+        ib_read += consumed;
+        
+        if (consumed == 0) break;  // Prevent infinite loop
     }
 }
 
-void CommandProcessor::set_register(u32 index, u32 value) {
-    if (index < registers_.size()) {
-        registers_[index] = value;
-    }
-}
-
-void CommandProcessor::write_register(u32 index, u32 value) {
-    if (index >= registers_.size()) {
-        return;
-    }
-    
-    registers_[index] = value;
-    on_register_write(index, value);
-}
-
-void CommandProcessor::on_register_write(u32 index, u32 value) {
-    // Handle register write side effects
-    using namespace xenos_reg;
-    
-    switch (index) {
-        case RB_SURFACE_INFO:
-            render_state_.color_pitch = value & 0x3FFF;
-            break;
-            
-        case RB_COLOR_INFO:
-            render_state_.color_target_address = value & 0xFFFFF000;
-            render_state_.color_format = static_cast<SurfaceFormat>((value >> 0) & 0xF);
-            break;
-            
-        case RB_DEPTH_INFO:
-            render_state_.depth_target_address = value & 0xFFFFF000;
-            break;
-            
-        case PA_CL_VPORT_XSCALE:
-            render_state_.viewport_width = *reinterpret_cast<f32*>(&value) * 2.0f;
-            break;
-            
-        case PA_CL_VPORT_YSCALE:
-            render_state_.viewport_height = *reinterpret_cast<f32*>(&value) * -2.0f;
-            break;
-            
-        case PA_CL_VPORT_XOFFSET:
-            render_state_.viewport_x = *reinterpret_cast<f32*>(&value) - render_state_.viewport_width / 2.0f;
-            break;
-            
-        case PA_CL_VPORT_YOFFSET:
-            render_state_.viewport_y = *reinterpret_cast<f32*>(&value) - render_state_.viewport_height / 2.0f;
-            break;
-            
-        case PA_SC_SCREEN_SCISSOR_TL:
-            render_state_.scissor_left = value & 0x7FFF;
-            render_state_.scissor_top = (value >> 16) & 0x7FFF;
-            break;
-            
-        case PA_SC_SCREEN_SCISSOR_BR:
-            render_state_.scissor_right = value & 0x7FFF;
-            render_state_.scissor_bottom = (value >> 16) & 0x7FFF;
-            break;
-            
-        case SQ_VS_PROGRAM:
-            render_state_.vertex_shader_address = value;
-            break;
-            
-        case SQ_PS_PROGRAM:
-            render_state_.pixel_shader_address = value;
-            break;
-    }
-}
+//=============================================================================
+// State Management
+//=============================================================================
 
 void CommandProcessor::update_render_state() {
-    // Copy fetch constants to render state
-    for (u32 i = 0; i < 96; i++) {
-        render_state_.vertex_fetch[i] = vertex_fetch_[i];
+    // Update viewport from registers
+    u32 pa_cl_vte_cntl = registers_[xenos_reg::PA_CL_VTE_CNTL];
+    
+    if (pa_cl_vte_cntl & 1) {  // VPORT_X_SCALE_ENA
+        u32 x_scale_raw = registers_[xenos_reg::PA_CL_VPORT_XSCALE];
+        u32 x_offset_raw = registers_[xenos_reg::PA_CL_VPORT_XOFFSET];
+        u32 y_scale_raw = registers_[xenos_reg::PA_CL_VPORT_YSCALE];
+        u32 y_offset_raw = registers_[xenos_reg::PA_CL_VPORT_YOFFSET];
+        u32 z_scale_raw = registers_[xenos_reg::PA_CL_VPORT_ZSCALE];
+        u32 z_offset_raw = registers_[xenos_reg::PA_CL_VPORT_ZOFFSET];
+        
+        memcpy(&render_state_.viewport_width, &x_scale_raw, sizeof(f32));
+        memcpy(&render_state_.viewport_x, &x_offset_raw, sizeof(f32));
+        memcpy(&render_state_.viewport_height, &y_scale_raw, sizeof(f32));
+        memcpy(&render_state_.viewport_y, &y_offset_raw, sizeof(f32));
+        memcpy(&render_state_.viewport_z_max, &z_scale_raw, sizeof(f32));
+        memcpy(&render_state_.viewport_z_min, &z_offset_raw, sizeof(f32));
     }
+    
+    // Update scissor
+    u32 scissor_tl = registers_[xenos_reg::PA_SC_WINDOW_SCISSOR_TL];
+    u32 scissor_br = registers_[xenos_reg::PA_SC_WINDOW_SCISSOR_BR];
+    
+    render_state_.scissor_left = scissor_tl & 0x7FFF;
+    render_state_.scissor_top = (scissor_tl >> 16) & 0x7FFF;
+    render_state_.scissor_right = scissor_br & 0x7FFF;
+    render_state_.scissor_bottom = (scissor_br >> 16) & 0x7FFF;
+    
+    // Update depth state
+    u32 rb_depthcontrol = registers_[xenos_reg::RB_DEPTHCONTROL];
+    render_state_.depth_test = (rb_depthcontrol >> 1) & 1;
+    render_state_.depth_write = (rb_depthcontrol >> 2) & 1;
+    render_state_.depth_func = (rb_depthcontrol >> 4) & 0x7;
+    
+    // Update blend state
+    u32 rb_blendcontrol = registers_[xenos_reg::RB_BLENDCONTROL];
+    render_state_.blend_enable = (rb_blendcontrol >> 0) & 1;
+    render_state_.blend_src = (rb_blendcontrol >> 0) & 0x1F;
+    render_state_.blend_dst = (rb_blendcontrol >> 8) & 0x1F;
+    render_state_.blend_op = (rb_blendcontrol >> 5) & 0x7;
+    
+    // Update cull mode
+    u32 pa_su_sc_mode_cntl = registers_[xenos_reg::PA_SU_SC_MODE_CNTL];
+    render_state_.cull_mode = (pa_su_sc_mode_cntl >> 0) & 0x3;
+    render_state_.front_ccw = (pa_su_sc_mode_cntl >> 2) & 1;
+    
+    // Update render target info
+    u32 rb_color_info = registers_[xenos_reg::RB_COLOR_INFO];
+    render_state_.color_target_address = (rb_color_info & 0xFFFFF) << 12;
+    render_state_.color_format = static_cast<SurfaceFormat>((rb_color_info >> 20) & 0xF);
+    
+    u32 rb_surface_info = registers_[xenos_reg::RB_SURFACE_INFO];
+    render_state_.color_pitch = rb_surface_info & 0x3FFF;
+}
+
+void CommandProcessor::update_shaders() {
+    // Get shader addresses from registers
+    u32 sq_vs_program = registers_[xenos_reg::SQ_VS_PROGRAM];
+    u32 sq_ps_program = registers_[xenos_reg::SQ_PS_PROGRAM];
+    
+    render_state_.vertex_shader_address = (sq_vs_program & 0xFFFFF) << 8;
+    render_state_.pixel_shader_address = (sq_ps_program & 0xFFFFF) << 8;
+}
+
+void CommandProcessor::update_textures() {
+    // Copy texture fetch constants
     for (u32 i = 0; i < 32; i++) {
         render_state_.texture_fetch[i] = texture_fetch_[i];
     }
 }
 
+void CommandProcessor::update_vertex_buffers() {
+    // Copy vertex fetch constants
+    for (u32 i = 0; i < 96; i++) {
+        render_state_.vertex_fetch[i] = vertex_fetch_[i];
+    }
+}
+
 void CommandProcessor::execute_draw(const DrawCommand& cmd) {
-    // Update state before draw
-    update_render_state();
-    update_shaders();
-    update_textures();
+    if (!vulkan_) return;
     
-    LOGD("Draw: primitive=%d, count=%d, indexed=%d", 
-         static_cast<int>(cmd.primitive_type), cmd.index_count, cmd.indexed);
-    
-    if (!vulkan_) {
-        return;
+    // Start frame if not already in one
+    if (!in_frame_) {
+        if (vulkan_->begin_frame() != Status::Ok) {
+            LOGE("Failed to begin frame");
+            return;
+        }
+        in_frame_ = true;
     }
     
-    // TODO: Actually execute the draw call through Vulkan
-    // This requires:
-    // 1. Translate shaders if not cached
-    // 2. Create/bind pipeline
-    // 3. Bind vertex/index buffers
-    // 4. Bind descriptors (textures, constants)
-    // 5. Issue draw command
+    // Get or translate shaders
+    // TODO: Implement shader binding
+    
+    // Configure pipeline state based on render_state_
+    PipelineState pipeline_state = {};
+    
+    // Map primitive type
+    switch (cmd.primitive_type) {
+        case PrimitiveType::PointList:
+            pipeline_state.primitive_topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+            break;
+        case PrimitiveType::LineList:
+            pipeline_state.primitive_topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+            break;
+        case PrimitiveType::LineStrip:
+            pipeline_state.primitive_topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+            break;
+        case PrimitiveType::TriangleList:
+            pipeline_state.primitive_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            break;
+        case PrimitiveType::TriangleFan:
+            pipeline_state.primitive_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+            break;
+        case PrimitiveType::TriangleStrip:
+            pipeline_state.primitive_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+            break;
+        default:
+            pipeline_state.primitive_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            break;
+    }
+    
+    // Depth state
+    pipeline_state.depth_test_enable = render_state_.depth_test ? VK_TRUE : VK_FALSE;
+    pipeline_state.depth_write_enable = render_state_.depth_write ? VK_TRUE : VK_FALSE;
+    
+    // Map depth function
+    static const VkCompareOp depth_funcs[] = {
+        VK_COMPARE_OP_NEVER,          // 0
+        VK_COMPARE_OP_LESS,           // 1
+        VK_COMPARE_OP_EQUAL,          // 2
+        VK_COMPARE_OP_LESS_OR_EQUAL,  // 3
+        VK_COMPARE_OP_GREATER,        // 4
+        VK_COMPARE_OP_NOT_EQUAL,      // 5
+        VK_COMPARE_OP_GREATER_OR_EQUAL, // 6
+        VK_COMPARE_OP_ALWAYS,         // 7
+    };
+    pipeline_state.depth_compare_op = depth_funcs[render_state_.depth_func & 0x7];
+    
+    // Blend state
+    pipeline_state.blend_enable = render_state_.blend_enable ? VK_TRUE : VK_FALSE;
+    
+    // Cull mode
+    switch (render_state_.cull_mode) {
+        case 0:  // None
+            pipeline_state.cull_mode = VK_CULL_MODE_NONE;
+            break;
+        case 1:  // Front
+            pipeline_state.cull_mode = VK_CULL_MODE_FRONT_BIT;
+            break;
+        case 2:  // Back
+            pipeline_state.cull_mode = VK_CULL_MODE_BACK_BIT;
+            break;
+        default:
+            pipeline_state.cull_mode = VK_CULL_MODE_NONE;
+            break;
+    }
+    
+    pipeline_state.front_face = render_state_.front_ccw ? 
+                                VK_FRONT_FACE_COUNTER_CLOCKWISE : 
+                                VK_FRONT_FACE_CLOCKWISE;
+    
+    // Execute draw
+    if (cmd.indexed) {
+        vulkan_->draw_indexed(cmd.index_count, 1, 0, 0, 0);
+    } else {
+        vulkan_->draw(cmd.vertex_count > 0 ? cmd.vertex_count : cmd.index_count, 1, 0, 0);
+    }
     
     draws_this_frame_++;
+    
+    LOGD("Draw: %s, %u %s", 
+         cmd.indexed ? "indexed" : "non-indexed",
+         cmd.indexed ? cmd.index_count : cmd.vertex_count,
+         cmd.indexed ? "indices" : "vertices");
 }
 
-void CommandProcessor::update_shaders() {
-    // Translate vertex shader if needed
-    if (render_state_.vertex_shader_address && shader_translator_) {
-        // Read shader microcode from memory
-        // void* vs_code = memory_->get_host_ptr(render_state_.vertex_shader_address);
-        // shader_translator_->translate(vs_code, size, ShaderType::Vertex);
-    }
+void CommandProcessor::on_register_write(u32 index, u32 value) {
+    // Handle side effects of register writes
     
-    // Translate pixel shader if needed
-    if (render_state_.pixel_shader_address && shader_translator_) {
-        // void* ps_code = memory_->get_host_ptr(render_state_.pixel_shader_address);
-        // shader_translator_->translate(ps_code, size, ShaderType::Pixel);
-    }
-}
-
-void CommandProcessor::update_textures() {
-    // Process texture fetch constants and load textures
-    for (u32 i = 0; i < 32; i++) {
-        const auto& fetch = texture_fetch_[i];
-        if (fetch.data[0] == 0) continue;  // Not configured
-        
-        if (texture_cache_) {
-            // texture_cache_->get_texture(fetch, memory_);
-        }
-    }
-}
-
-// ShaderMicrocode implementation
-Status ShaderMicrocode::parse(const void* data, u32 size, ShaderType type) {
-    type_ = type;
-    
-    if (size < 16) {
-        return Status::InvalidFormat;
-    }
-    
-    const u32* words = static_cast<const u32*>(data);
-    u32 dword_count = size / 4;
-    
-    // Copy raw instructions
-    instructions_.assign(words, words + dword_count);
-    
-    // Decode control flow instructions
-    decode_control_flow();
-    
-    return Status::Ok;
-}
-
-void ShaderMicrocode::decode_control_flow() {
-    // Xenos shaders start with control flow instructions
-    // Each CF instruction is 48 bits (1.5 dwords)
-    
-    u32 cf_offset = 0;
-    bool end_found = false;
-    
-    while (!end_found && cf_offset < instructions_.size()) {
-        ControlFlowInstruction cf;
-        
-        // Read 48-bit instruction
-        u32 lo = instructions_[cf_offset];
-        u32 hi = cf_offset + 1 < instructions_.size() ? instructions_[cf_offset + 1] : 0;
-        
-        cf.word = lo;
-        cf.opcode = (lo >> 23) & 0x1F;
-        cf.address = lo & 0x1FF;
-        cf.count = (lo >> 10) & 0x7;
-        cf.end_of_shader = (lo >> 20) & 1;
-        cf.predicated = (lo >> 21) & 1;
-        cf.condition = (lo >> 22) & 1;
-        
-        cf_instructions_.push_back(cf);
-        
-        // Decode referenced ALU or fetch clauses
-        if (cf.opcode >= 0 && cf.opcode <= 3) {
-            // EXEC instruction - execute ALU clause
-            decode_alu_clause(cf.address, cf.count + 1);
-        } else if (cf.opcode >= 4 && cf.opcode <= 7) {
-            // EXEC with fetch
-            decode_fetch_clause(cf.address, cf.count + 1);
-        }
-        
-        if (cf.end_of_shader) {
-            end_found = true;
-        }
-        
-        cf_offset += 2;  // 48 bits = 1.5 dwords, but aligned to 2
-    }
-}
-
-void ShaderMicrocode::decode_alu_clause(u32 address, u32 count) {
-    // ALU instructions are 96 bits each (3 dwords)
-    for (u32 i = 0; i < count; i++) {
-        u32 offset = (address + i) * 3;
-        if (offset + 2 >= instructions_.size()) break;
-        
-        AluInstruction alu;
-        alu.words[0] = instructions_[offset];
-        alu.words[1] = instructions_[offset + 1];
-        alu.words[2] = instructions_[offset + 2];
-        
-        // Decode ALU fields (simplified)
-        alu.vector_opcode = (alu.words[0] >> 0) & 0x1F;
-        alu.scalar_opcode = (alu.words[0] >> 5) & 0x3F;
-        alu.dest_reg = (alu.words[1] >> 24) & 0x7F;
-        alu.write_mask = (alu.words[1] >> 20) & 0xF;
-        alu.export_data = (alu.words[1] >> 31) & 1;
-        
-        alu_instructions_.push_back(alu);
-    }
-}
-
-void ShaderMicrocode::decode_fetch_clause(u32 address, u32 count) {
-    // Fetch instructions are 96 bits each (3 dwords)
-    for (u32 i = 0; i < count; i++) {
-        u32 offset = (address + i) * 3;
-        if (offset + 2 >= instructions_.size()) break;
-        
-        FetchInstruction fetch;
-        fetch.words[0] = instructions_[offset];
-        fetch.words[1] = instructions_[offset + 1];
-        fetch.words[2] = instructions_[offset + 2];
-        
-        // Decode fetch fields
-        fetch.opcode = (fetch.words[0] >> 0) & 0x1F;
-        fetch.const_index = (fetch.words[0] >> 12) & 0x1F;
-        fetch.dest_reg = (fetch.words[1] >> 16) & 0x7F;
-        fetch.src_reg = (fetch.words[1] >> 9) & 0x7F;
-        fetch.fetch_type = (fetch.words[0] >> 5) & 0x3;
-        
-        fetch_instructions_.push_back(fetch);
+    switch (index) {
+        case xenos_reg::CP_RB_WPTR:
+            // Ring buffer write pointer updated - may need to process commands
+            break;
+            
+        case xenos_reg::VGT_DRAW_INITIATOR:
+            // Draw initiated via register write
+            {
+                DrawCommand cmd = {};
+                cmd.primitive_type = static_cast<PrimitiveType>(value & 0x3F);
+                cmd.indexed = (value >> 11) & 1;
+                cmd.vertex_count = registers_[xenos_reg::VGT_IMMED_DATA];
+                
+                update_render_state();
+                execute_draw(cmd);
+            }
+            break;
+            
+        case xenos_reg::RB_COPY_CONTROL:
+            // Resolve initiated
+            if (value & 1) {
+                // TODO: Implement resolve
+                LOGD("Resolve triggered");
+            }
+            break;
+            
+        default:
+            break;
     }
 }
 
 } // namespace x360mu
-

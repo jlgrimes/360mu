@@ -179,6 +179,8 @@ void Vmx128Unit::execute(ThreadContext& ctx, const Vmx128Inst& inst) {
         // Dot products (Xbox 360 extension)
         case Vmx128Inst::Type::VDot3fp: vdot3fp(vd, va, vb); break;
         case Vmx128Inst::Type::VDot4fp: vdot4fp(vd, va, vb); break;
+        case Vmx128Inst::Type::VCross3fp: vcross3fp(vd, va, vb); break;
+        case Vmx128Inst::Type::VShufD: vshufd(vd, vb, inst.va); break;
         
         // Compare
         case Vmx128Inst::Type::VCmpEqFp: vcmpeqfp(vd, va, vb, inst.rc, ctx); break;
@@ -716,6 +718,43 @@ void Vmx128Unit::update_cr6(ThreadContext& ctx, bool all_true, bool all_false) {
     ctx.cr[6].gt = 0;
     ctx.cr[6].eq = all_false;  // All elements false
     ctx.cr[6].so = 0;
+}
+
+//=============================================================================
+// Xbox 360 Extended VMX128 Operations (non-inline implementations)
+//=============================================================================
+
+void Vmx128Unit::vmtx44mul(VectorReg vd[4], const VectorReg va[4], const VectorReg vb[4]) {
+    // 4x4 matrix multiply: vd = va * vb
+    // This is typically used for transform matrices in games
+    VectorReg temp[4];
+    
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < 4; k++) {
+                sum += va[i].f32x4[k] * vb[k].f32x4[j];
+            }
+            temp[i].f32x4[j] = sum;
+        }
+    }
+    
+    for (int i = 0; i < 4; i++) {
+        vd[i] = temp[i];
+    }
+}
+
+void Vmx128Unit::vmtxtrn(VectorReg vd[4], const VectorReg va[4]) {
+    // Matrix transpose
+    // Uses ARM NEON for efficient transpose
+    float32x4x2_t row01 = vtrnq_f32(vld1q_f32(va[0].f32x4), vld1q_f32(va[1].f32x4));
+    float32x4x2_t row23 = vtrnq_f32(vld1q_f32(va[2].f32x4), vld1q_f32(va[3].f32x4));
+    
+    // Combine low and high halves
+    vst1q_f32(vd[0].f32x4, vcombine_f32(vget_low_f32(row01.val[0]), vget_low_f32(row23.val[0])));
+    vst1q_f32(vd[1].f32x4, vcombine_f32(vget_low_f32(row01.val[1]), vget_low_f32(row23.val[1])));
+    vst1q_f32(vd[2].f32x4, vcombine_f32(vget_high_f32(row01.val[0]), vget_high_f32(row23.val[0])));
+    vst1q_f32(vd[3].f32x4, vcombine_f32(vget_high_f32(row01.val[1]), vget_high_f32(row23.val[1])));
 }
 
 void Vmx128Unit::execute_load_store(ThreadContext& ctx, const Vmx128Inst& inst,

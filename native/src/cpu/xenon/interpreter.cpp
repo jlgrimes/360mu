@@ -81,7 +81,12 @@ u32 Interpreter::execute_one(ThreadContext& ctx) {
         case DecodedInst::Type::FAbs:
         case DecodedInst::Type::FCompare:
         case DecodedInst::Type::FConvert:
-            exec_float(ctx, d);
+            // Use complete float handler for opcodes 59/63
+            if (d.opcode == 59 || d.opcode == 63) {
+                exec_float_complete(ctx, d);
+            } else {
+                exec_float(ctx, d);
+            }
             ctx.pc += 4;
             break;
             
@@ -260,6 +265,36 @@ void Interpreter::exec_integer(ThreadContext& ctx, const DecodedInst& d) {
                     update_cr0(ctx, static_cast<s64>(result));
                 }
             }
+            break;
+            
+        case 23: // rlwnm - rotate left word then AND with mask
+            {
+                u32 rs = static_cast<u32>(ctx.gpr[d.rs]);
+                u32 sh = ctx.gpr[d.rb] & 0x1F;
+                u32 mb = d.mb;
+                u32 me = d.me;
+                
+                // Rotate left
+                u32 rotated = (rs << sh) | (rs >> (32 - sh));
+                
+                // Generate mask
+                u32 mask;
+                if (mb <= me) {
+                    mask = ((1ULL << (me - mb + 1)) - 1) << (31 - me);
+                } else {
+                    mask = ~(((1ULL << (mb - me - 1)) - 1) << (31 - mb + 1));
+                }
+                
+                result = rotated & mask;
+                ctx.gpr[d.ra] = result;
+                if (d.rc) {
+                    update_cr0(ctx, static_cast<s64>(result));
+                }
+            }
+            break;
+            
+        case 30: // 64-bit rotate instructions (rldic, rldicl, rldicr, rldimi, rldcl, rldcr)
+            exec_rotate64(ctx, d);
             break;
             
         case 31: // Extended opcodes
@@ -597,6 +632,11 @@ void Interpreter::exec_load_store(ThreadContext& ctx, const DecodedInst& d) {
                 write_u64(ctx, addr, dval);
             }
             break;
+            
+        case 58: // ld/ldu/lwa (DS-form)
+        case 62: // std/stdu (DS-form)
+            exec_load_store_ds(ctx, d);
+            return; // exec_load_store_ds handles everything
             
         default:
             LOGE("Unhandled load/store opcode: %d", d.opcode);

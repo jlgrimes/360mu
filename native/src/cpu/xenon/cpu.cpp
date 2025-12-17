@@ -7,6 +7,10 @@
 #include "cpu.h"
 #include "memory/memory.h"
 
+#ifdef X360MU_JIT_ENABLED
+#include "../jit/jit.h"
+#endif
+
 #ifdef __ANDROID__
 #include <android/log.h>
 #define LOG_TAG "360mu-cpu"

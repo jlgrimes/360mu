@@ -16,43 +16,44 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
 
-// Xbox 360 inspired colors
-private val XboxGreen = Color(0xFF107C10)
-private val XboxGreenLight = Color(0xFF0E6A0E)
-private val XboxGreenDark = Color(0xFF054B05)
-private val XboxBlack = Color(0xFF0D0D0D)
-private val XboxDarkGray = Color(0xFF1F1F1F)
-private val XboxMediumGray = Color(0xFF2D2D2D)
-private val XboxLightGray = Color(0xFFE5E5E5)
+// Gaming-focused dark theme colors
+private val DeepPurple = Color(0xFF6B4EE6)       // Primary
+private val DeepPurpleLight = Color(0xFF8B6EFF)
+private val DeepPurpleDark = Color(0xFF4B2EC6)
+private val ElectricBlue = Color(0xFF00D9FF)     // Accent/Tertiary
+private val NearBlack = Color(0xFF0D0D0D)        // Background
+private val DarkGray = Color(0xFF1A1A1A)         // Surface
+private val MediumGray = Color(0xFF2D2D2D)       // Surface variant
+private val LightGray = Color(0xFFE5E5E5)
 
 private val DarkColorScheme = darkColorScheme(
-    primary = XboxGreen,
+    primary = DeepPurple,
     onPrimary = Color.White,
-    primaryContainer = XboxGreenDark,
+    primaryContainer = DeepPurpleDark,
     onPrimaryContainer = Color.White,
-    secondary = Color(0xFF5C6BC0),
-    onSecondary = Color.White,
-    tertiary = Color(0xFF7E57C2),
-    onTertiary = Color.White,
-    background = XboxBlack,
+    secondary = ElectricBlue,
+    onSecondary = Color.Black,
+    tertiary = ElectricBlue,
+    onTertiary = Color.Black,
+    background = NearBlack,
     onBackground = Color.White,
-    surface = XboxDarkGray,
+    surface = DarkGray,
     onSurface = Color.White,
-    surfaceVariant = XboxMediumGray,
+    surfaceVariant = MediumGray,
     onSurfaceVariant = Color(0xFFCAC4D0),
     error = Color(0xFFCF6679),
     onError = Color.Black,
 )
 
 private val LightColorScheme = lightColorScheme(
-    primary = XboxGreen,
+    primary = DeepPurple,
     onPrimary = Color.White,
-    primaryContainer = Color(0xFFB8F5B8),
-    onPrimaryContainer = XboxGreenDark,
-    secondary = Color(0xFF5C6BC0),
-    onSecondary = Color.White,
-    tertiary = Color(0xFF7E57C2),
-    onTertiary = Color.White,
+    primaryContainer = Color(0xFFE8DEFF),
+    onPrimaryContainer = DeepPurpleDark,
+    secondary = ElectricBlue,
+    onSecondary = Color.Black,
+    tertiary = ElectricBlue,
+    onTertiary = Color.Black,
     background = Color(0xFFFFFBFE),
     onBackground = Color(0xFF1C1B1F),
     surface = Color(0xFFFFFBFE),

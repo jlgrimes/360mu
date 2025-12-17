@@ -55,7 +55,7 @@ Status JitCompiler::initialize(Memory* memory, u64 cache_size) {
     
     if (code_cache_ == MAP_FAILED) {
         LOGE("Failed to allocate JIT code cache (%llu bytes)", cache_size);
-        return Status::ErrorOutOfMemory;
+        return Status::OutOfMemory;
     }
 #else
     // Non-ARM64 fallback (for testing on x86)
@@ -140,107 +140,23 @@ void JitCompiler::flush_cache() {
 }
 
 CompiledBlock* JitCompiler::compile_block(GuestAddr addr) {
+    std::lock_guard<std::mutex> lock(block_map_mutex_);
+    
     // Check cache first
-    {
-        std::lock_guard<std::mutex> lock(block_map_mutex_);
-        auto it = block_map_.find(addr);
-        if (it != block_map_.end()) {
-            stats_.cache_hits++;
-            return it->second;
-        }
+    auto it = block_map_.find(addr);
+    if (it != block_map_.end()) {
+        stats_.cache_hits++;
+        return it->second;
     }
     
     stats_.cache_misses++;
     
-    // Allocate new block
-    CompiledBlock* block = new CompiledBlock();
-    block->start_addr = addr;
-    block->code = code_write_ptr_;
-    block->execution_count = 0;
+    CompiledBlock* block = compile_block_unlocked(addr);
     
-    // Create temporary buffer for code generation
-    u8 temp_buffer[TEMP_BUFFER_SIZE];
-    ARM64Emitter emit(temp_buffer, TEMP_BUFFER_SIZE);
-    
-    // Template context for compilation
-    ThreadContext ctx_template = {};
-    
-    // Prologue: We expect X19 = context pointer, X20 = memory base
-    // Save state to context before each block can be optimized later
-    
-    GuestAddr pc = addr;
-    u32 inst_count = 0;
-    bool block_ended = false;
-    
-    while (!block_ended && inst_count < MAX_BLOCK_INSTRUCTIONS) {
-        // Fetch instruction from PPC memory (big-endian)
-        u32 ppc_inst = memory_->read_u32(pc);
-        
-        // Decode
-        DecodedInst decoded = Decoder::decode(ppc_inst);
-        
-        // Compile instruction
-        compile_instruction(emit, ctx_template, decoded, pc);
-        
-        inst_count++;
-        pc += 4;
-        
-        // Check if this instruction ends the block
-        switch (decoded.type) {
-            case DecodedInst::Type::Branch:
-            case DecodedInst::Type::BranchConditional:
-            case DecodedInst::Type::BranchLink:
-            case DecodedInst::Type::SC:
-            case DecodedInst::Type::RFI:
-                block_ended = true;
-                break;
-            default:
-                break;
-        }
+    // Try to link this block to others (outside lock would be better but ok for now)
+    if (block) {
+        try_link_block(block);
     }
-    
-    // If block didn't end with a branch, add fallthrough
-    if (!block_ended) {
-        // Update PC
-        emit.MOV_imm(arm64::X0, pc);
-        emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_pc());
-        
-        // Jump to exit stub
-        s64 exit_offset = reinterpret_cast<u8*>(exit_stub_) - emit.current();
-        emit.B(exit_offset);
-    }
-    
-    block->size = inst_count;
-    block->code_size = emit.size();
-    
-    // Copy code to executable cache
-    memcpy(code_write_ptr_, temp_buffer, emit.size());
-    code_write_ptr_ += emit.size();
-    
-    // Align to 16 bytes
-    code_write_ptr_ = reinterpret_cast<u8*>(
-        (reinterpret_cast<uintptr_t>(code_write_ptr_) + 15) & ~15
-    );
-    
-#ifdef __aarch64__
-    // Clear instruction cache
-    __builtin___clear_cache(
-        reinterpret_cast<char*>(block->code),
-        reinterpret_cast<char*>(block->code) + block->code_size
-    );
-#endif
-    
-    // Add to cache
-    {
-        std::lock_guard<std::mutex> lock(block_map_mutex_);
-        block_map_[addr] = block;
-    }
-    
-    stats_.blocks_compiled++;
-    stats_.code_bytes_used = code_write_ptr_ - code_cache_;
-    
-    // Try to link this block to others
-    try_link_block(block);
     
     return block;
 }
@@ -1172,18 +1088,219 @@ void JitCompiler::byteswap64(ARM64Emitter& emit, int reg) {
 
 void JitCompiler::try_link_block(CompiledBlock* block) {
     // Try to link this block's exits to already-compiled blocks
-    // And link other blocks' exits to this block
+    for (auto& link : block->links) {
+        if (link.linked) continue;
+        
+        // Look up target block
+        auto it = block_map_.find(link.target);
+        if (it != block_map_.end()) {
+            CompiledBlock* target = it->second;
+            
+            // Calculate offset from patch site to target
+            u32* patch_addr = reinterpret_cast<u32*>(
+                static_cast<u8*>(block->code) + link.patch_offset
+            );
+            s64 offset = static_cast<u8*>(target->code) - 
+                        reinterpret_cast<u8*>(patch_addr);
+            
+            // Check if offset fits in branch immediate (±128MB)
+            if (offset >= -128*1024*1024 && offset < 128*1024*1024) {
+                // Patch the branch instruction
+                s32 imm26 = static_cast<s32>(offset >> 2);
+                *patch_addr = 0x14000000 | (imm26 & 0x03FFFFFF);
+                
+                link.linked = true;
+                
+#ifdef __aarch64__
+                __builtin___clear_cache(
+                    reinterpret_cast<char*>(patch_addr),
+                    reinterpret_cast<char*>(patch_addr) + 4
+                );
+#endif
+                LOGD("Linked block %08X -> %08X", block->start_addr, link.target);
+            }
+        }
+    }
     
-    // This is an optimization - skip for now
+    // Try to link other blocks to this one
+    for (auto& [addr, other] : block_map_) {
+        if (other == block) continue;
+        
+        for (auto& link : other->links) {
+            if (link.linked) continue;
+            if (link.target != block->start_addr) continue;
+            
+            u32* patch_addr = reinterpret_cast<u32*>(
+                static_cast<u8*>(other->code) + link.patch_offset
+            );
+            s64 offset = static_cast<u8*>(block->code) - 
+                        reinterpret_cast<u8*>(patch_addr);
+            
+            if (offset >= -128*1024*1024 && offset < 128*1024*1024) {
+                s32 imm26 = static_cast<s32>(offset >> 2);
+                *patch_addr = 0x14000000 | (imm26 & 0x03FFFFFF);
+                
+                link.linked = true;
+                
+#ifdef __aarch64__
+                __builtin___clear_cache(
+                    reinterpret_cast<char*>(patch_addr),
+                    reinterpret_cast<char*>(patch_addr) + 4
+                );
+#endif
+                LOGD("Linked block %08X -> %08X (backpatch)", addr, block->start_addr);
+            }
+        }
+    }
 }
 
 void JitCompiler::unlink_block(CompiledBlock* block) {
-    // Remove links to/from this block
+    // When a block is invalidated, we need to restore any direct branches
+    // that were patched to jump to it. For simplicity, we mark them as unlinked
+    // and let the dispatcher handle them on next execution.
+    
+    for (auto& [addr, other] : block_map_) {
+        for (auto& link : other->links) {
+            if (link.target == block->start_addr && link.linked) {
+                // Restore branch to exit stub
+                u32* patch_addr = reinterpret_cast<u32*>(
+                    static_cast<u8*>(other->code) + link.patch_offset
+                );
+                
+                // Calculate offset to exit stub
+                s64 offset = static_cast<u8*>(exit_stub_) - 
+                            reinterpret_cast<u8*>(patch_addr);
+                s32 imm26 = static_cast<s32>(offset >> 2);
+                *patch_addr = 0x14000000 | (imm26 & 0x03FFFFFF);
+                
+                link.linked = false;
+                
+#ifdef __aarch64__
+                __builtin___clear_cache(
+                    reinterpret_cast<char*>(patch_addr),
+                    reinterpret_cast<char*>(patch_addr) + 4
+                );
+#endif
+            }
+        }
+    }
 }
 
 //=============================================================================
 // Dispatcher
 //=============================================================================
+
+// Helper function that looks up a block - called from JIT code
+extern "C" void* jit_lookup_block(JitCompiler* jit, GuestAddr pc) {
+    return jit->lookup_block_for_dispatch(pc);
+}
+
+void* JitCompiler::lookup_block_for_dispatch(GuestAddr pc) {
+    std::lock_guard<std::mutex> lock(block_map_mutex_);
+    
+    auto it = block_map_.find(pc);
+    if (it != block_map_.end()) {
+        stats_.cache_hits++;
+        return it->second->code;
+    }
+    
+    stats_.cache_misses++;
+    
+    // Compile the block
+    CompiledBlock* block = compile_block_unlocked(pc);
+    if (block) {
+        return block->code;
+    }
+    
+    return nullptr;
+}
+
+CompiledBlock* JitCompiler::compile_block_unlocked(GuestAddr addr) {
+    // Called with lock held
+    
+    // Allocate new block
+    CompiledBlock* block = new CompiledBlock();
+    block->start_addr = addr;
+    block->code = code_write_ptr_;
+    block->execution_count = 0;
+    
+    // Create temporary buffer for code generation
+    u8 temp_buffer[TEMP_BUFFER_SIZE];
+    ARM64Emitter emit(temp_buffer, TEMP_BUFFER_SIZE);
+    
+    // Template context for compilation
+    ThreadContext ctx_template = {};
+    
+    GuestAddr pc = addr;
+    u32 inst_count = 0;
+    bool block_ended = false;
+    
+    while (!block_ended && inst_count < MAX_BLOCK_INSTRUCTIONS) {
+        // Fetch instruction from PPC memory (big-endian)
+        u32 ppc_inst = memory_->read_u32(pc);
+        
+        // Decode
+        DecodedInst decoded = Decoder::decode(ppc_inst);
+        
+        // Compile instruction
+        compile_instruction(emit, ctx_template, decoded, pc);
+        
+        inst_count++;
+        pc += 4;
+        
+        // Check if this instruction ends the block
+        switch (decoded.type) {
+            case DecodedInst::Type::Branch:
+            case DecodedInst::Type::BranchConditional:
+            case DecodedInst::Type::BranchLink:
+            case DecodedInst::Type::SC:
+            case DecodedInst::Type::RFI:
+                block_ended = true;
+                break;
+            default:
+                break;
+        }
+    }
+    
+    // If block didn't end with a branch, add fallthrough
+    if (!block_ended) {
+        // Update PC
+        emit.MOV_imm(arm64::X0, pc);
+        emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_pc());
+        
+        // Jump to exit stub
+        s64 exit_offset = reinterpret_cast<u8*>(exit_stub_) - emit.current();
+        emit.B(static_cast<s32>(exit_offset));
+    }
+    
+    block->size = inst_count;
+    block->code_size = emit.size();
+    
+    // Copy code to executable cache
+    memcpy(code_write_ptr_, temp_buffer, emit.size());
+    code_write_ptr_ += emit.size();
+    
+    // Align to 16 bytes
+    code_write_ptr_ = reinterpret_cast<u8*>(
+        (reinterpret_cast<uintptr_t>(code_write_ptr_) + 15) & ~15
+    );
+    
+#ifdef __aarch64__
+    // Clear instruction cache
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(block->code),
+        reinterpret_cast<char*>(block->code) + block->code_size
+    );
+#endif
+    
+    // Add to cache
+    block_map_[addr] = block;
+    
+    stats_.blocks_compiled++;
+    stats_.code_bytes_used = code_write_ptr_ - code_cache_;
+    
+    return block;
+}
 
 void JitCompiler::generate_dispatcher() {
 #ifdef __aarch64__
@@ -1200,40 +1317,49 @@ void JitCompiler::generate_dispatcher() {
     emit.STP(arm64::X23, arm64::X24, arm64::SP, -64);
     emit.STP(arm64::X25, arm64::X26, arm64::SP, -80);
     emit.STP(arm64::X27, arm64::X28, arm64::SP, -96);
-    emit.SUB_imm(arm64::SP, arm64::SP, 96);
+    emit.SUB_imm(arm64::SP, arm64::SP, 112); // 96 + 16 for locals
     
-    // Set up context register
-    emit.ORR(arm64::CTX_REG, arm64::X0, arm64::X0); // MOV X19, X0
+    // Set up context register (X19)
+    emit.ORR(arm64::CTX_REG, 31, arm64::X0); // MOV X19, X0
     
-    // Set up memory base (will be filled in during execute)
-    // emit.MOV_imm(arm64::MEM_BASE, ...);
+    // Save JitCompiler pointer (X27)
+    emit.ORR(arm64::X27, 31, arm64::X1); // MOV X27, X1
+    
+    // Load memory base from context or use direct pointer
+    // For now, assume fastmem is disabled and we use helper functions
+    emit.MOV_imm(arm64::MEM_BASE, 0); // Will be set up properly
     
     // Main dispatch loop
-    u32* loop_start = emit.label_here();
+    u8* loop_start = emit.current();
     
     // Check if still running
     emit.LDRB(arm64::X0, arm64::CTX_REG, offsetof(ThreadContext, running));
-    emit.CBZ(arm64::X0, 0); // Exit if not running - will patch
-    u32* exit_patch = emit.label_here() - 1;
+    emit.CBZ(arm64::X0, 48); // Exit if not running
     
     // Check if interrupted
     emit.LDRB(arm64::X0, arm64::CTX_REG, offsetof(ThreadContext, interrupted));
-    emit.CBNZ(arm64::X0, 0); // Exit if interrupted - will patch
-    u32* int_patch = emit.label_here() - 1;
+    emit.CBNZ(arm64::X0, 40); // Exit if interrupted
     
     // Load PC
-    emit.LDR(arm64::X0, arm64::CTX_REG, ctx_offset_pc());
+    emit.LDR(arm64::X1, arm64::CTX_REG, ctx_offset_pc());
     
-    // Look up compiled block (simplified - would call lookup function)
-    // For now, just exit to interpreter
-    emit.B(0);
-    u32* interp_patch = emit.label_here() - 1;
+    // Call lookup function: jit_lookup_block(jit, pc)
+    // X0 = jit (X27), X1 = pc (already loaded)
+    emit.ORR(arm64::X0, 31, arm64::X27); // MOV X0, X27
     
-    // Exit point
-    u32* exit_point = emit.label_here();
+    // Load function pointer and call
+    emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(&jit_lookup_block));
+    emit.BLR(arm64::X16);
     
+    // Check if we got a block
+    emit.CBZ(arm64::X0, 16); // Exit if no block
+    
+    // Jump to compiled code
+    emit.BR(arm64::X0);
+    
+    // Exit point - restore and return
     // Restore callee-saved registers
-    emit.ADD_imm(arm64::SP, arm64::SP, 96);
+    emit.ADD_imm(arm64::SP, arm64::SP, 112);
     emit.LDP(arm64::X27, arm64::X28, arm64::SP, -96);
     emit.LDP(arm64::X25, arm64::X26, arm64::SP, -80);
     emit.LDP(arm64::X23, arm64::X24, arm64::SP, -64);
@@ -1241,9 +1367,6 @@ void JitCompiler::generate_dispatcher() {
     emit.LDP(arm64::X19, arm64::X20, arm64::SP, -32);
     emit.LDP(arm64::X29, arm64::X30, arm64::SP, -16);
     emit.RET();
-    
-    // Patch branches
-    // ...
     
     dispatcher_ = reinterpret_cast<DispatcherFunc>(code_cache_);
     
@@ -1257,6 +1380,8 @@ void JitCompiler::generate_dispatcher() {
     code_write_ptr_ = reinterpret_cast<u8*>(
         (reinterpret_cast<uintptr_t>(code_write_ptr_) + 15) & ~15
     );
+    
+    LOGI("Dispatcher generated at %p (%zu bytes)", code_cache_, emit.size());
 #endif
 }
 

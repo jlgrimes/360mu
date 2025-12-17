@@ -94,6 +94,12 @@ struct CompiledBlock {
         bool linked;                // Has been linked?
     };
     std::vector<Link> links;
+    
+    // Block cache management (used by BlockCache)
+    CompiledBlock* hash_next = nullptr;  // Hash chain
+    CompiledBlock* hash_prev = nullptr;
+    CompiledBlock* lru_next = nullptr;   // LRU list
+    CompiledBlock* lru_prev = nullptr;
 };
 
 /**
@@ -265,6 +271,46 @@ public:
     void UZP1(int vd, int vn, int vm);
     void UZP2(int vd, int vn, int vm);
     
+    // NEON - integer vector
+    void ADD_vec(int vd, int vn, int vm, int size = 2);
+    void SUB_vec(int vd, int vn, int vm, int size = 2);
+    void AND_vec(int vd, int vn, int vm);
+    void ORR_vec(int vd, int vn, int vm);
+    void EOR_vec(int vd, int vn, int vm);
+    void BIC_vec(int vd, int vn, int vm);
+    void NOT_vec(int vd, int vn);
+    
+    // NEON - comparison
+    void CMEQ_vec(int vd, int vn, int vm, int size = 2);
+    void CMGT_vec(int vd, int vn, int vm, int size = 2);
+    void CMGE_vec(int vd, int vn, int vm, int size = 2);
+    
+    // NEON - min/max
+    void FMAX_vec(int vd, int vn, int vm, bool is_double = false);
+    void FMIN_vec(int vd, int vn, int vm, bool is_double = false);
+    
+    // NEON - reciprocal/sqrt
+    void FRECPE_vec(int vd, int vn, bool is_double = false);
+    void FRSQRTE_vec(int vd, int vn, bool is_double = false);
+    void FSQRT_vec(int vd, int vn, bool is_double = false);
+    
+    // NEON - convert
+    void FCVTZS_vec(int vd, int vn, bool is_double = false);
+    void FCVTZU_vec(int vd, int vn, bool is_double = false);
+    void SCVTF_vec(int vd, int vn, bool is_double = false);
+    void UCVTF_vec(int vd, int vn, bool is_double = false);
+    
+    // 32-bit mode operations
+    void ADD_32(int rd, int rn, int rm);
+    void SUB_32(int rd, int rn, int rm);
+    void MUL_32(int rd, int rn, int rm);
+    void SDIV_32(int rd, int rn, int rm);
+    void UDIV_32(int rd, int rn, int rm);
+    void LSL_32(int rd, int rn, int rm);
+    void LSR_32(int rd, int rn, int rm);
+    void ASR_32(int rd, int rn, int rm);
+    void ROR_32(int rd, int rn, int rm);
+    
     // Address manipulation
     void ADR(int rd, s32 offset);
     void ADRP(int rd, s64 offset);
@@ -334,7 +380,14 @@ public:
      */
     void flush_cache();
     
+    /**
+     * Look up block for dispatch (called from JIT code)
+     */
+    void* lookup_block_for_dispatch(GuestAddr pc);
+    
 private:
+    // Compile without locking (lock must be held)
+    CompiledBlock* compile_block_unlocked(GuestAddr addr);
     Memory* memory_ = nullptr;
     
     // Code cache

@@ -247,10 +247,78 @@ void ARM64Emitter::TST(int rn, int rm) {
     ANDS(31, rn, rm);
 }
 
-// Logical immediate encoding is complex - simplified version
+// Logical immediate encoding is complex - full implementation
+// ARM64 logical immediates are bitmask patterns that can be encoded
+// This implements the full encoder based on ARM ARM specification
+
+static bool encode_logical_imm_impl(u64 imm, bool is_64bit, u32& n, u32& immr, u32& imms) {
+    if (imm == 0 || imm == ~0ULL) return false;
+    if (!is_64bit) {
+        imm &= 0xFFFFFFFF;
+        if (imm == 0 || imm == 0xFFFFFFFF) return false;
+        // Replicate 32-bit pattern to 64-bit
+        imm |= (imm << 32);
+    }
+    
+    // Count trailing zeros and ones
+    int tz = __builtin_ctzll(imm);
+    int to = __builtin_ctzll(~(imm >> tz));
+    int size = tz + to;
+    
+    // Check if pattern repeats
+    u64 mask = (1ULL << size) - 1;
+    u64 pattern = imm & mask;
+    
+    // Verify pattern repeats across the entire value
+    for (int i = size; i < 64; i += size) {
+        if (((imm >> i) & mask) != pattern) {
+            // Try next power of 2 element size
+            size *= 2;
+            if (size > 64) return false;
+            mask = (size == 64) ? ~0ULL : (1ULL << size) - 1;
+            pattern = imm & mask;
+            i = 0;
+        }
+    }
+    
+    // Find the rotation and element size
+    int ones = __builtin_popcountll(pattern);
+    int rotation = 0;
+    
+    // Find where the ones start
+    if (pattern & 1) {
+        // Pattern starts with 1, find where 0s start
+        rotation = __builtin_ctzll(~pattern);
+        pattern = (pattern >> rotation) | (pattern << (size - rotation));
+        pattern &= mask;
+    }
+    
+    // Verify we have a contiguous sequence of ones
+    int trailing_zeros = __builtin_ctzll(pattern);
+    int leading_zeros = 64 - size + trailing_zeros;
+    u64 check = (pattern >> trailing_zeros);
+    if (check != ((1ULL << ones) - 1)) {
+        return false; // Not a valid bitmask
+    }
+    
+    // Encode N, immr, imms
+    // N is 1 for 64-bit element size, 0 otherwise
+    n = (size == 64) ? 1 : 0;
+    
+    // immr is the rotation amount
+    immr = (size - rotation) & (size - 1);
+    
+    // imms encodes both element size and number of ones
+    // High bits encode element size (inverted), low bits encode ones-1
+    int len = 31 - __builtin_clz(size);
+    imms = ((~(size - 1) << 1) & 0x3F) | (ones - 1);
+    
+    return true;
+}
+
 void ARM64Emitter::AND_imm(int rd, int rn, u64 imm) {
     u32 n, immr, imms;
-    if (encode_logical_imm_params(imm, true, n, immr, imms)) {
+    if (encode_logical_imm_impl(imm, true, n, immr, imms)) {
         emit32(0x92000000 | (n << 22) | (immr << 16) | (imms << 10) | (rn << 5) | rd);
     } else {
         // Fallback: load immediate to temp register and use reg version
@@ -261,7 +329,7 @@ void ARM64Emitter::AND_imm(int rd, int rn, u64 imm) {
 
 void ARM64Emitter::ORR_imm(int rd, int rn, u64 imm) {
     u32 n, immr, imms;
-    if (encode_logical_imm_params(imm, true, n, immr, imms)) {
+    if (encode_logical_imm_impl(imm, true, n, immr, imms)) {
         emit32(0xB2000000 | (n << 22) | (immr << 16) | (imms << 10) | (rn << 5) | rd);
     } else {
         MOV_imm(arm64::X16, imm);
@@ -271,7 +339,7 @@ void ARM64Emitter::ORR_imm(int rd, int rn, u64 imm) {
 
 void ARM64Emitter::EOR_imm(int rd, int rn, u64 imm) {
     u32 n, immr, imms;
-    if (encode_logical_imm_params(imm, true, n, immr, imms)) {
+    if (encode_logical_imm_impl(imm, true, n, immr, imms)) {
         emit32(0xD2000000 | (n << 22) | (immr << 16) | (imms << 10) | (rn << 5) | rd);
     } else {
         MOV_imm(arm64::X16, imm);
@@ -784,34 +852,241 @@ void ARM64Emitter::patch_branch(u32* patch_site, void* target) {
 }
 
 //=============================================================================
-// Helpers
+// NEON - Additional instructions for VMX128 emulation
 //=============================================================================
 
-bool encode_logical_imm_params(u64 imm, bool is_64bit, u32& n, u32& immr, u32& imms) {
-    // This is a simplified version - full implementation is complex
-    // Returns false if the immediate can't be encoded
-    
-    if (imm == 0 || imm == ~0ULL) return false;
-    
-    // Try to find valid encoding
-    // For simplicity, we'll return false for complex patterns and use fallback
-    
-    // Check for simple patterns
-    if (is_64bit) {
-        // All 1s pattern
-        if (imm == 0xFFFFFFFF) {
-            n = 0; immr = 0; imms = 31;
-            return true;
-        }
-        // Powers of 2 minus 1
-        if ((imm & (imm + 1)) == 0) {
-            int bits = __builtin_ctzll(imm + 1);
-            n = 1; immr = 0; imms = bits - 1;
-            return true;
-        }
+void ARM64Emitter::FMADD_vec(int vd, int vn, int vm, int va, bool is_double) {
+    // FMLA Vd.4S, Vn.4S, Vm.4S (fused multiply-add)
+    u32 sz = is_double ? 1 : 0;
+    emit32(0x4E20CC00 | (sz << 22) | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::FCMP_vec(int vd, int vn, int vm, bool is_double) {
+    // FCMEQ Vd.4S, Vn.4S, Vm.4S
+    u32 sz = is_double ? 1 : 0;
+    emit32(0x4E20E400 | (sz << 22) | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::LD1(int vt, int rn, int lane) {
+    if (lane < 0) {
+        // LD1 {Vt.4S}, [Xn]
+        emit32(0x4C407800 | (rn << 5) | vt);
+    } else {
+        // LD1 {Vt.S}[lane], [Xn]
+        emit32(0x4D408000 | ((lane & 3) << 12) | (rn << 5) | vt);
     }
-    
-    return false; // Use fallback for other patterns
+}
+
+void ARM64Emitter::ST1(int vt, int rn, int lane) {
+    if (lane < 0) {
+        // ST1 {Vt.4S}, [Xn]
+        emit32(0x4C007800 | (rn << 5) | vt);
+    } else {
+        // ST1 {Vt.S}[lane], [Xn]
+        emit32(0x4D008000 | ((lane & 3) << 12) | (rn << 5) | vt);
+    }
+}
+
+void ARM64Emitter::INS_element(int vd, int index, int vn, int src_index) {
+    // INS Vd.S[index], Vn.S[src_index]
+    u32 imm5 = ((index & 3) << 3) | 0x04;
+    u32 imm4 = (src_index & 3) << 1;
+    emit32(0x6E000400 | (imm5 << 16) | (imm4 << 11) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::INS_general(int vd, int index, int rn) {
+    // INS Vd.S[index], Wn
+    u32 imm5 = ((index & 3) << 3) | 0x04;
+    emit32(0x4E001C00 | (imm5 << 16) | (rn << 5) | vd);
+}
+
+void ARM64Emitter::TRN1(int vd, int vn, int vm) {
+    emit32(0x4E802800 | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::TRN2(int vd, int vn, int vm) {
+    emit32(0x4E806800 | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::ZIP1(int vd, int vn, int vm) {
+    emit32(0x4E803800 | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::ZIP2(int vd, int vn, int vm) {
+    emit32(0x4E807800 | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::UZP1(int vd, int vn, int vm) {
+    emit32(0x4E801800 | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::UZP2(int vd, int vn, int vm) {
+    emit32(0x4E805800 | (vm << 16) | (vn << 5) | vd);
+}
+
+//=============================================================================
+// NEON - Integer vector operations
+//=============================================================================
+
+void ARM64Emitter::ADD_vec(int vd, int vn, int vm, int size) {
+    // ADD Vd.4S, Vn.4S, Vm.4S (size: 0=8b, 1=16b, 2=32b, 3=64b)
+    emit32(0x4E208400 | (size << 22) | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::SUB_vec(int vd, int vn, int vm, int size) {
+    emit32(0x6E208400 | (size << 22) | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::AND_vec(int vd, int vn, int vm) {
+    emit32(0x4E201C00 | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::ORR_vec(int vd, int vn, int vm) {
+    emit32(0x4EA01C00 | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::EOR_vec(int vd, int vn, int vm) {
+    emit32(0x6E201C00 | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::BIC_vec(int vd, int vn, int vm) {
+    emit32(0x4E601C00 | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::NOT_vec(int vd, int vn) {
+    emit32(0x6E205800 | (vn << 5) | vd);
+}
+
+//=============================================================================
+// NEON - Comparison
+//=============================================================================
+
+void ARM64Emitter::CMEQ_vec(int vd, int vn, int vm, int size) {
+    emit32(0x6E208C00 | (size << 22) | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::CMGT_vec(int vd, int vn, int vm, int size) {
+    emit32(0x4E203400 | (size << 22) | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::CMGE_vec(int vd, int vn, int vm, int size) {
+    emit32(0x4E203C00 | (size << 22) | (vm << 16) | (vn << 5) | vd);
+}
+
+//=============================================================================
+// NEON - Min/Max
+//=============================================================================
+
+void ARM64Emitter::FMAX_vec(int vd, int vn, int vm, bool is_double) {
+    u32 sz = is_double ? 1 : 0;
+    emit32(0x4E20F400 | (sz << 22) | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::FMIN_vec(int vd, int vn, int vm, bool is_double) {
+    u32 sz = is_double ? 1 : 0;
+    emit32(0x4EA0F400 | (sz << 22) | (vm << 16) | (vn << 5) | vd);
+}
+
+//=============================================================================
+// NEON - Reciprocal/Square root estimates
+//=============================================================================
+
+void ARM64Emitter::FRECPE_vec(int vd, int vn, bool is_double) {
+    u32 sz = is_double ? 1 : 0;
+    emit32(0x4EA1D800 | (sz << 22) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::FRSQRTE_vec(int vd, int vn, bool is_double) {
+    u32 sz = is_double ? 1 : 0;
+    emit32(0x6EA1D800 | (sz << 22) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::FSQRT_vec(int vd, int vn, bool is_double) {
+    u32 sz = is_double ? 1 : 0;
+    emit32(0x6EA1F800 | (sz << 22) | (vn << 5) | vd);
+}
+
+//=============================================================================
+// NEON - Convert
+//=============================================================================
+
+void ARM64Emitter::FCVTZS_vec(int vd, int vn, bool is_double) {
+    u32 sz = is_double ? 1 : 0;
+    emit32(0x4EA1B800 | (sz << 22) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::FCVTZU_vec(int vd, int vn, bool is_double) {
+    u32 sz = is_double ? 1 : 0;
+    emit32(0x6EA1B800 | (sz << 22) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::SCVTF_vec(int vd, int vn, bool is_double) {
+    u32 sz = is_double ? 1 : 0;
+    emit32(0x4E21D800 | (sz << 22) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::UCVTF_vec(int vd, int vn, bool is_double) {
+    u32 sz = is_double ? 1 : 0;
+    emit32(0x6E21D800 | (sz << 22) | (vn << 5) | vd);
+}
+
+//=============================================================================
+// Patching helpers
+//=============================================================================
+
+void ARM64Emitter::patch_imm(u32* patch_site, u64 imm) {
+    // For patching MOV immediate sequences
+    // This is complex and depends on how the immediate was originally encoded
+    // For now, just update a single MOVZ/MOVK
+    u16 imm16 = imm & 0xFFFF;
+    u32 opcode = *patch_site & 0xFFE00000;
+    *patch_site = opcode | ((u32)imm16 << 5) | (*patch_site & 0x1F);
+}
+
+void ARM64Emitter::bind_label(u32* label, u32* target) {
+    s64 offset = reinterpret_cast<u8*>(target) - reinterpret_cast<u8*>(label);
+    patch_branch(label, target);
+}
+
+//=============================================================================
+// Helper for 32-bit mode operations
+//=============================================================================
+
+void ARM64Emitter::ADD_32(int rd, int rn, int rm) {
+    // ADD Wd, Wn, Wm (32-bit)
+    emit32(0x0B000000 | (rm << 16) | (rn << 5) | rd);
+}
+
+void ARM64Emitter::SUB_32(int rd, int rn, int rm) {
+    emit32(0x4B000000 | (rm << 16) | (rn << 5) | rd);
+}
+
+void ARM64Emitter::MUL_32(int rd, int rn, int rm) {
+    emit32(0x1B007C00 | (rm << 16) | (rn << 5) | rd);
+}
+
+void ARM64Emitter::SDIV_32(int rd, int rn, int rm) {
+    emit32(0x1AC00C00 | (rm << 16) | (rn << 5) | rd);
+}
+
+void ARM64Emitter::UDIV_32(int rd, int rn, int rm) {
+    emit32(0x1AC00800 | (rm << 16) | (rn << 5) | rd);
+}
+
+void ARM64Emitter::LSL_32(int rd, int rn, int rm) {
+    emit32(0x1AC02000 | (rm << 16) | (rn << 5) | rd);
+}
+
+void ARM64Emitter::LSR_32(int rd, int rn, int rm) {
+    emit32(0x1AC02400 | (rm << 16) | (rn << 5) | rd);
+}
+
+void ARM64Emitter::ASR_32(int rd, int rn, int rm) {
+    emit32(0x1AC02800 | (rm << 16) | (rn << 5) | rd);
+}
+
+void ARM64Emitter::ROR_32(int rd, int rn, int rm) {
+    emit32(0x1AC02C00 | (rm << 16) | (rn << 5) | rd);
 }
 
 } // namespace x360mu

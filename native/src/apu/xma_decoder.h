@@ -15,6 +15,7 @@
 #include <queue>
 #include <mutex>
 #include <atomic>
+#include <array>
 
 namespace x360mu {
 
@@ -30,6 +31,11 @@ struct XmaFrameHeader {
     u16 loop_end;          // Loop end sub-frame
     u8 num_subframes;      // Number of sub-frames in frame
 };
+
+// Forward declaration for FFmpeg decoder
+#ifdef X360MU_USE_FFMPEG
+class FFmpegXmaDecoder;
+#endif
 
 /**
  * XMA stream context (one per channel pair)
@@ -59,10 +65,15 @@ struct XmaContext {
     u32 loop_start_offset;
     u32 loop_end_offset;
     
-    // Decoder state
+    // Decoder state (fallback software decoder)
     std::array<s16, 2048> history;
     u32 history_index;
     std::array<f32, 128> predictor_coefs;
+    
+    // FFmpeg decoder (when available)
+#ifdef X360MU_USE_FFMPEG
+    std::unique_ptr<FFmpegXmaDecoder> ffmpeg_decoder;
+#endif
     
     // Statistics
     u32 samples_decoded;

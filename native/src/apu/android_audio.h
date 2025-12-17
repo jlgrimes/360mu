@@ -19,6 +19,11 @@
 
 #ifdef __ANDROID__
 #include <aaudio/AAudio.h>
+#else
+// Stub types for non-Android builds
+using aaudio_data_callback_result_t = int32_t;
+constexpr aaudio_data_callback_result_t AAUDIO_CALLBACK_RESULT_CONTINUE = 0;
+constexpr aaudio_data_callback_result_t AAUDIO_CALLBACK_RESULT_STOP = 1;
 #endif
 
 namespace x360mu {
@@ -257,11 +262,12 @@ private:
 };
 
 /**
- * Audio Mixer
+ * Simple Audio Mixer
  * 
  * Mixes multiple audio sources into a single output.
+ * This is a simpler mixer for direct source playback.
  */
-class AudioMixer {
+class SimpleAudioMixer {
 public:
     static constexpr u32 MAX_SOURCES = 16;
     

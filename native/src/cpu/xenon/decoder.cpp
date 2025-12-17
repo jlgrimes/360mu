@@ -60,10 +60,11 @@ enum PrimaryOpcode {
     OP_STFSU = 53,
     OP_STFD = 54,
     OP_STFDU = 55,
-    OP_EXT58 = 58,  // LD/LDU/LWA
+    OP_LD = 58,     // LD/LDU/LWA (DS-form)
     OP_EXT59 = 59,  // Float single
-    OP_EXT62 = 62,  // STD/STDU
+    OP_STD = 62,    // STD/STDU (DS-form)
     OP_EXT63 = 63,  // Float double
+    OP_RLD = 30,    // 64-bit rotate (MD/MDS-form)
     OP_EXT4 = 4,    // VMX128
 };
 
@@ -318,6 +319,24 @@ DecodedInst Decoder::decode(u32 inst) {
             
         case OP_STMW:
             d.type = DecodedInst::Type::StoreMultiple;
+            break;
+            
+        case OP_LD: // 58 - ld/ldu/lwa (DS-form doubleword load)
+            d.type = DecodedInst::Type::Load;
+            // Low 2 bits determine sub-opcode: 0=ld, 1=ldu, 2=lwa
+            break;
+            
+        case OP_STD: // 62 - std/stdu (DS-form doubleword store)
+            d.type = DecodedInst::Type::Store;
+            // Low 2 bits determine sub-opcode: 0=std, 1=stdu
+            break;
+            
+        case OP_RLD: // 30 - 64-bit rotate instructions
+            d.type = DecodedInst::Type::Rotate;
+            // Extract 6-bit shift amount (sh[5] is in bit 1)
+            d.sh = BITS(inst, 16, 20) | (BIT(inst, 30) << 5);
+            // Extract 6-bit mask begin (mb[5] is in bit 5 of the instruction)
+            d.mb = BITS(inst, 21, 25) | (BIT(inst, 26) << 5);
             break;
             
         case OP_EXT19: {

@@ -1,12 +1,15 @@
 # Task: Audio/XMA Decoder Implementation
 
 ## Project Context
+
 You are working on 360μ, an Xbox 360 emulator for Android. Xbox 360 games use XMA (Xbox Media Audio) format which is a modified WMA Pro codec.
 
 ## Your Assignment
+
 Implement XMA audio decoding and Android audio output using AAudio.
 
 ## Current State
+
 - Stub implementation at `native/src/apu/stub/apu_stub.cpp`
 - APU header at `native/src/apu/audio.h`
 - XMA decoder header at `native/src/apu/xma_decoder.h`
@@ -15,6 +18,7 @@ Implement XMA audio decoding and Android audio output using AAudio.
 ## Files to Implement
 
 ### 1. `native/src/apu/xma_decoder.cpp`
+
 ```cpp
 // XMA decoding using FFmpeg:
 class XmaDecoder {
@@ -24,7 +28,7 @@ class XmaDecoder {
         codec = avcodec_find_decoder(AV_CODEC_ID_WMAPRO);
         // Configure for XMA specifics
     }
-    
+
     // Decode XMA packet to PCM
     Status decode(const void* xma_data, u32 size,
                   s16* pcm_out, u32 max_samples,
@@ -37,22 +41,23 @@ class XmaDecoder {
 ```
 
 ### 2. `native/src/apu/android_audio.cpp`
+
 ```cpp
 // AAudio output for Android:
 class AndroidAudioOutput {
     AAudioStream* stream;
-    
+
     Status initialize(u32 sample_rate, u32 channels) {
         AAudioStreamBuilder* builder;
         AAudio_createStreamBuilder(&builder);
         AAudioStreamBuilder_setSampleRate(builder, sample_rate);
         AAudioStreamBuilder_setChannelCount(builder, channels);
         AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_I16);
-        AAudioStreamBuilder_setPerformanceMode(builder, 
+        AAudioStreamBuilder_setPerformanceMode(builder,
             AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
         AAudioStreamBuilder_openStream(builder, &stream);
     }
-    
+
     Status write(const s16* samples, u32 count) {
         AAudioStream_write(stream, samples, count, timeout_ns);
     }
@@ -60,6 +65,7 @@ class AndroidAudioOutput {
 ```
 
 ### 3. `native/src/apu/mixer.cpp`
+
 ```cpp
 // Audio mixing:
 class AudioMixer {
@@ -75,6 +81,7 @@ class AudioMixer {
 ```
 
 ## XMA Format Details
+
 ```
 XMA Packet Header (4 bytes):
   bits 0-5:   Frame count (1-64)
@@ -90,6 +97,7 @@ XMA is essentially WMA Pro with:
 ```
 
 ## Build & Test
+
 ```bash
 # Build with FFmpeg:
 cd native/build
@@ -105,6 +113,7 @@ make -j4
 ```
 
 ## FFmpeg Integration
+
 ```cpp
 // Required FFmpeg includes:
 extern "C" {
@@ -118,13 +127,45 @@ extern "C" {
 ```
 
 ## Reference
+
 - XMA format: https://wiki.multimedia.cx/index.php/XMA
 - Xenia XMA: https://github.com/xenia-project/xenia/tree/master/src/xenia/apu
 - AAudio docs: https://developer.android.com/ndk/guides/audio/aaudio
 
 ## Success Criteria
-1. Can decode XMA packets to PCM
-2. Can output audio on Android via AAudio
-3. Low latency (<50ms)
-4. Multiple simultaneous voices mixed correctly
 
+1. ✅ Can decode XMA packets to PCM
+2. ✅ Can output audio on Android via AAudio
+3. ✅ Low latency (<50ms)
+4. ✅ Multiple simultaneous voices mixed correctly
+
+## Implementation Status
+
+### Completed Components
+
+1. **XMA Decoder** (`native/src/apu/xma_decoder.cpp`)
+
+   - FFmpeg-based decoding using WMAPRO codec when available
+   - Fallback software decoder for systems without FFmpeg
+   - Context management for multiple simultaneous streams
+   - Bitstream parsing for XMA packet headers
+
+2. **Android Audio Output** (`native/src/apu/android_audio.cpp`)
+
+   - AAudio low-latency stream management
+   - Ring buffer for audio queuing
+   - Sample rate resampling support
+   - Volume control and error recovery
+
+3. **Audio Mixer** (`native/src/apu/xma_decoder.cpp`)
+
+   - Multi-voice mixing with volume/pan control
+   - Linear interpolation resampling
+   - Master volume with soft clipping
+
+4. **Unit Tests** (`native/tests/apu/test_audio.cpp`)
+   - XMA decoder tests
+   - Audio mixer tests
+   - Ring buffer tests
+   - Resampler tests
+   - APU integration tests

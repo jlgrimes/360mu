@@ -253,6 +253,8 @@ private:
                         u32 pixel_count,
                         EdramSurfaceFormat src_format,
                         EdramSurfaceFormat dst_format);
+    
+    void resolve_pixel(const u8* src, u8* dst, u32 bpp, u32 sample_count);
 };
 
 /**

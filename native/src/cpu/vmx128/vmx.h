@@ -76,8 +76,12 @@ struct Vmx128Inst {
         VRfin, VRfiz, VRfip, VRfim,
         // Xbox 360 extensions
         VDot3fp, VDot4fp,           // Dot product
+        VCross3fp,                  // 3D cross product
         VPack128,                   // 128-bit pack
         VUnpack128,                 // 128-bit unpack
+        VShufD,                     // Shuffle dwords
+        VMtx44Mul,                  // 4x4 matrix multiply (software)
+        VMtxTrn,                    // Matrix transpose
         // Load/Store (handled separately but decoded here)
         Lvx, Lvxl, Stvx, Stvxl,
         Lvebx, Lvehx, Lvewx,
@@ -110,15 +114,29 @@ public:
     void execute_load_store(ThreadContext& ctx, const Vmx128Inst& inst, 
                            class Memory* memory, GuestAddr effective_addr);
     
+    // Public arithmetic operations (for direct use and testing)
+    void vaddfp(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
+    void vsubfp(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
+    void vmulfp(VectorReg& vd, const VectorReg& va, const VectorReg& vc);
+    void vmaddfp(VectorReg& vd, const VectorReg& va, const VectorReg& vb, const VectorReg& vc);
+    void vdot3fp(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
+    void vdot4fp(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
+    void vcross3fp(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
+    void vshufd(VectorReg& vd, const VectorReg& vb, u8 imm);
+    void vand(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
+    void vor(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
+    void vxor(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
+    void vspltw(VectorReg& vd, const VectorReg& vb, u8 uimm);
+    void vspltisw(VectorReg& vd, s8 simm);
+    void vadd_uwm(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
+    void vsub_uwm(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
+    
 private:
-    // NEON implementation helpers
-    // Integer operations
+    // NEON implementation helpers - private operations
     void vadd_ubm(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
     void vadd_uhm(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
-    void vadd_uwm(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
     void vsub_ubm(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
     void vsub_uhm(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
-    void vsub_uwm(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
     
     // Saturating operations
     void vaddsbs(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
@@ -128,11 +146,7 @@ private:
     void vadduhs(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
     void vadduws(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
     
-    // Float operations
-    void vaddfp(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
-    void vsubfp(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
-    void vmulfp(VectorReg& vd, const VectorReg& va, const VectorReg& vc);
-    void vmaddfp(VectorReg& vd, const VectorReg& va, const VectorReg& vb, const VectorReg& vc);
+    // Float operations (private)
     void vnmsubfp(VectorReg& vd, const VectorReg& va, const VectorReg& vb, const VectorReg& vc);
     void vmaxfp(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
     void vminfp(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
@@ -141,9 +155,9 @@ private:
     void vrefp(VectorReg& vd, const VectorReg& vb);
     void vrsqrtefp(VectorReg& vd, const VectorReg& vb);
     
-    // Dot products (Xbox 360 extension)
-    void vdot3fp(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
-    void vdot4fp(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
+    // Matrix operations (software emulation for Xbox 360 specific)
+    void vmtx44mul(VectorReg vd[4], const VectorReg va[4], const VectorReg vb[4]);
+    void vmtxtrn(VectorReg vd[4], const VectorReg va[4]);
     
     // Compare operations
     void vcmpeqfp(VectorReg& vd, const VectorReg& va, const VectorReg& vb, bool rc, ThreadContext& ctx);
@@ -153,12 +167,9 @@ private:
     void vcmpgtuw(VectorReg& vd, const VectorReg& va, const VectorReg& vb, bool rc, ThreadContext& ctx);
     void vcmpgtsw(VectorReg& vd, const VectorReg& va, const VectorReg& vb, bool rc, ThreadContext& ctx);
     
-    // Logical operations
-    void vand(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
+    // Logical operations (private)
     void vandc(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
-    void vor(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
     void vorc(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
-    void vxor(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
     void vnor(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
     
     // Permute
@@ -173,13 +184,11 @@ private:
     void vmrglh(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
     void vmrglw(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
     
-    // Splat
+    // Splat (private)
     void vspltb(VectorReg& vd, const VectorReg& vb, u8 uimm);
     void vsplth(VectorReg& vd, const VectorReg& vb, u8 uimm);
-    void vspltw(VectorReg& vd, const VectorReg& vb, u8 uimm);
     void vspltisb(VectorReg& vd, s8 simm);
     void vspltish(VectorReg& vd, s8 simm);
-    void vspltisw(VectorReg& vd, s8 simm);
     
     // Shift/Rotate
     void vslb(VectorReg& vd, const VectorReg& va, const VectorReg& vb);
@@ -313,6 +322,28 @@ inline void Vmx128Unit::vxor(VectorReg& vd, const VectorReg& va, const VectorReg
     uint32x4_t b = vld1q_u32(vb.u32x4);
     uint32x4_t result = veorq_u32(a, b);
     vst1q_u32(vd.u32x4, result);
+}
+
+// Cross product (critical for physics/lighting)
+inline void Vmx128Unit::vcross3fp(VectorReg& vd, const VectorReg& va, const VectorReg& vb) {
+    // Cross product: vd = va × vb
+    float ax = va.f32x4[0], ay = va.f32x4[1], az = va.f32x4[2];
+    float bx = vb.f32x4[0], by = vb.f32x4[1], bz = vb.f32x4[2];
+    
+    vd.f32x4[0] = ay * bz - az * by;
+    vd.f32x4[1] = az * bx - ax * bz;
+    vd.f32x4[2] = ax * by - ay * bx;
+    vd.f32x4[3] = 0.0f;
+}
+
+// Shuffle dwords
+inline void Vmx128Unit::vshufd(VectorReg& vd, const VectorReg& vb, u8 imm) {
+    VectorReg temp;
+    temp.u32x4[0] = vb.u32x4[(imm >> 0) & 3];
+    temp.u32x4[1] = vb.u32x4[(imm >> 2) & 3];
+    temp.u32x4[2] = vb.u32x4[(imm >> 4) & 3];
+    temp.u32x4[3] = vb.u32x4[(imm >> 6) & 3];
+    vd = temp;
 }
 
 inline void Vmx128Unit::vadd_uwm(VectorReg& vd, const VectorReg& va, const VectorReg& vb) {

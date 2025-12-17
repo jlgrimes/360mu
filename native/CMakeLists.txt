@@ -61,6 +61,7 @@ if(X360MU_ENABLE_JIT)
     list(APPEND CPU_SOURCES
         src/cpu/jit/jit_compiler.cpp
         src/cpu/jit/arm64_emitter.cpp
+        src/cpu/jit/block_cache.cpp
     )
     add_definitions(-DX360MU_JIT_ENABLED)
 endif()
@@ -215,6 +216,12 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
     )
     FetchContent_MakeAvailable(googletest)
     
+    # JIT tests only on ARM64
+    set(JIT_TEST_SOURCES "")
+    if(X360MU_ENABLE_JIT AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+        set(JIT_TEST_SOURCES tests/cpu/test_jit.cpp)
+    endif()
+    
     add_executable(x360mu_tests
         tests/test_main.cpp
         tests/cpu/test_decoder.cpp
@@ -222,6 +229,8 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
         tests/cpu/test_vmx128.cpp
         tests/memory/test_memory.cpp
         tests/kernel/test_xex_loader.cpp
+        tests/apu/test_audio.cpp
+        ${JIT_TEST_SOURCES}
     )
     
     target_link_libraries(x360mu_tests

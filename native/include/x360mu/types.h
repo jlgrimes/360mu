@@ -185,6 +185,8 @@ enum class Status {
     InvalidFormat,
     IoError,
     Timeout,
+    ErrorInit,
+    ErrorSwapchain,
 };
 
 inline const char* status_to_string(Status s) {
@@ -198,6 +200,8 @@ inline const char* status_to_string(Status s) {
         case Status::InvalidFormat: return "InvalidFormat";
         case Status::IoError: return "IoError";
         case Status::Timeout: return "Timeout";
+        case Status::ErrorInit: return "ErrorInit";
+        case Status::ErrorSwapchain: return "ErrorSwapchain";
         default: return "Unknown";
     }
 }

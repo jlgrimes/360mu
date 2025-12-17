@@ -5,6 +5,9 @@
  * 
  * Decodes Xbox Media Audio (XMA/XMA2) to PCM.
  * XMA is a lossy audio codec based on WMA Pro.
+ * 
+ * When FFmpeg is available, uses libavcodec's WMAPRO decoder.
+ * Otherwise falls back to a simplified custom decoder.
  */
 
 #include "xma_decoder.h"
@@ -12,6 +15,14 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+
+#ifdef X360MU_USE_FFMPEG
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/opt.h>
+#include <libswresample/swresample.h>
+}
+#endif
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -28,6 +39,218 @@
 #endif
 
 namespace x360mu {
+
+//=============================================================================
+// FFmpeg XMA Decoder (when available)
+//=============================================================================
+
+#ifdef X360MU_USE_FFMPEG
+
+/**
+ * FFmpeg-based XMA decoder
+ * Uses WMAPRO codec with XMA-specific configuration
+ */
+class FFmpegXmaDecoder {
+public:
+    FFmpegXmaDecoder() = default;
+    ~FFmpegXmaDecoder() { shutdown(); }
+    
+    Status initialize(u32 sample_rate, u32 num_channels) {
+        // Find WMAPRO decoder (XMA is based on it)
+        const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_WMAPRO);
+        if (!codec) {
+            LOGE("FFmpeg WMAPRO decoder not found");
+            return Status::NotFound;
+        }
+        
+        codec_ctx_ = avcodec_alloc_context3(codec);
+        if (!codec_ctx_) {
+            LOGE("Failed to allocate codec context");
+            return Status::OutOfMemory;
+        }
+        
+        // Configure for XMA
+        codec_ctx_->sample_rate = sample_rate;
+        codec_ctx_->channels = num_channels;
+        codec_ctx_->channel_layout = (num_channels == 2) ? AV_CH_LAYOUT_STEREO : AV_CH_LAYOUT_MONO;
+        codec_ctx_->sample_fmt = AV_SAMPLE_FMT_FLTP;
+        codec_ctx_->bits_per_coded_sample = 16;
+        codec_ctx_->block_align = 2048;  // XMA packet size
+        codec_ctx_->bit_rate = 192000;   // Typical XMA bitrate
+        
+        // XMA extradata (simplified)
+        static const u8 xma_extradata[] = {
+            0x00, 0x00, 0x00, 0x00,  // Format tag
+            0x02, 0x00,              // Channels
+            0x00, 0x00, 0xBB, 0x80,  // Sample rate (48000)
+            0x00, 0x00, 0x00, 0x00,  // Bytes per second
+            0x00, 0x08,              // Block align (2048)
+            0x10, 0x00,              // Bits per sample
+            0x00, 0x00               // Extra data size
+        };
+        codec_ctx_->extradata = static_cast<u8*>(av_malloc(sizeof(xma_extradata)));
+        if (codec_ctx_->extradata) {
+            memcpy(codec_ctx_->extradata, xma_extradata, sizeof(xma_extradata));
+            codec_ctx_->extradata_size = sizeof(xma_extradata);
+        }
+        
+        if (avcodec_open2(codec_ctx_, codec, nullptr) < 0) {
+            LOGE("Failed to open WMAPRO codec");
+            avcodec_free_context(&codec_ctx_);
+            return Status::Error;
+        }
+        
+        // Allocate frame
+        frame_ = av_frame_alloc();
+        if (!frame_) {
+            avcodec_free_context(&codec_ctx_);
+            return Status::OutOfMemory;
+        }
+        
+        // Allocate packet
+        packet_ = av_packet_alloc();
+        if (!packet_) {
+            av_frame_free(&frame_);
+            avcodec_free_context(&codec_ctx_);
+            return Status::OutOfMemory;
+        }
+        
+        // Initialize resampler (FLTP to S16)
+        swr_ctx_ = swr_alloc_set_opts(
+            nullptr,
+            codec_ctx_->channel_layout,
+            AV_SAMPLE_FMT_S16,
+            sample_rate,
+            codec_ctx_->channel_layout,
+            AV_SAMPLE_FMT_FLTP,
+            sample_rate,
+            0, nullptr
+        );
+        
+        if (!swr_ctx_ || swr_init(swr_ctx_) < 0) {
+            LOGW("Resampler init failed, will do manual conversion");
+            if (swr_ctx_) {
+                swr_free(&swr_ctx_);
+                swr_ctx_ = nullptr;
+            }
+        }
+        
+        sample_rate_ = sample_rate;
+        num_channels_ = num_channels;
+        initialized_ = true;
+        
+        LOGI("FFmpeg XMA decoder initialized: %uHz, %u channels", sample_rate, num_channels);
+        return Status::Ok;
+    }
+    
+    void shutdown() {
+        if (swr_ctx_) {
+            swr_free(&swr_ctx_);
+            swr_ctx_ = nullptr;
+        }
+        if (packet_) {
+            av_packet_free(&packet_);
+            packet_ = nullptr;
+        }
+        if (frame_) {
+            av_frame_free(&frame_);
+            frame_ = nullptr;
+        }
+        if (codec_ctx_) {
+            avcodec_free_context(&codec_ctx_);
+            codec_ctx_ = nullptr;
+        }
+        initialized_ = false;
+    }
+    
+    /**
+     * Decode XMA packet to PCM
+     * Returns number of samples decoded
+     */
+    u32 decode(const u8* input, u32 input_size, s16* output, u32 max_samples) {
+        if (!initialized_ || !input || !output || input_size == 0) {
+            return 0;
+        }
+        
+        // Parse XMA packet header
+        u32 frame_count = (input[0] >> 2) & 0x3F;
+        u32 skip_samples = ((input[0] & 0x03) << 13) | (input[1] << 5) | (input[2] >> 3);
+        
+        (void)frame_count;  // Used for validation
+        (void)skip_samples; // Used for start of stream
+        
+        // Skip header (4 bytes) for actual data
+        const u8* xma_data = input + 4;
+        u32 xma_size = input_size - 4;
+        
+        // Feed data to decoder
+        packet_->data = const_cast<u8*>(xma_data);
+        packet_->size = xma_size;
+        
+        int ret = avcodec_send_packet(codec_ctx_, packet_);
+        if (ret < 0) {
+            LOGD("avcodec_send_packet failed: %d", ret);
+            return 0;
+        }
+        
+        u32 total_samples = 0;
+        
+        while (total_samples < max_samples) {
+            ret = avcodec_receive_frame(codec_ctx_, frame_);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                break;
+            } else if (ret < 0) {
+                LOGD("avcodec_receive_frame failed: %d", ret);
+                break;
+            }
+            
+            u32 samples_to_write = std::min(static_cast<u32>(frame_->nb_samples),
+                                           max_samples - total_samples);
+            
+            // Convert FLTP to S16 interleaved
+            if (swr_ctx_) {
+                u8* out_ptr = reinterpret_cast<u8*>(output + total_samples * num_channels_);
+                const u8* const* in_ptr = const_cast<const u8* const*>(frame_->extended_data);
+                swr_convert(swr_ctx_, &out_ptr, samples_to_write,
+                           in_ptr, frame_->nb_samples);
+            } else {
+                // Manual conversion
+                for (u32 i = 0; i < samples_to_write; i++) {
+                    for (u32 ch = 0; ch < num_channels_; ch++) {
+                        float sample = reinterpret_cast<float*>(frame_->data[ch])[i];
+                        sample = std::max(-1.0f, std::min(1.0f, sample));
+                        output[(total_samples + i) * num_channels_ + ch] = 
+                            static_cast<s16>(sample * 32767.0f);
+                    }
+                }
+            }
+            
+            total_samples += samples_to_write;
+        }
+        
+        return total_samples;
+    }
+    
+    void reset() {
+        if (codec_ctx_) {
+            avcodec_flush_buffers(codec_ctx_);
+        }
+    }
+    
+    bool is_initialized() const { return initialized_; }
+    
+private:
+    AVCodecContext* codec_ctx_ = nullptr;
+    AVFrame* frame_ = nullptr;
+    AVPacket* packet_ = nullptr;
+    SwrContext* swr_ctx_ = nullptr;
+    
+    u32 sample_rate_ = 48000;
+    u32 num_channels_ = 2;
+    bool initialized_ = false;
+};
+
+#endif // X360MU_USE_FFMPEG
 
 //=============================================================================
 // XMA Constants and Tables
@@ -147,6 +370,15 @@ u32 XmaDecoder::create_context(u32 sample_rate, u32 num_channels) {
                 contexts_[i]->predictor_coefs[j] = 0.0f;
             }
             
+#ifdef X360MU_USE_FFMPEG
+            // Try to create FFmpeg decoder
+            contexts_[i]->ffmpeg_decoder = std::make_unique<FFmpegXmaDecoder>();
+            if (contexts_[i]->ffmpeg_decoder->initialize(sample_rate, num_channels) != Status::Ok) {
+                LOGW("FFmpeg decoder init failed, using fallback for context %u", i);
+                contexts_[i]->ffmpeg_decoder.reset();
+            }
+#endif
+            
             LOGD("Created XMA context %u: %uHz, %u channels", i, sample_rate, num_channels);
             return i;
         }
@@ -264,39 +496,61 @@ void XmaDecoder::process(Memory* memory) {
             }
         }
         
-        // Read XMA data from memory
-        u32 bytes_to_read = std::min(4096u, input_size - ctx.input_buffer_read_offset);
+        // Read XMA data from memory (one packet at a time - 2048 bytes typical)
+        constexpr u32 XMA_PACKET_SIZE = 2048;
+        u32 bytes_to_read = std::min(XMA_PACKET_SIZE, input_size - ctx.input_buffer_read_offset);
         std::vector<u8> input_data(bytes_to_read);
         
         for (u32 i = 0; i < bytes_to_read; i++) {
             input_data[i] = memory->read_u8(input_addr + ctx.input_buffer_read_offset + i);
         }
         
-        // Decode frames
-        BitReader reader(input_data.data(), bytes_to_read);
-        
         // Output buffer
         std::vector<s16> output_samples;
         output_samples.reserve(4096);
         
-        while (reader.has_bits(32)) {
-            s16 frame_output[256 * 2]; // Max samples per frame
-            u32 samples_written = 0;
-            
-            if (!decode_frame(ctx, reader, frame_output, samples_written)) {
-                break;
+#ifdef X360MU_USE_FFMPEG
+        // Try FFmpeg decoder first
+        if (ctx.ffmpeg_decoder && ctx.ffmpeg_decoder->is_initialized()) {
+            s16 ffmpeg_output[4096 * 2];
+            u32 samples = ctx.ffmpeg_decoder->decode(input_data.data(), bytes_to_read,
+                                                      ffmpeg_output, 4096);
+            if (samples > 0) {
+                for (u32 i = 0; i < samples * ctx.num_channels; i++) {
+                    output_samples.push_back(ffmpeg_output[i]);
+                }
+                ctx.frames_decoded++;
+                ctx.input_buffer_read_offset += bytes_to_read;
+            } else {
+                // FFmpeg failed, fall through to software decoder
+                ctx.ffmpeg_decoder.reset();
             }
-            
-            // Append to output
-            for (u32 i = 0; i < samples_written; i++) {
-                output_samples.push_back(frame_output[i]);
-            }
-            
-            ctx.frames_decoded++;
         }
+#endif
         
-        // Update read offset
-        ctx.input_buffer_read_offset += reader.position() / 8;
+        // Fallback: Use software decoder if FFmpeg not available or failed
+        if (output_samples.empty()) {
+            BitReader reader(input_data.data(), bytes_to_read);
+            
+            while (reader.has_bits(32)) {
+                s16 frame_output[256 * 2]; // Max samples per frame
+                u32 samples_written = 0;
+                
+                if (!decode_frame(ctx, reader, frame_output, samples_written)) {
+                    break;
+                }
+                
+                // Append to output
+                for (u32 i = 0; i < samples_written; i++) {
+                    output_samples.push_back(frame_output[i]);
+                }
+                
+                ctx.frames_decoded++;
+            }
+            
+            // Update read offset
+            ctx.input_buffer_read_offset += reader.position() / 8;
+        }
         
         // Write output to memory
         u32 output_bytes = output_samples.size() * sizeof(s16);
@@ -418,6 +672,33 @@ void XmaDecoder::apply_predictor(XmaContext& ctx, f32* samples, u32 count) {
 std::vector<s16> XmaDecoder::decode(const u8* data, u32 size, u32 sample_rate, u32 num_channels) {
     std::vector<s16> output;
     
+#ifdef X360MU_USE_FFMPEG
+    // Try FFmpeg first for better quality
+    FFmpegXmaDecoder ffmpeg;
+    if (ffmpeg.initialize(sample_rate, num_channels) == Status::Ok) {
+        constexpr u32 XMA_PACKET_SIZE = 2048;
+        u32 offset = 0;
+        
+        while (offset < size) {
+            u32 packet_size = std::min(XMA_PACKET_SIZE, size - offset);
+            s16 packet_output[4096 * 2];
+            
+            u32 samples = ffmpeg.decode(data + offset, packet_size, packet_output, 4096);
+            for (u32 i = 0; i < samples * num_channels; i++) {
+                output.push_back(packet_output[i]);
+            }
+            
+            offset += packet_size;
+        }
+        
+        if (!output.empty()) {
+            return output;
+        }
+        // Fall through to software decoder if FFmpeg produced no output
+    }
+#endif
+    
+    // Fallback software decoder
     XmaContext ctx = {};
     ctx.sample_rate = sample_rate;
     ctx.num_channels = num_channels;

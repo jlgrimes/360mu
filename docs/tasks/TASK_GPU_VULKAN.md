@@ -1,5 +1,7 @@
 # Task: GPU/Vulkan Backend Implementation
 
+**Status: ✅ COMPLETED**
+
 ## Project Context
 
 You are working on 360μ, an Xbox 360 emulator for Android. The project uses C++20 and Vulkan for rendering.

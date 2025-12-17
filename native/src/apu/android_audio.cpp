@@ -449,21 +449,21 @@ u32 AudioResampler::get_output_frames(u32 input_frames) const {
 }
 
 //=============================================================================
-// AudioMixer Implementation
+// SimpleAudioMixer Implementation
 //=============================================================================
 
-AudioMixer::AudioMixer() {
+SimpleAudioMixer::SimpleAudioMixer() {
     for (auto& source : sources_) {
         source = {};
     }
 }
 
-void AudioMixer::configure(u32 sample_rate, u32 channels) {
+void SimpleAudioMixer::configure(u32 sample_rate, u32 channels) {
     sample_rate_ = sample_rate;
     channels_ = channels;
 }
 
-int AudioMixer::add_source(const f32* samples, u32 frame_count, f32 volume, bool loop) {
+int SimpleAudioMixer::add_source(const f32* samples, u32 frame_count, f32 volume, bool loop) {
     std::lock_guard<std::mutex> lock(sources_mutex_);
     
     for (u32 i = 0; i < MAX_SOURCES; i++) {
@@ -482,28 +482,28 @@ int AudioMixer::add_source(const f32* samples, u32 frame_count, f32 volume, bool
     return -1;  // No free slots
 }
 
-void AudioMixer::remove_source(int index) {
+void SimpleAudioMixer::remove_source(int index) {
     if (index < 0 || index >= static_cast<int>(MAX_SOURCES)) return;
     
     std::lock_guard<std::mutex> lock(sources_mutex_);
     sources_[index].active = false;
 }
 
-void AudioMixer::set_source_volume(int index, f32 volume) {
+void SimpleAudioMixer::set_source_volume(int index, f32 volume) {
     if (index < 0 || index >= static_cast<int>(MAX_SOURCES)) return;
     
     std::lock_guard<std::mutex> lock(sources_mutex_);
     sources_[index].volume = std::clamp(volume, 0.0f, 2.0f);
 }
 
-void AudioMixer::set_source_pan(int index, f32 pan) {
+void SimpleAudioMixer::set_source_pan(int index, f32 pan) {
     if (index < 0 || index >= static_cast<int>(MAX_SOURCES)) return;
     
     std::lock_guard<std::mutex> lock(sources_mutex_);
     sources_[index].pan = std::clamp(pan, -1.0f, 1.0f);
 }
 
-void AudioMixer::mix(f32* output, u32 frame_count) {
+void SimpleAudioMixer::mix(f32* output, u32 frame_count) {
     // Clear output
     memset(output, 0, frame_count * channels_ * sizeof(f32));
     

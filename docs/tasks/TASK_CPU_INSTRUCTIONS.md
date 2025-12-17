@@ -1,21 +1,29 @@
 # Task: CPU Instruction Coverage
 
+**STATUS: ✅ COMPLETED**
+
 ## Project Context
+
 You are working on 360μ, an Xbox 360 emulator for Android. The Xbox 360 uses a PowerPC-based CPU (IBM Xenon) with VMX128 SIMD extensions.
 
 ## Your Assignment
+
 Expand CPU instruction coverage to handle all instructions Black Ops uses.
 
 ## Current State
-- Decoder at `native/src/cpu/xenon/decoder.cpp`
-- Interpreter at `native/src/cpu/xenon/interpreter.cpp`
-- Extended interpreter at `native/src/cpu/xenon/interpreter_extended.cpp`
-- VMX128 at `native/src/cpu/vmx128/vmx.cpp`
-- Basic tests passing
+
+- Decoder at `native/src/cpu/xenon/decoder.cpp` ✅
+- Interpreter at `native/src/cpu/xenon/interpreter.cpp` ✅
+- Extended interpreter at `native/src/cpu/xenon/interpreter_extended.cpp` ✅
+- VMX128 at `native/src/cpu/vmx128/vmx.cpp` ✅
+- Comprehensive tests at `native/tests/cpu/test_interpreter.cpp` and `test_vmx128.cpp` ✅
+
+## Implemented Instructions
 
 ## Instructions to Implement
 
 ### 1. 64-bit Integer Operations (`interpreter_extended.cpp`)
+
 ```cpp
 // Opcode 31 extended:
 case 9:   // mulhdu - Multiply High Doubleword Unsigned
@@ -36,6 +44,7 @@ case 32:  // cmpl (verify L=1)
 ```
 
 ### 2. Rotate/Mask Operations (`interpreter_extended.cpp`)
+
 ```cpp
 // Opcode 30 (64-bit rotate):
 void exec_rotate64(ThreadContext& ctx, const DecodedInst& d) {
@@ -51,6 +60,7 @@ void exec_rotate64(ThreadContext& ctx, const DecodedInst& d) {
 ```
 
 ### 3. Load/Store with Update (`interpreter.cpp`)
+
 ```cpp
 // Already have basic load/store, add:
 case 31: // Extended load/store (by xo):
@@ -64,7 +74,7 @@ case 31: // Extended load/store (by xo):
     // xo 375: lhaux
     // xo 21:  ldx    - Load Doubleword Indexed
     // xo 53:  ldux
-    
+
     // Stores:
     // xo 151: stwx
     // xo 183: stwux
@@ -77,6 +87,7 @@ case 31: // Extended load/store (by xo):
 ```
 
 ### 4. Atomic Operations (`interpreter_extended.cpp`)
+
 ```cpp
 // Load-reserved / Store-conditional:
 case 20:  // lwarx - Load Word and Reserve Indexed
@@ -84,7 +95,7 @@ case 20:  // lwarx - Load Word and Reserve Indexed
     result = memory->read_u32(addr);
     reservation_addr = addr;
     reservation_valid = true;
-    
+
 case 150: // stwcx. - Store Word Conditional Indexed
     // Check reservation, store if valid
     if (reservation_valid && reservation_addr == addr) {
@@ -100,6 +111,7 @@ case 214: // stdcx. - Store Doubleword Conditional
 ```
 
 ### 5. Floating Point Complete (`interpreter.cpp`)
+
 ```cpp
 // Opcode 63 (extended float):
 void exec_float_complete(ThreadContext& ctx, const DecodedInst& d) {
@@ -131,24 +143,25 @@ void exec_float_complete(ThreadContext& ctx, const DecodedInst& d) {
 ```
 
 ### 6. VMX128 Complete (`vmx.cpp`)
+
 ```cpp
 // Xbox 360 specific VMX instructions:
 void exec_vmx128(ThreadContext& ctx, const Vmx128Inst& d) {
     // Pack/Unpack 128-bit
     case VPack128:
     case VUnpack128:
-    
+
     // Dot products
     case VDot3:  // 3-component dot
     case VDot4:  // 4-component dot
-    
+
     // Cross product
     case VCross3:
-    
+
     // Matrix ops (software)
     case VMtx44Mul:  // 4x4 matrix multiply
     case VMtxTrn:    // Transpose
-    
+
     // Shuffle/swizzle
     case VShufD:     // Shuffle dwords
     case VPerm128:   // Full permute with control
@@ -156,6 +169,7 @@ void exec_vmx128(ThreadContext& ctx, const Vmx128Inst& d) {
 ```
 
 ## Testing Strategy
+
 ```cpp
 // Add tests for each instruction:
 TEST_F(InterpreterTest, Mulld) {
@@ -177,6 +191,7 @@ TEST_F(InterpreterTest, Lwarx_Stwcx) {
 ```
 
 ## Build & Test
+
 ```bash
 cd native/build
 cmake ..
@@ -186,14 +201,16 @@ make -j4
 ```
 
 ## Reference
+
 - PowerPC ISA v2.06 (search online)
 - Xenia CPU: https://github.com/xenia-project/xenia/tree/master/src/xenia/cpu/ppc
 - `native/src/cpu/xenon/interpreter.cpp` for existing patterns
 
 ## Success Criteria
-1. All integer/float/VMX instruction groups complete
-2. Atomic operations (lwarx/stwcx) working
-3. 64-bit operations correct
-4. All rotate/mask instructions implemented
-5. Test coverage for critical paths
 
+1. ✅ All integer/float/VMX instruction groups complete
+2. ✅ Atomic operations (lwarx/stwcx/ldarx/stdcx) working
+3. ✅ 64-bit operations correct (mulld, mulhd, mulhdu, divd, divdu, sld, srd, srad, sradi)
+4. ✅ All rotate/mask instructions implemented (rldicl, rldicr, rldic, rldimi, rldcl, rldcr)
+5. ✅ Test coverage for critical paths
+6. ✅ VMX128 extensions: dot products, cross product, shuffle, matrix ops

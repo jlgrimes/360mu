@@ -16,6 +16,7 @@
 #include "../../memory/memory.h"
 #include <cmath>
 #include <cstring>
+#include <atomic>
 
 #ifdef __ANDROID__
 #include <android/log.h>

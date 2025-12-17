@@ -41,9 +41,13 @@ Status Kernel::initialize(Memory* memory, Cpu* cpu, VirtualFileSystem* vfs) {
     cpu_ = cpu;
     vfs_ = vfs;
     
+    // Initialize HLE state
+    init_hle_state(vfs);
+    
+    // Register all HLE functions
     register_hle_functions();
     
-    LOGI("Kernel initialized");
+    LOGI("Kernel initialized with HLE functions");
     return Status::Ok;
 }
 

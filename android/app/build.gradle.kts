@@ -7,6 +7,7 @@ plugins {
 android {
     namespace = "com.x360mu"
     compileSdk = 34
+    // ndkVersion = "26.1.10909125"  // Uncomment and set to your installed NDK version
 
     defaultConfig {
         applicationId = "com.x360mu"
@@ -27,6 +28,7 @@ android {
                 arguments += listOf(
                     "-DANDROID_STL=c++_shared",
                     "-DX360MU_ENABLE_JIT=ON",
+                    "-DX360MU_USE_VULKAN=ON",
                     "-DX360MU_USE_FFMPEG=ON"
                 )
             }
