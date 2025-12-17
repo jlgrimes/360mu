@@ -216,6 +216,219 @@ TEST_F(AudioMixerTest, PauseResume) {
     mixer_->resume();
 }
 
+//=============================================================================
+// XMA Processor Tests
+//=============================================================================
+
+class XmaProcessorTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        processor_ = std::make_unique<XmaProcessor>();
+        mixer_ = std::make_unique<AudioMixer>();
+        
+        ASSERT_EQ(mixer_->initialize(48000, 1024), Status::Ok);
+        // Note: processor needs memory pointer which we don't have in tests
+        // So we'll test what we can without full memory integration
+        ASSERT_EQ(processor_->initialize(nullptr, mixer_.get()), Status::Ok);
+    }
+    
+    void TearDown() override {
+        processor_->shutdown();
+        mixer_->shutdown();
+        processor_.reset();
+        mixer_.reset();
+    }
+    
+    std::unique_ptr<XmaProcessor> processor_;
+    std::unique_ptr<AudioMixer> mixer_;
+};
+
+TEST_F(XmaProcessorTest, Initialize) {
+    SUCCEED();
+}
+
+TEST_F(XmaProcessorTest, CreateContext) {
+    u32 ctx_id = processor_->create_context();
+    ASSERT_NE(ctx_id, UINT32_MAX);
+    
+    processor_->destroy_context(ctx_id);
+}
+
+TEST_F(XmaProcessorTest, CreateMultipleContexts) {
+    std::vector<u32> contexts;
+    
+    // Create several contexts
+    for (int i = 0; i < 16; i++) {
+        u32 ctx_id = processor_->create_context();
+        ASSERT_NE(ctx_id, UINT32_MAX);
+        contexts.push_back(ctx_id);
+    }
+    
+    // Verify each context is unique
+    for (size_t i = 0; i < contexts.size(); i++) {
+        for (size_t j = i + 1; j < contexts.size(); j++) {
+            EXPECT_NE(contexts[i], contexts[j]);
+        }
+    }
+    
+    // Destroy them
+    for (u32 ctx_id : contexts) {
+        processor_->destroy_context(ctx_id);
+    }
+}
+
+TEST_F(XmaProcessorTest, GetContext) {
+    u32 ctx_id = processor_->create_context();
+    ASSERT_NE(ctx_id, UINT32_MAX);
+    
+    // Get context should return valid pointer
+    XmaContext* ctx = processor_->get_context(ctx_id);
+    ASSERT_NE(ctx, nullptr);
+    
+    // Invalid context should return null
+    EXPECT_EQ(processor_->get_context(UINT32_MAX), nullptr);
+    EXPECT_EQ(processor_->get_context(999), nullptr);
+    
+    processor_->destroy_context(ctx_id);
+}
+
+TEST_F(XmaProcessorTest, SetInputBuffer) {
+    u32 ctx_id = processor_->create_context();
+    ASSERT_NE(ctx_id, UINT32_MAX);
+    
+    // Set both input buffers (double buffering)
+    processor_->set_input_buffer(ctx_id, 0x10000, 2048, 0);
+    processor_->set_input_buffer(ctx_id, 0x12000, 2048, 1);
+    
+    XmaContext* ctx = processor_->get_context(ctx_id);
+    ASSERT_NE(ctx, nullptr);
+    EXPECT_EQ(ctx->input_buffer_0, 0x10000u);
+    EXPECT_EQ(ctx->input_buffer_0_size, 2048u);
+    EXPECT_EQ(ctx->input_buffer_1, 0x12000u);
+    EXPECT_EQ(ctx->input_buffer_1_size, 2048u);
+    
+    processor_->destroy_context(ctx_id);
+}
+
+TEST_F(XmaProcessorTest, SetOutputBuffer) {
+    u32 ctx_id = processor_->create_context();
+    ASSERT_NE(ctx_id, UINT32_MAX);
+    
+    processor_->set_output_buffer(ctx_id, 0x20000, 8192);
+    
+    XmaContext* ctx = processor_->get_context(ctx_id);
+    ASSERT_NE(ctx, nullptr);
+    EXPECT_EQ(ctx->output_buffer, 0x20000u);
+    EXPECT_EQ(ctx->output_buffer_size, 8192u);
+    
+    processor_->destroy_context(ctx_id);
+}
+
+TEST_F(XmaProcessorTest, ContextConfiguration) {
+    u32 ctx_id = processor_->create_context();
+    ASSERT_NE(ctx_id, UINT32_MAX);
+    
+    // Set configuration
+    processor_->set_context_sample_rate(ctx_id, 44100);
+    processor_->set_context_channels(ctx_id, 1);
+    processor_->set_context_loop(ctx_id, true, 0x100, 0x500);
+    
+    XmaContext* ctx = processor_->get_context(ctx_id);
+    ASSERT_NE(ctx, nullptr);
+    EXPECT_EQ(ctx->sample_rate, 44100u);
+    EXPECT_EQ(ctx->num_channels, 1u);
+    EXPECT_TRUE(ctx->loop_enabled);
+    EXPECT_EQ(ctx->loop_start_offset, 0x100u);
+    EXPECT_EQ(ctx->loop_end_offset, 0x500u);
+    
+    processor_->destroy_context(ctx_id);
+}
+
+TEST_F(XmaProcessorTest, EnableDisableContext) {
+    u32 ctx_id = processor_->create_context();
+    ASSERT_NE(ctx_id, UINT32_MAX);
+    
+    // Initially inactive
+    EXPECT_FALSE(processor_->is_context_active(ctx_id));
+    
+    // Enable
+    processor_->enable_context(ctx_id);
+    EXPECT_TRUE(processor_->is_context_active(ctx_id));
+    
+    // Disable
+    processor_->disable_context(ctx_id);
+    EXPECT_FALSE(processor_->is_context_active(ctx_id));
+    
+    processor_->destroy_context(ctx_id);
+}
+
+TEST_F(XmaProcessorTest, InputBufferConsumed) {
+    u32 ctx_id = processor_->create_context();
+    ASSERT_NE(ctx_id, UINT32_MAX);
+    
+    // Set input buffers with zero size (immediately consumed)
+    processor_->set_input_buffer(ctx_id, 0x10000, 0, 0);
+    processor_->set_input_buffer(ctx_id, 0x12000, 0, 1);
+    
+    // Buffer 0 with size 0 should be considered consumed when context is active
+    processor_->enable_context(ctx_id);
+    
+    // Without memory, buffers will be marked consumed
+    EXPECT_TRUE(processor_->is_input_buffer_consumed(ctx_id, 0));
+    EXPECT_TRUE(processor_->is_input_buffer_consumed(ctx_id, 1));
+    
+    processor_->destroy_context(ctx_id);
+}
+
+TEST_F(XmaProcessorTest, Statistics) {
+    // Create a few contexts and check stats
+    u32 ctx1 = processor_->create_context();
+    u32 ctx2 = processor_->create_context();
+    
+    processor_->enable_context(ctx1);
+    processor_->enable_context(ctx2);
+    
+    auto stats = processor_->get_stats();
+    EXPECT_EQ(stats.active_contexts, 2u);
+    
+    processor_->disable_context(ctx1);
+    
+    // Stats update after process
+    processor_->process();
+    stats = processor_->get_stats();
+    EXPECT_EQ(stats.active_contexts, 1u);
+    
+    processor_->destroy_context(ctx1);
+    processor_->destroy_context(ctx2);
+}
+
+TEST_F(XmaProcessorTest, InvalidContextOperations) {
+    // Operations on invalid context IDs should not crash
+    processor_->set_input_buffer(UINT32_MAX, 0x10000, 2048, 0);
+    processor_->set_output_buffer(UINT32_MAX, 0x20000, 8192);
+    processor_->enable_context(UINT32_MAX);
+    processor_->disable_context(UINT32_MAX);
+    
+    EXPECT_FALSE(processor_->is_context_active(UINT32_MAX));
+    EXPECT_TRUE(processor_->is_input_buffer_consumed(UINT32_MAX, 0));
+    EXPECT_EQ(processor_->get_output_write_offset(UINT32_MAX), 0u);
+    
+    SUCCEED();
+}
+
+TEST_F(XmaProcessorTest, ProcessWithoutMemory) {
+    u32 ctx_id = processor_->create_context();
+    ASSERT_NE(ctx_id, UINT32_MAX);
+    
+    processor_->set_input_buffer(ctx_id, 0x10000, 2048, 0);
+    processor_->set_output_buffer(ctx_id, 0x20000, 8192);
+    processor_->enable_context(ctx_id);
+    
+    // Process should not crash even without memory
+    processor_->process();
+    
+    processor_->destroy_context(ctx_id);
+}
 
 }  // namespace test
 }  // namespace x360mu

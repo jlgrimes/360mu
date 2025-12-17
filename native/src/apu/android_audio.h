@@ -284,8 +284,8 @@ public:
         bool loop = false;
     };
     
-    AudioMixer();
-    ~AudioMixer() = default;
+    SimpleAudioMixer();
+    ~SimpleAudioMixer() = default;
     
     /**
      * Configure mixer

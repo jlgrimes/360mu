@@ -923,5 +923,412 @@ u32 AudioMixer::get_latency() const {
     return buffer_frames_;
 }
 
+//=============================================================================
+// XMA Processor Implementation
+//=============================================================================
+
+XmaProcessor::XmaProcessor() = default;
+XmaProcessor::~XmaProcessor() { shutdown(); }
+
+Status XmaProcessor::initialize(Memory* memory, AudioMixer* mixer) {
+    memory_ = memory;
+    mixer_ = mixer;
+    running_ = true;
+    stats_ = {};
+    
+    LOGI("XMA processor initialized");
+    return Status::Ok;
+}
+
+void XmaProcessor::shutdown() {
+    running_ = false;
+    
+    std::lock_guard<std::mutex> lock(contexts_mutex_);
+    
+    for (auto& hw_ctx : contexts_) {
+        if (hw_ctx) {
+            // Destroy associated mixer voice
+            if (mixer_ && hw_ctx->voice_id != UINT32_MAX) {
+                mixer_->destroy_voice(hw_ctx->voice_id);
+            }
+            hw_ctx.reset();
+        }
+    }
+    
+    memory_ = nullptr;
+    mixer_ = nullptr;
+    
+    LOGI("XMA processor shutdown");
+}
+
+u32 XmaProcessor::create_context() {
+    std::lock_guard<std::mutex> lock(contexts_mutex_);
+    
+    for (u32 i = 0; i < MAX_CONTEXTS; i++) {
+        if (!contexts_[i]) {
+            contexts_[i] = std::make_unique<HardwareContext>();
+            contexts_[i]->ctx = std::make_unique<XmaContext>();
+            contexts_[i]->decoder = std::make_unique<XmaDecoder>();
+            contexts_[i]->decoder->initialize();
+            contexts_[i]->voice_id = UINT32_MAX;
+            contexts_[i]->buffer_0_consumed = false;
+            contexts_[i]->buffer_1_consumed = false;
+            
+            // Initialize context with defaults
+            auto& ctx = *contexts_[i]->ctx;
+            ctx.sample_rate = 48000;
+            ctx.num_channels = 2;
+            ctx.bits_per_sample = 16;
+            ctx.active = false;
+            ctx.input_buffer_0 = 0;
+            ctx.input_buffer_1 = 0;
+            ctx.input_buffer_0_size = 0;
+            ctx.input_buffer_1_size = 0;
+            ctx.output_buffer = 0;
+            ctx.output_buffer_size = 0;
+            ctx.input_buffer_index = 0;
+            ctx.input_buffer_read_offset = 0;
+            ctx.output_buffer_write_offset = 0;
+            ctx.loop_enabled = false;
+            ctx.loop_count = 0;
+            ctx.loop_start_offset = 0;
+            ctx.loop_end_offset = 0;
+            ctx.samples_decoded = 0;
+            ctx.frames_decoded = 0;
+            ctx.history.fill(0);
+            ctx.history_index = 0;
+            
+            LOGD("Created XMA context %u", i);
+            return i;
+        }
+    }
+    
+    LOGE("Failed to create XMA context: no free slots");
+    return UINT32_MAX;
+}
+
+void XmaProcessor::destroy_context(u32 context_id) {
+    if (context_id >= MAX_CONTEXTS) return;
+    
+    std::lock_guard<std::mutex> lock(contexts_mutex_);
+    
+    if (contexts_[context_id]) {
+        // Destroy associated mixer voice
+        if (mixer_ && contexts_[context_id]->voice_id != UINT32_MAX) {
+            mixer_->destroy_voice(contexts_[context_id]->voice_id);
+        }
+        
+        if (contexts_[context_id]->decoder) {
+            contexts_[context_id]->decoder->shutdown();
+        }
+        
+        contexts_[context_id].reset();
+        LOGD("Destroyed XMA context %u", context_id);
+    }
+}
+
+XmaContext* XmaProcessor::get_context(u32 context_id) {
+    if (context_id >= MAX_CONTEXTS || !contexts_[context_id]) {
+        return nullptr;
+    }
+    return contexts_[context_id]->ctx.get();
+}
+
+const XmaContext* XmaProcessor::get_context(u32 context_id) const {
+    if (context_id >= MAX_CONTEXTS || !contexts_[context_id]) {
+        return nullptr;
+    }
+    return contexts_[context_id]->ctx.get();
+}
+
+void XmaProcessor::set_input_buffer(u32 context_id, GuestAddr buffer, u32 size, u32 buffer_index) {
+    if (context_id >= MAX_CONTEXTS || !contexts_[context_id]) return;
+    
+    auto& hw_ctx = *contexts_[context_id];
+    auto& ctx = *hw_ctx.ctx;
+    
+    if (buffer_index == 0) {
+        ctx.input_buffer_0 = buffer;
+        ctx.input_buffer_0_size = size;
+        hw_ctx.buffer_0_consumed = false;
+    } else {
+        ctx.input_buffer_1 = buffer;
+        ctx.input_buffer_1_size = size;
+        hw_ctx.buffer_1_consumed = false;
+    }
+    
+    LOGD("XMA context %u: set input buffer %u at 0x%08X, size %u", 
+         context_id, buffer_index, buffer, size);
+}
+
+void XmaProcessor::set_output_buffer(u32 context_id, GuestAddr buffer, u32 size) {
+    if (context_id >= MAX_CONTEXTS || !contexts_[context_id]) return;
+    
+    auto& ctx = *contexts_[context_id]->ctx;
+    ctx.output_buffer = buffer;
+    ctx.output_buffer_size = size;
+    ctx.output_buffer_write_offset = 0;
+    
+    LOGD("XMA context %u: set output buffer at 0x%08X, size %u", context_id, buffer, size);
+}
+
+void XmaProcessor::set_context_sample_rate(u32 context_id, u32 sample_rate) {
+    if (context_id >= MAX_CONTEXTS || !contexts_[context_id]) return;
+    contexts_[context_id]->ctx->sample_rate = sample_rate;
+}
+
+void XmaProcessor::set_context_channels(u32 context_id, u32 num_channels) {
+    if (context_id >= MAX_CONTEXTS || !contexts_[context_id]) return;
+    contexts_[context_id]->ctx->num_channels = num_channels;
+}
+
+void XmaProcessor::set_context_loop(u32 context_id, bool enabled, u32 loop_start, u32 loop_end) {
+    if (context_id >= MAX_CONTEXTS || !contexts_[context_id]) return;
+    
+    auto& ctx = *contexts_[context_id]->ctx;
+    ctx.loop_enabled = enabled;
+    ctx.loop_start_offset = loop_start;
+    ctx.loop_end_offset = loop_end;
+}
+
+void XmaProcessor::enable_context(u32 context_id) {
+    if (context_id >= MAX_CONTEXTS || !contexts_[context_id]) return;
+    
+    std::lock_guard<std::mutex> lock(contexts_mutex_);
+    
+    auto& hw_ctx = *contexts_[context_id];
+    auto& ctx = *hw_ctx.ctx;
+    
+    ctx.active = true;
+    ctx.input_buffer_read_offset = 0;
+    ctx.samples_decoded = 0;
+    ctx.frames_decoded = 0;
+    hw_ctx.buffer_0_consumed = false;
+    hw_ctx.buffer_1_consumed = false;
+    
+    // Create mixer voice if not already created
+    if (mixer_ && hw_ctx.voice_id == UINT32_MAX) {
+        hw_ctx.voice_id = mixer_->create_voice(ctx.sample_rate, ctx.num_channels);
+        if (hw_ctx.voice_id != UINT32_MAX) {
+            mixer_->set_voice_volume(hw_ctx.voice_id, 1.0f);
+        }
+    }
+    
+    LOGD("Enabled XMA context %u", context_id);
+}
+
+void XmaProcessor::disable_context(u32 context_id) {
+    if (context_id >= MAX_CONTEXTS || !contexts_[context_id]) return;
+    
+    contexts_[context_id]->ctx->active = false;
+    LOGD("Disabled XMA context %u", context_id);
+}
+
+bool XmaProcessor::is_context_active(u32 context_id) const {
+    if (context_id >= MAX_CONTEXTS || !contexts_[context_id]) return false;
+    return contexts_[context_id]->ctx->active;
+}
+
+bool XmaProcessor::is_input_buffer_consumed(u32 context_id, u32 buffer_index) const {
+    if (context_id >= MAX_CONTEXTS || !contexts_[context_id]) return true;
+    
+    const auto& hw_ctx = *contexts_[context_id];
+    return buffer_index == 0 ? hw_ctx.buffer_0_consumed : hw_ctx.buffer_1_consumed;
+}
+
+u32 XmaProcessor::get_output_write_offset(u32 context_id) const {
+    if (context_id >= MAX_CONTEXTS || !contexts_[context_id]) return 0;
+    return contexts_[context_id]->ctx->output_buffer_write_offset;
+}
+
+void XmaProcessor::process() {
+    if (!running_ || !memory_) return;
+    
+    std::lock_guard<std::mutex> lock(contexts_mutex_);
+    
+    u32 active_count = 0;
+    
+    for (u32 i = 0; i < MAX_CONTEXTS; i++) {
+        if (!contexts_[i] || !contexts_[i]->ctx->active) continue;
+        
+        active_count++;
+        
+        // Process up to 4 packets per frame per context
+        process_context(i, 4);
+    }
+    
+    stats_.active_contexts = active_count;
+}
+
+u32 XmaProcessor::process_context(u32 context_id, u32 max_packets) {
+    if (context_id >= MAX_CONTEXTS || !contexts_[context_id]) return 0;
+    
+    auto& hw_ctx = *contexts_[context_id];
+    auto& ctx = *hw_ctx.ctx;
+    
+    if (!ctx.active) return 0;
+    
+    u32 packets_decoded = 0;
+    
+    for (u32 p = 0; p < max_packets; p++) {
+        u32 samples = decode_packet(hw_ctx, context_id);
+        if (samples == 0) break;
+        
+        packets_decoded++;
+        stats_.total_packets_decoded++;
+        stats_.total_samples_decoded += samples;
+    }
+    
+    return packets_decoded;
+}
+
+u32 XmaProcessor::decode_packet(HardwareContext& hw_ctx, u32 context_id) {
+    auto& ctx = *hw_ctx.ctx;
+    
+    // Determine current input buffer
+    GuestAddr input_addr;
+    u32 input_size;
+    bool* buffer_consumed;
+    
+    if (ctx.input_buffer_index == 0) {
+        input_addr = ctx.input_buffer_0;
+        input_size = ctx.input_buffer_0_size;
+        buffer_consumed = &hw_ctx.buffer_0_consumed;
+    } else {
+        input_addr = ctx.input_buffer_1;
+        input_size = ctx.input_buffer_1_size;
+        buffer_consumed = &hw_ctx.buffer_1_consumed;
+    }
+    
+    // Check if we've consumed the current buffer
+    if (ctx.input_buffer_read_offset >= input_size || input_size == 0) {
+        *buffer_consumed = true;
+        
+        // Try to switch buffers
+        u32 other_index = 1 - ctx.input_buffer_index;
+        u32 other_size = (other_index == 0) ? ctx.input_buffer_0_size : ctx.input_buffer_1_size;
+        bool other_consumed = (other_index == 0) ? hw_ctx.buffer_0_consumed : hw_ctx.buffer_1_consumed;
+        
+        if (other_size > 0 && !other_consumed) {
+            ctx.input_buffer_index = other_index;
+            ctx.input_buffer_read_offset = 0;
+            
+            // Update for new buffer
+            if (other_index == 0) {
+                input_addr = ctx.input_buffer_0;
+                input_size = ctx.input_buffer_0_size;
+                buffer_consumed = &hw_ctx.buffer_0_consumed;
+            } else {
+                input_addr = ctx.input_buffer_1;
+                input_size = ctx.input_buffer_1_size;
+                buffer_consumed = &hw_ctx.buffer_1_consumed;
+            }
+        } else {
+            // Handle looping
+            if (ctx.loop_enabled && ctx.loop_count > 0) {
+                ctx.loop_count--;
+                ctx.input_buffer_read_offset = ctx.loop_start_offset;
+                hw_ctx.buffer_0_consumed = false;
+                hw_ctx.buffer_1_consumed = false;
+            } else {
+                // No more data
+                return 0;
+            }
+        }
+    }
+    
+    // Read XMA packet from memory
+    u8 packet_data[XMA_PACKET_SIZE];
+    u32 bytes_to_read = std::min(XMA_PACKET_SIZE, input_size - ctx.input_buffer_read_offset);
+    
+    if (bytes_to_read == 0) return 0;
+    
+    for (u32 i = 0; i < bytes_to_read; i++) {
+        packet_data[i] = memory_->read_u8(input_addr + ctx.input_buffer_read_offset + i);
+    }
+    
+    // Decode packet
+    s16 pcm_output[4096 * 2];  // Max stereo samples per packet
+    std::vector<s16> decoded = hw_ctx.decoder->decode(packet_data, bytes_to_read, 
+                                                       ctx.sample_rate, ctx.num_channels);
+    
+    if (decoded.empty()) {
+        // Try software decoder path
+        ctx.input_buffer_read_offset += bytes_to_read;
+        stats_.decode_errors++;
+        return 0;
+    }
+    
+    // Copy decoded samples
+    u32 sample_count = std::min(static_cast<u32>(decoded.size()), 4096u * 2);
+    std::memcpy(pcm_output, decoded.data(), sample_count * sizeof(s16));
+    
+    // Write to output buffer
+    write_pcm_output(hw_ctx, pcm_output, sample_count);
+    
+    // Submit to mixer for playback
+    if (mixer_ && hw_ctx.voice_id != UINT32_MAX) {
+        mixer_->submit_samples(hw_ctx.voice_id, pcm_output, sample_count);
+    }
+    
+    // Update read offset
+    ctx.input_buffer_read_offset += bytes_to_read;
+    ctx.samples_decoded += sample_count / ctx.num_channels;
+    ctx.frames_decoded++;
+    
+    return sample_count / ctx.num_channels;
+}
+
+bool XmaProcessor::read_xma_packet(HardwareContext& hw_ctx, u8* packet_data) {
+    auto& ctx = *hw_ctx.ctx;
+    
+    GuestAddr input_addr;
+    u32 input_size;
+    
+    if (ctx.input_buffer_index == 0) {
+        input_addr = ctx.input_buffer_0;
+        input_size = ctx.input_buffer_0_size;
+    } else {
+        input_addr = ctx.input_buffer_1;
+        input_size = ctx.input_buffer_1_size;
+    }
+    
+    if (ctx.input_buffer_read_offset + XMA_PACKET_SIZE > input_size) {
+        return false;
+    }
+    
+    for (u32 i = 0; i < XMA_PACKET_SIZE; i++) {
+        packet_data[i] = memory_->read_u8(input_addr + ctx.input_buffer_read_offset + i);
+    }
+    
+    return true;
+}
+
+void XmaProcessor::write_pcm_output(HardwareContext& hw_ctx, const s16* pcm_data, u32 sample_count) {
+    auto& ctx = *hw_ctx.ctx;
+    
+    if (ctx.output_buffer == 0 || ctx.output_buffer_size == 0) return;
+    
+    u32 bytes_to_write = sample_count * sizeof(s16);
+    u32 space_available = ctx.output_buffer_size - ctx.output_buffer_write_offset;
+    
+    if (bytes_to_write > space_available) {
+        bytes_to_write = space_available;
+        sample_count = bytes_to_write / sizeof(s16);
+    }
+    
+    // Write PCM data to output buffer
+    for (u32 i = 0; i < sample_count; i++) {
+        memory_->write_u16(ctx.output_buffer + ctx.output_buffer_write_offset + i * 2,
+                          static_cast<u16>(pcm_data[i]));
+    }
+    
+    ctx.output_buffer_write_offset += bytes_to_write;
+}
+
+XmaProcessor::Stats XmaProcessor::get_stats() const {
+    return stats_;
+}
+
 } // namespace x360mu
 

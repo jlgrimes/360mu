@@ -15,6 +15,8 @@
 #include <unordered_map>
 #include <vector>
 #include <mutex>
+#include <bitset>
+#include <array>
 
 #ifdef __aarch64__
 #include <sys/mman.h>
@@ -45,45 +47,108 @@ namespace arm64 {
     constexpr int X13 = 13; // Temp
     constexpr int X14 = 14; // Temp
     constexpr int X15 = 15; // Temp
-    constexpr int X16 = 16; // IP0
-    constexpr int X17 = 17; // IP1
+    constexpr int X16 = 16; // IP0 - scratch
+    constexpr int X17 = 17; // IP1 - scratch
     constexpr int X18 = 18; // Platform register (avoid)
     
     // Callee-saved registers (must preserve)
     constexpr int X19 = 19; // PPC context pointer
-    constexpr int X20 = 20; // Memory base pointer
+    constexpr int X20 = 20; // Memory base pointer (fastmem)
     constexpr int X21 = 21; // PPC GPR cache 0
     constexpr int X22 = 22; // PPC GPR cache 1
     constexpr int X23 = 23; // PPC GPR cache 2
     constexpr int X24 = 24; // PPC GPR cache 3
     constexpr int X25 = 25; // PPC LR cache
     constexpr int X26 = 26; // PPC CTR cache
-    constexpr int X27 = 27; // Reserved
-    constexpr int X28 = 28; // Reserved
+    constexpr int X27 = 27; // JIT compiler pointer
+    constexpr int X28 = 28; // Cycle counter
     constexpr int X29 = 29; // Frame pointer
     constexpr int X30 = 30; // Link register
-    constexpr int SP = 31;  // Stack pointer
+    constexpr int SP = 31;  // Stack pointer / Zero register
+    constexpr int XZR = 31; // Zero register (same encoding as SP)
     
-    // NEON registers for VMX128 emulation
+    // NEON registers for FPU and VMX128 emulation
     constexpr int V0 = 0;
     constexpr int V1 = 1;
-    // ... etc
+    constexpr int V2 = 2;
+    constexpr int V3 = 3;
+    constexpr int V4 = 4;
+    constexpr int V5 = 5;
+    constexpr int V6 = 6;
+    constexpr int V7 = 7;
+    // V8-V15 are callee-saved (lower 64 bits only)
+    // V16-V31 are caller-saved
     
     // Context register - always points to ThreadContext
     constexpr int CTX_REG = X19;
-    // Memory base register
+    // Memory base register for fastmem
     constexpr int MEM_BASE = X20;
+    // JIT compiler pointer
+    constexpr int JIT_REG = X27;
+    // Cycle counter
+    constexpr int CYCLES_REG = X28;
 }
+
+/**
+ * Register allocator for PPC to ARM64 mapping
+ */
+class RegisterAllocator {
+public:
+    RegisterAllocator();
+    
+    // Get ARM64 register for PPC GPR
+    // Returns a register (may need to load from context if not cached)
+    int get_gpr(int ppc_reg);
+    
+    // Mark a PPC GPR as dirty (needs writeback)
+    void mark_dirty(int ppc_reg);
+    
+    // Flush all dirty registers to context
+    void flush_all(class ARM64Emitter& emit);
+    
+    // Flush specific register
+    void flush_gpr(class ARM64Emitter& emit, int ppc_reg);
+    
+    // Allocate a temporary ARM64 register
+    int alloc_temp();
+    
+    // Free a temporary register
+    void free_temp(int arm_reg);
+    
+    // Reset allocator state
+    void reset();
+    
+    // Check if a PPC register is currently cached in an ARM64 register
+    bool is_cached(int ppc_reg) const;
+    
+    // Direct register mapping (simple approach for initial implementation)
+    // PPC GPR -> ARM64 register or -1 if not mapped
+    static constexpr int INVALID_REG = -1;
+    
+private:
+    // Which PPC GPRs are cached in ARM64 registers
+    std::array<int, 32> ppc_to_arm_;  // -1 if not cached
+    
+    // Which ARM64 registers hold PPC GPRs
+    std::array<int, 32> arm_to_ppc_;  // -1 if not holding a PPC reg
+    
+    // Which cached registers are dirty
+    std::bitset<32> dirty_;
+    
+    // Available temp registers
+    std::bitset<18> temp_available_;  // X0-X17 availability
+};
 
 /**
  * Compiled code block
  */
 struct CompiledBlock {
     GuestAddr start_addr;           // PPC start address
+    GuestAddr end_addr;             // PPC end address (exclusive)
     u32 size;                       // Number of PPC instructions
     void* code;                     // Pointer to compiled ARM64 code
-    u32 code_size;                  // Size of ARM64 code
-    u64 hash;                       // Hash of original PPC code
+    u32 code_size;                  // Size of ARM64 code in bytes
+    u64 hash;                       // Hash of original PPC code for SMC detection
     u32 execution_count;            // For hot block tracking
     std::vector<GuestAddr> exits;   // Block exit addresses
     
@@ -92,6 +157,7 @@ struct CompiledBlock {
         GuestAddr target;           // PPC target address
         u32 patch_offset;           // Offset in ARM64 code to patch
         bool linked;                // Has been linked?
+        bool is_conditional;        // Is this a conditional branch?
     };
     std::vector<Link> links;
     
@@ -100,6 +166,11 @@ struct CompiledBlock {
     CompiledBlock* hash_prev = nullptr;
     CompiledBlock* lru_next = nullptr;   // LRU list
     CompiledBlock* lru_prev = nullptr;
+    
+    // Check if this block contains the given address
+    bool contains(GuestAddr addr) const {
+        return addr >= start_addr && addr < end_addr;
+    }
 };
 
 /**
@@ -355,8 +426,12 @@ public:
     
     /**
      * Execute a thread starting from its current PC
+     * Runs until cycles exhausted or interrupted
+     * @param ctx Thread context to execute
+     * @param cycles Maximum cycles to execute
+     * @return Number of cycles actually executed
      */
-    void execute(ThreadContext& ctx, u64 cycles);
+    u64 execute(ThreadContext& ctx, u64 cycles);
     
     /**
      * Invalidate code at address (called when game writes to code)
@@ -372,6 +447,7 @@ public:
         u64 cache_hits;
         u64 cache_misses;
         u64 instructions_executed;
+        u64 interpreter_fallbacks;
     };
     Stats get_stats() const { return stats_; }
     
@@ -385,12 +461,17 @@ public:
      */
     void* lookup_block_for_dispatch(GuestAddr pc);
     
+    /**
+     * Get memory pointer for fastmem (called from JIT code)
+     */
+    u8* get_memory_base() const;
+    
 private:
     // Compile without locking (lock must be held)
     CompiledBlock* compile_block_unlocked(GuestAddr addr);
     Memory* memory_ = nullptr;
     
-    // Code cache
+    // Code cache - executable memory region
     u8* code_cache_ = nullptr;
     u8* code_write_ptr_ = nullptr;
     size_t cache_size_ = 0;
@@ -399,8 +480,15 @@ private:
     std::unordered_map<GuestAddr, CompiledBlock*> block_map_;
     std::mutex block_map_mutex_;
     
+    // Fastmem base pointer (points to guest memory region)
+    u8* fastmem_base_ = nullptr;
+    bool fastmem_enabled_ = false;
+    
     // Statistics
     Stats stats_ = {};
+    
+    // Register allocator
+    RegisterAllocator reg_alloc_;
     
     // Compile a single block
     CompiledBlock* compile_block(GuestAddr addr);
@@ -408,6 +496,9 @@ private:
     // Block compilation
     void compile_instruction(ARM64Emitter& emit, ThreadContext& ctx_template, 
                              const DecodedInst& inst, GuestAddr pc);
+    
+    // Check if instruction ends the block
+    bool is_block_ending(const DecodedInst& inst) const;
     
     // Integer instruction compilation
     void compile_add(ARM64Emitter& emit, const DecodedInst& inst);
@@ -424,6 +515,15 @@ private:
     void compile_store(ARM64Emitter& emit, const DecodedInst& inst);
     void compile_load_multiple(ARM64Emitter& emit, const DecodedInst& inst);
     void compile_store_multiple(ARM64Emitter& emit, const DecodedInst& inst);
+    void compile_atomic_load(ARM64Emitter& emit, const DecodedInst& inst);
+    void compile_atomic_store(ARM64Emitter& emit, const DecodedInst& inst);
+    
+    // Additional instruction compilation
+    void compile_extsb(ARM64Emitter& emit, const DecodedInst& inst);
+    void compile_extsh(ARM64Emitter& emit, const DecodedInst& inst);
+    void compile_extsw(ARM64Emitter& emit, const DecodedInst& inst);
+    void compile_cntlzw(ARM64Emitter& emit, const DecodedInst& inst);
+    void compile_cntlzd(ARM64Emitter& emit, const DecodedInst& inst);
     
     // Branch compilation
     void compile_branch(ARM64Emitter& emit, const DecodedInst& inst, GuestAddr pc, 
@@ -446,6 +546,8 @@ private:
     // CR operations
     void compile_cr_update(ARM64Emitter& emit, int field, int result_reg);
     void compile_cr_logical(ARM64Emitter& emit, const DecodedInst& inst);
+    void compile_mtcrf(ARM64Emitter& emit, const DecodedInst& inst);
+    void compile_mfcr(ARM64Emitter& emit, const DecodedInst& inst);
     
     // SPR operations  
     void compile_mfspr(ARM64Emitter& emit, const DecodedInst& inst);
@@ -477,6 +579,10 @@ private:
     void byteswap32(ARM64Emitter& emit, int reg);
     void byteswap16(ARM64Emitter& emit, int reg);
     void byteswap64(ARM64Emitter& emit, int reg);
+    
+    // Block prologue/epilogue
+    void emit_block_prologue(ARM64Emitter& emit);
+    void emit_block_epilogue(ARM64Emitter& emit);
     
     // Block linking
     void try_link_block(CompiledBlock* block);

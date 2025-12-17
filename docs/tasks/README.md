@@ -1,137 +1,159 @@
-# Parallel Task Instructions for 360μ
+# 360μ Development Tasks
 
-## Overview
+## Quick Reference
 
-These task documents are designed for parallel AI agent work on the 360μ Xbox 360 emulator. Each task is **independent** and can be worked on simultaneously.
+| Task | File | Priority | Time Est. | Dependencies |
+|------|------|----------|-----------|--------------|
+| File System | `TASK_01_FILE_SYSTEM.md` | 🔴 CRITICAL | 2-4 weeks | None |
+| Vulkan Backend | `TASK_02_VULKAN_BACKEND.md` | 🔴 CRITICAL | 2-3 weeks | None |
+| Shader Translator | `TASK_03_SHADER_TRANSLATOR.md` | 🔴 CRITICAL | 6-10 weeks | Task 02 |
+| Command Processor | `TASK_04_COMMAND_PROCESSOR.md` | 🔴 CRITICAL | 3-4 weeks | Task 02 |
+| JIT Codegen | `TASK_05_JIT_CODEGEN.md` | 🔴 CRITICAL | 6-8 weeks | None |
+| Kernel File I/O | `TASK_06_KERNEL_FILE_IO.md` | 🔴 CRITICAL | 2-3 weeks | Task 01 |
+| Kernel Threading | `TASK_07_KERNEL_THREADING.md` | 🟡 HIGH | 3-4 weeks | None |
+| XMA Audio | `TASK_08_XMA_AUDIO.md` | 🟡 MEDIUM | 2-3 weeks | None |
 
-## Task List
+---
 
-| Task | File | Priority | Dependencies |
-|------|------|----------|--------------|
-| **GPU/Vulkan** | `TASK_GPU_VULKAN.md` | HIGH | Vulkan SDK |
-| **JIT Compiler** | `TASK_JIT_COMPILER.md` | HIGH | ARM64 device for testing |
-| **Audio/XMA** | `TASK_AUDIO_XMA.md` | MEDIUM | FFmpeg |
-| **Kernel HLE** | `TASK_KERNEL_HLE.md` | HIGH | None |
-| **Android Build** | `TASK_ANDROID_BUILD.md` | HIGH | Android Studio |
-| **CPU Instructions** | `TASK_CPU_INSTRUCTIONS.md` | HIGH | None |
+## Task Descriptions
 
-## Recommended Parallelization
+### 🔴 TASK_01: File System
+**What:** ISO 9660 and STFS file system mounting  
+**Why:** Games can't load without reading their data files  
+**Scope:** `native/src/kernel/filesystem/`
 
-### Minimum 3 Agents
-1. **Agent A**: `TASK_JIT_COMPILER.md` + `TASK_CPU_INSTRUCTIONS.md` (CPU-focused)
-2. **Agent B**: `TASK_GPU_VULKAN.md` (GPU-focused)
-3. **Agent C**: `TASK_KERNEL_HLE.md` + `TASK_AUDIO_XMA.md` (System-focused)
+### 🔴 TASK_02: Vulkan Backend
+**What:** Initialize Vulkan, create swapchain, basic rendering  
+**Why:** No GPU = black screen  
+**Scope:** `native/src/gpu/vulkan/`
 
-### Optimal 6 Agents
-One agent per task file.
+### 🔴 TASK_03: Shader Translator  
+**What:** Translate Xenos shader microcode to SPIR-V  
+**Why:** No shaders = no graphics  
+**Scope:** `native/src/gpu/xenos/shader_translator.cpp`
 
-## Project Structure
+### 🔴 TASK_04: Command Processor
+**What:** Parse GPU PM4 command buffers, dispatch draws  
+**Why:** Bridge between game and GPU  
+**Scope:** `native/src/gpu/xenos/command_processor.cpp`
+
+### 🔴 TASK_05: JIT Codegen
+**What:** Generate ARM64 machine code from PowerPC  
+**Why:** Interpreter is ~100x too slow for gameplay  
+**Scope:** `native/src/cpu/jit/`
+
+### 🔴 TASK_06: Kernel File I/O
+**What:** NtCreateFile, NtReadFile, etc. HLE  
+**Why:** Games call these to load assets  
+**Scope:** `native/src/kernel/hle/xboxkrnl_io.cpp`
+
+### 🟡 TASK_07: Kernel Threading
+**What:** Thread creation, events, semaphores, critical sections  
+**Why:** Multi-threaded games need synchronization  
+**Scope:** `native/src/kernel/hle/xboxkrnl_threading.cpp`
+
+### 🟡 TASK_08: XMA Audio
+**What:** Decode XMA compressed audio to PCM  
+**Why:** No audio decoding = silence  
+**Scope:** `native/src/apu/xma_decoder.cpp`
+
+---
+
+## Parallel Work Strategy
+
+These tasks can be worked on **simultaneously** without conflicts:
+
+### Group A (No Dependencies)
+- Task 01: File System
+- Task 02: Vulkan Backend  
+- Task 05: JIT Codegen
+- Task 07: Kernel Threading
+- Task 08: XMA Audio
+
+### Group B (Depends on Group A)
+- Task 03: Shader Translator (needs Task 02)
+- Task 04: Command Processor (needs Task 02)
+- Task 06: Kernel File I/O (needs Task 01)
+
+---
+
+## How to Use These Tasks
+
+### For Human Developers
+1. Pick a task from Group A
+2. Read the corresponding `TASK_XX_*.md` file
+3. Follow the implementation guide
+4. Write tests as specified
+5. Don't touch files listed in "Do NOT Touch"
+
+### For AI Agents
+When assigning to an AI agent, use:
 
 ```
-360mu/
-├── native/                 # C++ emulator core
-│   ├── CMakeLists.txt
-│   ├── include/x360mu/     # Public headers
-│   ├── src/
-│   │   ├── core/           # Main emulator
-│   │   ├── cpu/
-│   │   │   ├── xenon/      # CPU decoder/interpreter
-│   │   │   ├── vmx128/     # SIMD unit
-│   │   │   └── jit/        # JIT compiler (Task: JIT_COMPILER)
-│   │   ├── gpu/
-│   │   │   ├── xenos/      # GPU emulation (Task: GPU_VULKAN)
-│   │   │   └── vulkan/     # Vulkan backend
-│   │   ├── apu/            # Audio (Task: AUDIO_XMA)
-│   │   ├── kernel/         # HLE (Task: KERNEL_HLE)
-│   │   │   └── hle/
-│   │   ├── memory/
-│   │   └── jni/            # Android bridge (Task: ANDROID_BUILD)
-│   ├── tests/              # Unit tests
-│   └── tools/              # Test utilities
-├── android/                # Android app (Task: ANDROID_BUILD)
-│   ├── app/
-│   │   └── src/main/java/com/x360mu/
-│   └── build.gradle.kts
-└── docs/
-    ├── DEVELOPMENT_PLAN.md # Full technical plan
-    ├── BLACK_OPS_COMPATIBILITY.md
-    └── tasks/              # These task files
+Please implement the task described in:
+docs/tasks/TASK_XX_NAME.md
+
+Key constraints:
+- Only modify files in the specified scope
+- Do not touch files in other tasks
+- Write tests as described
+- Follow the existing code style
 ```
 
-## Building the Project
+---
 
-### Host (macOS/Linux)
-```bash
-cd native/build
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-make -j4
-./x360mu_tests  # Run tests
-```
+## Progress Tracking
 
-### Android
-```bash
-cd android
-./gradlew assembleDebug
-adb install app/build/outputs/apk/debug/app-debug.apk
-```
+Update this section as tasks complete:
 
-## Key Headers to Know
+| Task | Status | Assignee | Notes |
+|------|--------|----------|-------|
+| 01 File System | ⬜ Not Started | | |
+| 02 Vulkan Backend | ⬜ Not Started | | |
+| 03 Shader Translator | ⬜ Not Started | | |
+| 04 Command Processor | ⬜ Not Started | | |
+| 05 JIT Codegen | ⬜ Not Started | | |
+| 06 Kernel File I/O | ⬜ Not Started | | |
+| 07 Kernel Threading | ⬜ Not Started | | |
+| 08 XMA Audio | ⬜ Not Started | | |
 
-Before starting any task, read:
+---
 
-1. **`native/include/x360mu/types.h`** - Common types (u8, u16, u32, u64, s8, s16, etc.)
-2. **`native/include/x360mu/emulator.h`** - Main emulator interface
-3. **`native/src/cpu/xenon/cpu.h`** - CPU types (ThreadContext, DecodedInst)
-4. **`native/src/memory/memory.h`** - Memory interface
+## Critical Path to Boot
 
-## Communication Between Tasks
+To show the Activision logo (first milestone):
 
-### GPU ↔ CPU
-- GPU reads from memory mapped at `0x7FC00000` (command buffer)
-- CPU writes PM4 packets via `Gpu::write_register()`
+1. ✅ **Task 01** - Mount game ISO
+2. ✅ **Task 06** - Read default.xex  
+3. ✅ **Task 02** - Initialize Vulkan
+4. ✅ **Task 04** - Parse GPU commands
+5. ✅ **Task 03** - Translate shaders (basic)
 
-### Audio ↔ CPU
-- Audio contexts at `0x7FE00000+`
-- CPU triggers via `Apu::write_register()`
+Minimum viable for boot: Tasks 01 → 06 → 02 → 04 → 03 (partial)
 
-### Kernel ↔ CPU
-- Kernel syscalls via supervisor call instruction (sc)
-- HLE intercepts at specific addresses
+---
 
-## Integration Checkpoints
+## File Ownership
 
-When your task reaches these milestones, verify:
+To prevent conflicts, each task owns specific files:
 
-1. **GPU**: Can create Vulkan context → notify Android task
-2. **JIT**: Basic block compilation → test with CPU task
-3. **Audio**: XMA decode works → test with kernel file I/O
-4. **Kernel**: Thread creation → test with CPU multi-threading
-5. **Android**: Native lib loads → integrate with all
+| Task | Owns |
+|------|------|
+| 01 | `kernel/filesystem/*` |
+| 02 | `gpu/vulkan/*` |
+| 03 | `gpu/xenos/shader_translator.*` |
+| 04 | `gpu/xenos/command_processor.*` |
+| 05 | `cpu/jit/*` |
+| 06 | `kernel/hle/xboxkrnl_io.cpp` |
+| 07 | `kernel/hle/xboxkrnl_threading.cpp`, `kernel/threading.*` |
+| 08 | `apu/xma_decoder.*` |
 
-## Testing Reference
+**Shared (read-only for most tasks):**
+- `cpu/xenon/cpu.h` - CPU types
+- `memory/memory.h` - Memory interface
+- `kernel/kernel.h` - Kernel types
+- `x360mu/types.h` - Common types
 
-All tests are in `native/tests/`:
-```
-test_decoder.cpp      - PowerPC decoder tests
-test_interpreter.cpp  - Instruction execution tests
-test_vmx128.cpp       - VMX128 SIMD tests
-test_memory.cpp       - Memory system tests
-test_xex_loader.cpp   - XEX file loading tests
-```
+---
 
-## External References
-
-- **Xenia** (Reference implementation): https://github.com/xenia-project/xenia
-- **PowerPC ISA**: Search "PowerPC User Instruction Set Architecture"
-- **Vulkan Spec**: https://www.khronos.org/vulkan/
-- **Xbox 360 Docs**: XenonWiki, FreeXDB
-
-## Questions?
-
-If you hit a blocker, the most likely issue is:
-1. Missing include path → Check CMakeLists.txt
-2. Missing type definition → Check types.h
-3. API mismatch → Check the relevant .h file
-
-Good luck! 🎮
-
+*Last updated: December 2024*

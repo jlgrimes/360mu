@@ -75,6 +75,8 @@ if(X360MU_USE_VULKAN)
         src/gpu/xenos/edram.cpp
         src/gpu/xenos/texture.cpp
         src/gpu/vulkan/vulkan_backend.cpp
+        src/gpu/vulkan/memory_manager.cpp
+        src/gpu/vulkan/swapchain.cpp
     )
 else()
     set(GPU_SOURCES
@@ -82,19 +84,26 @@ else()
     )
 endif()
 
-# APU sources - stub provides Apu class matching audio.h, xma_decoder provides XmaDecoder/AudioMixer
+# APU sources - stub provides Apu class matching audio.h, xma_decoder provides XmaDecoder/AudioMixer/XmaProcessor
 set(APU_SOURCES
     src/apu/stub/apu_stub.cpp
     src/apu/xma_decoder.cpp
+    src/apu/android_audio.cpp
 )
 
 set(KERNEL_SOURCES
     src/kernel/kernel.cpp
+    src/kernel/threading.cpp
     src/kernel/hle/xboxkrnl.cpp
     src/kernel/hle/xboxkrnl_extended.cpp
+    src/kernel/hle/xboxkrnl_io.cpp
+    src/kernel/hle/xboxkrnl_threading.cpp
     src/kernel/hle/xam.cpp
     src/kernel/xex_loader.cpp
     src/kernel/xex_crypto.cpp
+    src/kernel/filesystem/vfs.cpp
+    src/kernel/filesystem/iso_device.cpp
+    src/kernel/filesystem/stfs_device.cpp
 )
 
 set(MEMORY_SOURCES
@@ -216,6 +225,19 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
         set(JIT_TEST_SOURCES tests/cpu/test_jit.cpp)
     endif()
     
+    # GPU/Vulkan tests only when Vulkan is available
+    set(GPU_TEST_SOURCES "")
+    if(X360MU_USE_VULKAN)
+        # Command processor tests can run without full Vulkan (uses mocks)
+        set(GPU_TEST_SOURCES 
+            tests/gpu/test_command_processor.cpp
+        )
+        if(Vulkan_FOUND)
+            # Full Vulkan tests require Vulkan SDK
+            list(APPEND GPU_TEST_SOURCES tests/gpu/test_vulkan.cpp)
+        endif()
+    endif()
+    
     add_executable(x360mu_tests
         tests/test_main.cpp
         tests/cpu/test_decoder.cpp
@@ -223,8 +245,12 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
         tests/cpu/test_vmx128.cpp
         tests/memory/test_memory.cpp
         tests/kernel/test_xex_loader.cpp
+        tests/kernel/test_filesystem.cpp
+        tests/kernel/test_file_io.cpp
+        tests/kernel/test_threading.cpp
         tests/apu/test_audio.cpp
         ${JIT_TEST_SOURCES}
+        ${GPU_TEST_SOURCES}
     )
     
     target_link_libraries(x360mu_tests
@@ -232,6 +258,11 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
         gtest
         gtest_main
     )
+    
+    # Link Vulkan for tests if available
+    if(X360MU_USE_VULKAN AND Vulkan_FOUND)
+        target_link_libraries(x360mu_tests ${VULKAN_LIB})
+    endif()
     
     include(GoogleTest)
     gtest_discover_tests(x360mu_tests)
@@ -262,6 +293,7 @@ message(STATUS "=== 360μ Build Configuration ===")
 message(STATUS "Platform:       ${X360MU_PLATFORM}")
 message(STATUS "Build type:     ${CMAKE_BUILD_TYPE}")
 message(STATUS "JIT enabled:    ${X360MU_ENABLE_JIT}")
+message(STATUS "Vulkan:         ${X360MU_USE_VULKAN}")
 message(STATUS "FFmpeg:         ${X360MU_USE_FFMPEG}")
 message(STATUS "Tests:          ${X360MU_BUILD_TESTS}")
 message(STATUS "ASAN:           ${X360MU_ENABLE_ASAN}")

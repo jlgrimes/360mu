@@ -894,5 +894,552 @@ void VulkanBackend::bind_descriptor_set(VkDescriptorSet set) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 0, nullptr);
 }
 
+//=============================================================================
+// Memory Management
+//=============================================================================
+
+u32 VulkanBackend::find_memory_type(u32 type_filter, VkMemoryPropertyFlags properties) {
+    VkPhysicalDeviceMemoryProperties mem_props;
+    vkGetPhysicalDeviceMemoryProperties(physical_device_, &mem_props);
+    
+    for (u32 i = 0; i < mem_props.memoryTypeCount; i++) {
+        if ((type_filter & (1 << i)) &&
+            (mem_props.memoryTypes[i].propertyFlags & properties) == properties) {
+            return i;
+        }
+    }
+    
+    LOGE("Failed to find suitable memory type");
+    return UINT32_MAX;
+}
+
+VulkanBuffer VulkanBackend::create_buffer(u64 size, VkBufferUsageFlags usage,
+                                           VkMemoryPropertyFlags properties) {
+    VulkanBuffer buffer;
+    buffer.size = size;
+    
+    // Create buffer
+    VkBufferCreateInfo buffer_info = {};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = size;
+    buffer_info.usage = usage;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    
+    VkResult result = vkCreateBuffer(device_, &buffer_info, nullptr, &buffer.buffer);
+    if (result != VK_SUCCESS) {
+        LOGE("Failed to create buffer: %d", result);
+        return buffer;
+    }
+    
+    // Get memory requirements
+    VkMemoryRequirements mem_reqs;
+    vkGetBufferMemoryRequirements(device_, buffer.buffer, &mem_reqs);
+    
+    // Allocate memory
+    VkMemoryAllocateInfo alloc_info = {};
+    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc_info.allocationSize = mem_reqs.size;
+    alloc_info.memoryTypeIndex = find_memory_type(mem_reqs.memoryTypeBits, properties);
+    
+    if (alloc_info.memoryTypeIndex == UINT32_MAX) {
+        vkDestroyBuffer(device_, buffer.buffer, nullptr);
+        buffer.buffer = VK_NULL_HANDLE;
+        return buffer;
+    }
+    
+    result = vkAllocateMemory(device_, &alloc_info, nullptr, &buffer.memory);
+    if (result != VK_SUCCESS) {
+        LOGE("Failed to allocate buffer memory: %d", result);
+        vkDestroyBuffer(device_, buffer.buffer, nullptr);
+        buffer.buffer = VK_NULL_HANDLE;
+        return buffer;
+    }
+    
+    // Bind memory
+    vkBindBufferMemory(device_, buffer.buffer, buffer.memory, 0);
+    
+    // Map memory if host-visible
+    if (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+        vkMapMemory(device_, buffer.memory, 0, size, 0, &buffer.mapped);
+    }
+    
+    LOGD("Created buffer: size=%llu, usage=%u", (unsigned long long)size, usage);
+    return buffer;
+}
+
+void VulkanBackend::destroy_buffer(VulkanBuffer& buffer) {
+    if (buffer.buffer == VK_NULL_HANDLE) return;
+    
+    if (buffer.mapped) {
+        vkUnmapMemory(device_, buffer.memory);
+        buffer.mapped = nullptr;
+    }
+    
+    vkDestroyBuffer(device_, buffer.buffer, nullptr);
+    vkFreeMemory(device_, buffer.memory, nullptr);
+    
+    buffer.buffer = VK_NULL_HANDLE;
+    buffer.memory = VK_NULL_HANDLE;
+    buffer.size = 0;
+}
+
+VulkanImage VulkanBackend::create_image(u32 width, u32 height, VkFormat format,
+                                         VkImageUsageFlags usage) {
+    VulkanImage image;
+    image.width = width;
+    image.height = height;
+    image.format = format;
+    
+    // Create image
+    VkImageCreateInfo image_info = {};
+    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.extent.width = width;
+    image_info.extent.height = height;
+    image_info.extent.depth = 1;
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.format = format;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    image_info.usage = usage;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    
+    VkResult result = vkCreateImage(device_, &image_info, nullptr, &image.image);
+    if (result != VK_SUCCESS) {
+        LOGE("Failed to create image: %d", result);
+        return image;
+    }
+    
+    // Get memory requirements
+    VkMemoryRequirements mem_reqs;
+    vkGetImageMemoryRequirements(device_, image.image, &mem_reqs);
+    
+    // Allocate memory
+    VkMemoryAllocateInfo alloc_info = {};
+    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc_info.allocationSize = mem_reqs.size;
+    alloc_info.memoryTypeIndex = find_memory_type(mem_reqs.memoryTypeBits, 
+                                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    
+    if (alloc_info.memoryTypeIndex == UINT32_MAX) {
+        vkDestroyImage(device_, image.image, nullptr);
+        image.image = VK_NULL_HANDLE;
+        return image;
+    }
+    
+    result = vkAllocateMemory(device_, &alloc_info, nullptr, &image.memory);
+    if (result != VK_SUCCESS) {
+        LOGE("Failed to allocate image memory: %d", result);
+        vkDestroyImage(device_, image.image, nullptr);
+        image.image = VK_NULL_HANDLE;
+        return image;
+    }
+    
+    // Bind memory
+    vkBindImageMemory(device_, image.image, image.memory, 0);
+    
+    // Create image view
+    VkImageViewCreateInfo view_info = {};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = image.image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = format;
+    view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    view_info.subresourceRange.baseMipLevel = 0;
+    view_info.subresourceRange.levelCount = 1;
+    view_info.subresourceRange.baseArrayLayer = 0;
+    view_info.subresourceRange.layerCount = 1;
+    
+    // Adjust aspect mask for depth formats
+    if (format == VK_FORMAT_D32_SFLOAT || format == VK_FORMAT_D24_UNORM_S8_UINT ||
+        format == VK_FORMAT_D16_UNORM) {
+        view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    }
+    
+    result = vkCreateImageView(device_, &view_info, nullptr, &image.view);
+    if (result != VK_SUCCESS) {
+        LOGE("Failed to create image view: %d", result);
+        vkDestroyImage(device_, image.image, nullptr);
+        vkFreeMemory(device_, image.memory, nullptr);
+        image.image = VK_NULL_HANDLE;
+        image.memory = VK_NULL_HANDLE;
+        return image;
+    }
+    
+    LOGD("Created image: %ux%u, format=%d", width, height, format);
+    return image;
+}
+
+void VulkanBackend::destroy_image(VulkanImage& image) {
+    if (image.image == VK_NULL_HANDLE) return;
+    
+    if (image.view != VK_NULL_HANDLE) {
+        vkDestroyImageView(device_, image.view, nullptr);
+    }
+    vkDestroyImage(device_, image.image, nullptr);
+    vkFreeMemory(device_, image.memory, nullptr);
+    
+    image.image = VK_NULL_HANDLE;
+    image.memory = VK_NULL_HANDLE;
+    image.view = VK_NULL_HANDLE;
+    image.width = 0;
+    image.height = 0;
+}
+
+void VulkanBackend::upload_to_buffer(VulkanBuffer& buffer, const void* data, size_t size) {
+    if (buffer.mapped) {
+        // Buffer is host-visible, direct copy
+        memcpy(buffer.mapped, data, size);
+        
+        // Flush if not coherent
+        VkMappedMemoryRange range = {};
+        range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        range.memory = buffer.memory;
+        range.offset = 0;
+        range.size = VK_WHOLE_SIZE;
+        vkFlushMappedMemoryRanges(device_, 1, &range);
+    } else {
+        // Need staging buffer
+        VulkanBuffer staging = create_buffer(size,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        
+        memcpy(staging.mapped, data, size);
+        
+        // Copy via command buffer
+        VkCommandBufferAllocateInfo alloc_info = {};
+        alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        alloc_info.commandPool = command_pool_;
+        alloc_info.commandBufferCount = 1;
+        
+        VkCommandBuffer cmd;
+        vkAllocateCommandBuffers(device_, &alloc_info, &cmd);
+        
+        VkCommandBufferBeginInfo begin_info = {};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &begin_info);
+        
+        VkBufferCopy copy_region = {};
+        copy_region.size = size;
+        vkCmdCopyBuffer(cmd, staging.buffer, buffer.buffer, 1, &copy_region);
+        
+        vkEndCommandBuffer(cmd);
+        
+        VkSubmitInfo submit_info = {};
+        submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit_info.commandBufferCount = 1;
+        submit_info.pCommandBuffers = &cmd;
+        
+        vkQueueSubmit(graphics_queue_, 1, &submit_info, VK_NULL_HANDLE);
+        vkQueueWaitIdle(graphics_queue_);
+        
+        vkFreeCommandBuffers(device_, command_pool_, 1, &cmd);
+        destroy_buffer(staging);
+    }
+}
+
+void VulkanBackend::upload_to_image(VulkanImage& image, const void* data, size_t size) {
+    // Create staging buffer
+    VulkanBuffer staging = create_buffer(size,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    
+    memcpy(staging.mapped, data, size);
+    
+    // Create command buffer for transfer
+    VkCommandBufferAllocateInfo alloc_info = {};
+    alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    alloc_info.commandPool = command_pool_;
+    alloc_info.commandBufferCount = 1;
+    
+    VkCommandBuffer cmd;
+    vkAllocateCommandBuffers(device_, &alloc_info, &cmd);
+    
+    VkCommandBufferBeginInfo begin_info = {};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin_info);
+    
+    // Transition to transfer destination
+    transition_image_layout(cmd, image.image, VK_IMAGE_LAYOUT_UNDEFINED, 
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    
+    // Copy buffer to image
+    VkBufferImageCopy region = {};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {image.width, image.height, 1};
+    
+    vkCmdCopyBufferToImage(cmd, staging.buffer, image.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    
+    // Transition to shader read
+    transition_image_layout(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    
+    vkEndCommandBuffer(cmd);
+    
+    VkSubmitInfo submit_info = {};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &cmd;
+    
+    vkQueueSubmit(graphics_queue_, 1, &submit_info, VK_NULL_HANDLE);
+    vkQueueWaitIdle(graphics_queue_);
+    
+    vkFreeCommandBuffers(device_, command_pool_, 1, &cmd);
+    destroy_buffer(staging);
+}
+
+//=============================================================================
+// Image Layout Transitions
+//=============================================================================
+
+void VulkanBackend::transition_image_layout(VkImage image, VkImageLayout old_layout, 
+                                             VkImageLayout new_layout) {
+    // Create one-time command buffer
+    VkCommandBufferAllocateInfo alloc_info = {};
+    alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    alloc_info.commandPool = command_pool_;
+    alloc_info.commandBufferCount = 1;
+    
+    VkCommandBuffer cmd;
+    vkAllocateCommandBuffers(device_, &alloc_info, &cmd);
+    
+    VkCommandBufferBeginInfo begin_info = {};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin_info);
+    
+    transition_image_layout(cmd, image, old_layout, new_layout);
+    
+    vkEndCommandBuffer(cmd);
+    
+    VkSubmitInfo submit_info = {};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &cmd;
+    
+    vkQueueSubmit(graphics_queue_, 1, &submit_info, VK_NULL_HANDLE);
+    vkQueueWaitIdle(graphics_queue_);
+    
+    vkFreeCommandBuffers(device_, command_pool_, 1, &cmd);
+}
+
+void VulkanBackend::transition_image_layout(VkCommandBuffer cmd, VkImage image, 
+                                             VkImageLayout old_layout, VkImageLayout new_layout) {
+    VkImageMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = old_layout;
+    barrier.newLayout = new_layout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+    
+    VkPipelineStageFlags src_stage;
+    VkPipelineStageFlags dst_stage;
+    
+    // Determine access masks and stages based on layouts
+    if (old_layout == VK_IMAGE_LAYOUT_UNDEFINED && 
+        new_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    } else if (old_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && 
+               new_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    } else if (old_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && 
+               new_layout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) {
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = 0;
+        src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dst_stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    } else if (old_layout == VK_IMAGE_LAYOUT_UNDEFINED && 
+               new_layout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = 0;
+        src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        dst_stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    } else if (old_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL && 
+               new_layout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) {
+        barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstAccessMask = 0;
+        src_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dst_stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    } else {
+        // Generic transition
+        barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        src_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        dst_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    }
+    
+    vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 
+                         0, nullptr, 0, nullptr, 1, &barrier);
+}
+
+//=============================================================================
+// Swapchain Management
+//=============================================================================
+
+void VulkanBackend::cleanup_swapchain() {
+    // Destroy framebuffers
+    for (auto fb : framebuffers_) {
+        vkDestroyFramebuffer(device_, fb, nullptr);
+    }
+    framebuffers_.clear();
+    
+    // Destroy image views
+    for (auto view : swapchain_image_views_) {
+        vkDestroyImageView(device_, view, nullptr);
+    }
+    swapchain_image_views_.clear();
+    
+    // Destroy swapchain
+    if (swapchain_ != VK_NULL_HANDLE) {
+        vkDestroySwapchainKHR(device_, swapchain_, nullptr);
+        swapchain_ = VK_NULL_HANDLE;
+    }
+    
+    swapchain_images_.clear();
+}
+
+Status VulkanBackend::resize(u32 width, u32 height) {
+    if (device_ == VK_NULL_HANDLE) return Status::Error;
+    
+    // Wait for device idle
+    vkDeviceWaitIdle(device_);
+    
+    width_ = width;
+    height_ = height;
+    
+    // Cleanup old swapchain resources
+    cleanup_swapchain();
+    
+    // Recreate swapchain
+    VkResult result = create_swapchain();
+    if (result != VK_SUCCESS) {
+        LOGE("Failed to recreate swapchain: %d", result);
+        return Status::ErrorSwapchain;
+    }
+    
+    // Recreate framebuffers
+    result = create_framebuffers();
+    if (result != VK_SUCCESS) {
+        LOGE("Failed to recreate framebuffers: %d", result);
+        return Status::ErrorSwapchain;
+    }
+    
+    LOGI("Swapchain resized to %ux%u", width, height);
+    return Status::Ok;
+}
+
+//=============================================================================
+// Test/Debug Functions
+//=============================================================================
+
+void VulkanBackend::clear_screen(float r, float g, float b) {
+    // Wait for previous frame
+    vkWaitForFences(device_, 1, &in_flight_fences_[current_frame_], VK_TRUE, UINT64_MAX);
+    
+    // Acquire next image
+    VkResult result = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX,
+                                            image_available_semaphores_[current_frame_],
+                                            VK_NULL_HANDLE, &current_image_index_);
+    
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        LOGE("Swapchain out of date in clear_screen");
+        return;
+    }
+    
+    vkResetFences(device_, 1, &in_flight_fences_[current_frame_]);
+    
+    // Begin command buffer
+    VkCommandBuffer cmd = command_buffers_[current_frame_];
+    vkResetCommandBuffer(cmd, 0);
+    
+    VkCommandBufferBeginInfo begin_info = {};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vkBeginCommandBuffer(cmd, &begin_info);
+    
+    // Clear color value
+    VkClearColorValue clear_color = {{r, g, b, 1.0f}};
+    VkImageSubresourceRange range = {};
+    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    range.baseMipLevel = 0;
+    range.levelCount = 1;
+    range.baseArrayLayer = 0;
+    range.layerCount = 1;
+    
+    // Transition image to TRANSFER_DST
+    transition_image_layout(cmd, swapchain_images_[current_image_index_],
+                           VK_IMAGE_LAYOUT_UNDEFINED,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    
+    // Clear the image
+    vkCmdClearColorImage(cmd, swapchain_images_[current_image_index_],
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        &clear_color, 1, &range);
+    
+    // Transition to PRESENT
+    transition_image_layout(cmd, swapchain_images_[current_image_index_],
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    
+    vkEndCommandBuffer(cmd);
+    
+    // Submit
+    VkSubmitInfo submit_info = {};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    
+    VkSemaphore wait_semaphores[] = {image_available_semaphores_[current_frame_]};
+    VkPipelineStageFlags wait_stages[] = {VK_PIPELINE_STAGE_TRANSFER_BIT};
+    submit_info.waitSemaphoreCount = 1;
+    submit_info.pWaitSemaphores = wait_semaphores;
+    submit_info.pWaitDstStageMask = wait_stages;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &cmd;
+    
+    VkSemaphore signal_semaphores[] = {render_finished_semaphores_[current_frame_]};
+    submit_info.signalSemaphoreCount = 1;
+    submit_info.pSignalSemaphores = signal_semaphores;
+    
+    vkQueueSubmit(graphics_queue_, 1, &submit_info, in_flight_fences_[current_frame_]);
+    
+    // Present
+    VkPresentInfoKHR present_info = {};
+    present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    present_info.waitSemaphoreCount = 1;
+    present_info.pWaitSemaphores = signal_semaphores;
+    present_info.swapchainCount = 1;
+    present_info.pSwapchains = &swapchain_;
+    present_info.pImageIndices = &current_image_index_;
+    
+    vkQueuePresentKHR(graphics_queue_, &present_info);
+    
+    current_frame_ = (current_frame_ + 1) % MAX_FRAMES_IN_FLIGHT;
+}
+
 } // namespace x360mu
 

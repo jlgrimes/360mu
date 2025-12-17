@@ -380,6 +380,18 @@ u32 SpirvBuilder::type_sampled_image(u32 image_type) {
     return id;
 }
 
+u32 SpirvBuilder::type_runtime_array(u32 element_type) {
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpTypeRuntimeArray, 0, id, {element_type});
+    return id;
+}
+
+u32 SpirvBuilder::type_sampler() {
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpTypeSampler, 0, id, {});
+    return id;
+}
+
 // Constants
 u32 SpirvBuilder::const_bool(bool value) {
     u32 type = type_bool();
@@ -514,6 +526,55 @@ u32 SpirvBuilder::f_mod(u32 type, u32 a, u32 b) {
     return id;
 }
 
+u32 SpirvBuilder::i_add(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpIAdd, type, id, {a, b});
+    return id;
+}
+
+u32 SpirvBuilder::i_sub(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpISub, type, id, {a, b});
+    return id;
+}
+
+u32 SpirvBuilder::i_mul(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpIMul, type, id, {a, b});
+    return id;
+}
+
+// Conversions
+u32 SpirvBuilder::convert_f_to_s(u32 type, u32 value) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 110, type, id, {value}); // OpConvertFToS
+    return id;
+}
+
+u32 SpirvBuilder::convert_s_to_f(u32 type, u32 value) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 111, type, id, {value}); // OpConvertSToF
+    return id;
+}
+
+u32 SpirvBuilder::convert_f_to_u(u32 type, u32 value) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 109, type, id, {value}); // OpConvertFToU
+    return id;
+}
+
+u32 SpirvBuilder::convert_u_to_f(u32 type, u32 value) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 112, type, id, {value}); // OpConvertUToF
+    return id;
+}
+
+u32 SpirvBuilder::bitcast(u32 type, u32 value) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 124, type, id, {value}); // OpBitcast
+    return id;
+}
+
 // Extended instructions
 u32 SpirvBuilder::ext_inst(u32 type, u32 set, u32 instruction, const std::vector<u32>& operands) {
     u32 id = allocate_id();
@@ -554,6 +615,24 @@ u32 SpirvBuilder::composite_construct(u32 type, const std::vector<u32>& constitu
     return id;
 }
 
+u32 SpirvBuilder::vector_extract_dynamic(u32 type, u32 vector, u32 index) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 78, type, id, {vector, index}); // OpVectorExtractDynamic
+    return id;
+}
+
+u32 SpirvBuilder::vector_insert_dynamic(u32 type, u32 vector, u32 component, u32 index) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 79, type, id, {vector, component, index}); // OpVectorInsertDynamic
+    return id;
+}
+
+u32 SpirvBuilder::dot(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 148, type, id, {a, b}); // OpDot
+    return id;
+}
+
 // Comparison
 u32 SpirvBuilder::f_ord_equal(u32 type, u32 a, u32 b) {
     u32 id = allocate_id();
@@ -591,6 +670,49 @@ u32 SpirvBuilder::f_ord_greater_than_equal(u32 type, u32 a, u32 b) {
     return id;
 }
 
+u32 SpirvBuilder::i_equal(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 170, type, id, {a, b}); // OpIEqual
+    return id;
+}
+
+u32 SpirvBuilder::i_not_equal(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 171, type, id, {a, b}); // OpINotEqual
+    return id;
+}
+
+// Logical operations
+u32 SpirvBuilder::logical_and(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 167, type, id, {a, b}); // OpLogicalAnd
+    return id;
+}
+
+u32 SpirvBuilder::logical_or(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 166, type, id, {a, b}); // OpLogicalOr
+    return id;
+}
+
+u32 SpirvBuilder::logical_not(u32 type, u32 a) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 168, type, id, {a}); // OpLogicalNot
+    return id;
+}
+
+u32 SpirvBuilder::any(u32 type, u32 vector) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 154, type, id, {vector}); // OpAny
+    return id;
+}
+
+u32 SpirvBuilder::all(u32 type, u32 vector) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 155, type, id, {vector}); // OpAll
+    return id;
+}
+
 // Control flow
 u32 SpirvBuilder::select(u32 type, u32 condition, u32 true_val, u32 false_val) {
     u32 id = allocate_id();
@@ -614,7 +736,28 @@ void SpirvBuilder::selection_merge(u32 merge_block, u32 control) {
     emit_op(current_function_, spv::OpSelectionMerge, 0, 0, {merge_block, control});
 }
 
+void SpirvBuilder::kill() {
+    emit_op(current_function_, spv::OpKill, 0, 0, {});
+}
+
+u32 SpirvBuilder::phi(u32 type, const std::vector<std::pair<u32, u32>>& incoming) {
+    u32 id = allocate_id();
+    std::vector<u32> ops;
+    for (const auto& [value, block] : incoming) {
+        ops.push_back(value);
+        ops.push_back(block);
+    }
+    emit_op(current_function_, 245, type, id, ops); // OpPhi
+    return id;
+}
+
 // Texture
+u32 SpirvBuilder::sampled_image(u32 type, u32 image, u32 sampler) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 86, type, id, {image, sampler}); // OpSampledImage
+    return id;
+}
+
 u32 SpirvBuilder::image_sample(u32 type, u32 sampled_image, u32 coord, u32 bias) {
     u32 id = allocate_id();
     if (bias != 0) {
@@ -624,6 +767,36 @@ u32 SpirvBuilder::image_sample(u32 type, u32 sampled_image, u32 coord, u32 bias)
         emit_op(current_function_, spv::OpImageSampleImplicitLod, type, id, 
                 {sampled_image, coord});
     }
+    return id;
+}
+
+u32 SpirvBuilder::image_sample_lod(u32 type, u32 sampled_image, u32 coord, u32 lod) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpImageSampleExplicitLod, type, id, 
+            {sampled_image, coord, 0x2, lod}); // Lod operand mask
+    return id;
+}
+
+u32 SpirvBuilder::image_sample_grad(u32 type, u32 sampled_image, u32 coord, u32 ddx, u32 ddy) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpImageSampleExplicitLod, type, id, 
+            {sampled_image, coord, 0x4, ddx, ddy}); // Grad operand mask
+    return id;
+}
+
+u32 SpirvBuilder::image_fetch(u32 type, u32 image, u32 coord, u32 lod) {
+    u32 id = allocate_id();
+    if (lod != 0) {
+        emit_op(current_function_, 98, type, id, {image, coord, 0x2, lod}); // OpImageFetch
+    } else {
+        emit_op(current_function_, 98, type, id, {image, coord}); // OpImageFetch
+    }
+    return id;
+}
+
+u32 SpirvBuilder::image_query_size_lod(u32 type, u32 image, u32 lod) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 103, type, id, {image, lod}); // OpImageQuerySizeLod
     return id;
 }
 
@@ -638,6 +811,10 @@ void SpirvBuilder::member_decorate(u32 type, u32 member, u32 decoration, const s
     std::vector<u32> ops = {type, member, decoration};
     ops.insert(ops.end(), operands.begin(), operands.end());
     emit_op(decorations_, spv::OpMemberDecorate, 0, 0, ops);
+}
+
+void SpirvBuilder::decorate_array_stride(u32 type, u32 stride) {
+    decorate(type, 6, {stride}); // DecorationArrayStride = 6
 }
 
 // Debug

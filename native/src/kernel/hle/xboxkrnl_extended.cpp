@@ -18,6 +18,7 @@
 #include "../../cpu/xenon/cpu.h"
 #include "../../cpu/xenon/threading.h"
 #include "../../memory/memory.h"
+#include "../../apu/xma_decoder.h"
 #include <cstring>
 #include <ctime>
 #include <chrono>
@@ -1121,6 +1122,234 @@ static void HLE_KeCancelTimer(Cpu* cpu, Memory* memory, u64* args, u64* result) 
 }
 
 //=============================================================================
+// XMA Audio Functions
+//=============================================================================
+
+// Global XMA processor pointer (set during kernel init)
+static class XmaProcessor* g_xma_processor = nullptr;
+
+void set_xma_processor(class XmaProcessor* processor) {
+    g_xma_processor = processor;
+}
+
+XmaProcessor* get_xma_processor() {
+    return g_xma_processor;
+}
+
+static void HLE_XMACreateContext(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // DWORD XMACreateContext(DWORD* ContextIndex);
+    GuestAddr context_index_ptr = static_cast<GuestAddr>(args[0]);
+    
+    if (!g_xma_processor) {
+        LOGE("XMACreateContext: XMA processor not initialized");
+        *result = STATUS_UNSUCCESSFUL;
+        return;
+    }
+    
+    u32 context_id = g_xma_processor->create_context();
+    if (context_id == UINT32_MAX) {
+        LOGE("XMACreateContext: failed to create context");
+        *result = STATUS_NO_MEMORY;
+        return;
+    }
+    
+    memory->write_u32(context_index_ptr, context_id);
+    LOGD("XMACreateContext: created context %u", context_id);
+    *result = STATUS_SUCCESS;
+}
+
+static void HLE_XMADeleteContext(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // DWORD XMADeleteContext(DWORD ContextIndex);
+    u32 context_id = static_cast<u32>(args[0]);
+    
+    if (!g_xma_processor) {
+        *result = STATUS_UNSUCCESSFUL;
+        return;
+    }
+    
+    g_xma_processor->destroy_context(context_id);
+    LOGD("XMADeleteContext: destroyed context %u", context_id);
+    *result = STATUS_SUCCESS;
+}
+
+static void HLE_XMASetInputBuffer(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // DWORD XMASetInputBuffer(
+    //   DWORD ContextIndex,
+    //   void* InputBuffer,
+    //   DWORD InputBufferSize,
+    //   DWORD BufferIndex
+    // );
+    u32 context_id = static_cast<u32>(args[0]);
+    GuestAddr input_buffer = static_cast<GuestAddr>(args[1]);
+    u32 input_size = static_cast<u32>(args[2]);
+    u32 buffer_index = static_cast<u32>(args[3]);
+    
+    if (!g_xma_processor) {
+        *result = STATUS_UNSUCCESSFUL;
+        return;
+    }
+    
+    g_xma_processor->set_input_buffer(context_id, input_buffer, input_size, buffer_index);
+    LOGD("XMASetInputBuffer: ctx=%u, buf=%u, addr=0x%08X, size=%u", 
+         context_id, buffer_index, input_buffer, input_size);
+    *result = STATUS_SUCCESS;
+}
+
+static void HLE_XMASetOutputBuffer(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // DWORD XMASetOutputBuffer(
+    //   DWORD ContextIndex,
+    //   void* OutputBuffer,
+    //   DWORD OutputBufferSize
+    // );
+    u32 context_id = static_cast<u32>(args[0]);
+    GuestAddr output_buffer = static_cast<GuestAddr>(args[1]);
+    u32 output_size = static_cast<u32>(args[2]);
+    
+    if (!g_xma_processor) {
+        *result = STATUS_UNSUCCESSFUL;
+        return;
+    }
+    
+    g_xma_processor->set_output_buffer(context_id, output_buffer, output_size);
+    LOGD("XMASetOutputBuffer: ctx=%u, addr=0x%08X, size=%u", context_id, output_buffer, output_size);
+    *result = STATUS_SUCCESS;
+}
+
+static void HLE_XMAEnableContext(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // DWORD XMAEnableContext(DWORD ContextIndex);
+    u32 context_id = static_cast<u32>(args[0]);
+    
+    if (!g_xma_processor) {
+        *result = STATUS_UNSUCCESSFUL;
+        return;
+    }
+    
+    g_xma_processor->enable_context(context_id);
+    LOGD("XMAEnableContext: ctx=%u", context_id);
+    *result = STATUS_SUCCESS;
+}
+
+static void HLE_XMADisableContext(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // DWORD XMADisableContext(DWORD ContextIndex, BOOL Wait);
+    u32 context_id = static_cast<u32>(args[0]);
+    u32 wait = static_cast<u32>(args[1]);
+    
+    if (!g_xma_processor) {
+        *result = STATUS_UNSUCCESSFUL;
+        return;
+    }
+    
+    g_xma_processor->disable_context(context_id);
+    LOGD("XMADisableContext: ctx=%u, wait=%u", context_id, wait);
+    *result = STATUS_SUCCESS;
+}
+
+static void HLE_XMAGetOutputBufferWriteOffset(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // DWORD XMAGetOutputBufferWriteOffset(DWORD ContextIndex, DWORD* WriteOffset);
+    u32 context_id = static_cast<u32>(args[0]);
+    GuestAddr write_offset_ptr = static_cast<GuestAddr>(args[1]);
+    
+    if (!g_xma_processor) {
+        *result = STATUS_UNSUCCESSFUL;
+        return;
+    }
+    
+    u32 offset = g_xma_processor->get_output_write_offset(context_id);
+    memory->write_u32(write_offset_ptr, offset);
+    *result = STATUS_SUCCESS;
+}
+
+static void HLE_XMAIsInputBufferConsumed(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // BOOL XMAIsInputBufferConsumed(DWORD ContextIndex, DWORD BufferIndex);
+    u32 context_id = static_cast<u32>(args[0]);
+    u32 buffer_index = static_cast<u32>(args[1]);
+    
+    if (!g_xma_processor) {
+        *result = 1;  // TRUE - treat as consumed if no processor
+        return;
+    }
+    
+    *result = g_xma_processor->is_input_buffer_consumed(context_id, buffer_index) ? 1 : 0;
+}
+
+static void HLE_XMASetContextData(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // DWORD XMASetContextData(DWORD ContextIndex, void* ContextData);
+    u32 context_id = static_cast<u32>(args[0]);
+    GuestAddr context_data = static_cast<GuestAddr>(args[1]);
+    
+    if (!g_xma_processor) {
+        *result = STATUS_UNSUCCESSFUL;
+        return;
+    }
+    
+    // Read context data structure and configure
+    // XMA context data typically includes:
+    // +0: Sample rate
+    // +4: Channels
+    // +8: Loop data
+    // etc.
+    
+    if (context_data) {
+        u32 sample_rate = memory->read_u32(context_data + 0);
+        u32 channels = memory->read_u32(context_data + 4);
+        u32 loop_start = memory->read_u32(context_data + 8);
+        u32 loop_end = memory->read_u32(context_data + 12);
+        u32 loop_count = memory->read_u32(context_data + 16);
+        
+        // Apply valid values
+        if (sample_rate >= 8000 && sample_rate <= 48000) {
+            g_xma_processor->set_context_sample_rate(context_id, sample_rate);
+        }
+        if (channels >= 1 && channels <= 6) {
+            g_xma_processor->set_context_channels(context_id, channels);
+        }
+        if (loop_count > 0) {
+            g_xma_processor->set_context_loop(context_id, true, loop_start, loop_end);
+        }
+    }
+    
+    *result = STATUS_SUCCESS;
+}
+
+static void HLE_XMABlockWhileInUse(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // DWORD XMABlockWhileInUse(DWORD ContextIndex);
+    u32 context_id = static_cast<u32>(args[0]);
+    
+    if (!g_xma_processor) {
+        *result = STATUS_SUCCESS;
+        return;
+    }
+    
+    // Wait for context to become inactive
+    // For now, just process pending data
+    while (g_xma_processor->is_context_active(context_id)) {
+        g_xma_processor->process_context(context_id, 1);
+        std::this_thread::yield();
+    }
+    
+    *result = STATUS_SUCCESS;
+}
+
+static void HLE_XMAGetContextSampleRate(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // DWORD XMAGetContextSampleRate(DWORD ContextIndex, DWORD* SampleRate);
+    u32 context_id = static_cast<u32>(args[0]);
+    GuestAddr sample_rate_ptr = static_cast<GuestAddr>(args[1]);
+    
+    if (!g_xma_processor) {
+        *result = STATUS_UNSUCCESSFUL;
+        return;
+    }
+    
+    auto* ctx = g_xma_processor->get_context(context_id);
+    if (ctx) {
+        memory->write_u32(sample_rate_ptr, ctx->sample_rate);
+        *result = STATUS_SUCCESS;
+    } else {
+        *result = STATUS_INVALID_PARAMETER;
+    }
+}
+
+//=============================================================================
 // APC (Asynchronous Procedure Calls)
 //=============================================================================
 
@@ -1260,7 +1489,20 @@ void Kernel::register_xboxkrnl_extended() {
     hle_functions_[make_import_key(0, 54)] = HLE_KeInitializeApc;
     hle_functions_[make_import_key(0, 61)] = HLE_KeInsertQueueApc;
     
-    LOGI("Registered extended xboxkrnl.exe HLE functions");
+    // XMA Audio (ordinals are approximate - may need adjustment based on actual Xbox 360 SDK)
+    hle_functions_[make_import_key(0, 450)] = HLE_XMACreateContext;
+    hle_functions_[make_import_key(0, 451)] = HLE_XMADeleteContext;
+    hle_functions_[make_import_key(0, 452)] = HLE_XMASetInputBuffer;
+    hle_functions_[make_import_key(0, 453)] = HLE_XMASetOutputBuffer;
+    hle_functions_[make_import_key(0, 454)] = HLE_XMAEnableContext;
+    hle_functions_[make_import_key(0, 455)] = HLE_XMADisableContext;
+    hle_functions_[make_import_key(0, 456)] = HLE_XMAGetOutputBufferWriteOffset;
+    hle_functions_[make_import_key(0, 457)] = HLE_XMAIsInputBufferConsumed;
+    hle_functions_[make_import_key(0, 458)] = HLE_XMASetContextData;
+    hle_functions_[make_import_key(0, 459)] = HLE_XMABlockWhileInUse;
+    hle_functions_[make_import_key(0, 460)] = HLE_XMAGetContextSampleRate;
+    
+    LOGI("Registered extended xboxkrnl.exe HLE functions (including XMA audio)");
 }
 
 // Set scheduler pointer for thread management

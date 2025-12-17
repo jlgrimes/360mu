@@ -184,6 +184,11 @@ public:
      */
     const LoadedModule* get_module(const std::string& name) const;
     
+    /**
+     * Get HLE function table for registration
+     */
+    std::unordered_map<u64, HleFunction>& get_hle_functions() { return hle_functions_; }
+    
     // Object management
     u32 create_handle(ObjectType type, void* object, const std::string& name = "");
     void* get_object(u32 handle, ObjectType expected_type);
@@ -300,6 +305,16 @@ void set_thread_scheduler(class ThreadScheduler* scheduler);
 void xam_set_title_id(u32 title_id);
 void xam_set_input_state(u32 user_index, u16 buttons, u8 lt, u8 rt,
                          s16 lx, s16 ly, s16 rx, s16 ry);
+
+// XMA audio processor integration
+void set_xma_processor(class XmaProcessor* processor);
+class XmaProcessor* get_xma_processor();
+
+// File I/O HLE functions (xboxkrnl_io.cpp)
+void register_file_io_exports(std::unordered_map<u64, HleFunction>& hle_functions,
+                              std::function<u64(u32, u32)> make_import_key);
+void init_file_io_state(VirtualFileSystem* vfs);
+void shutdown_file_io_state();
 
 } // namespace x360mu
 

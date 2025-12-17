@@ -192,6 +192,21 @@ public:
      */
     void destroy_image(VulkanImage& image);
     
+    /**
+     * Upload data to a buffer using a staging buffer
+     */
+    void upload_to_buffer(VulkanBuffer& buffer, const void* data, size_t size);
+    
+    /**
+     * Upload data to an image using a staging buffer
+     */
+    void upload_to_image(VulkanImage& image, const void* data, size_t size);
+    
+    /**
+     * Clear screen to a solid color (test function)
+     */
+    void clear_screen(float r, float g, float b);
+    
     // Accessors
     VkDevice device() const { return device_; }
     VkPhysicalDevice physical_device() const { return physical_device_; }
@@ -261,6 +276,9 @@ private:
     VkResult create_edram_resources();
     
     u32 find_memory_type(u32 type_filter, VkMemoryPropertyFlags properties);
+    void transition_image_layout(VkImage image, VkImageLayout old_layout, VkImageLayout new_layout);
+    void transition_image_layout(VkCommandBuffer cmd, VkImage image, VkImageLayout old_layout, VkImageLayout new_layout);
+    void cleanup_swapchain();
 };
 
 } // namespace x360mu

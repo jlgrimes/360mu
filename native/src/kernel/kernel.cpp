@@ -44,6 +44,9 @@ Status Kernel::initialize(Memory* memory, Cpu* cpu, VirtualFileSystem* vfs) {
     // Initialize HLE state
     init_hle_state(vfs);
     
+    // Initialize file I/O state
+    init_file_io_state(vfs);
+    
     // Register all HLE functions
     register_hle_functions();
     
@@ -52,6 +55,9 @@ Status Kernel::initialize(Memory* memory, Cpu* cpu, VirtualFileSystem* vfs) {
 }
 
 void Kernel::shutdown() {
+    // Shutdown file I/O state first (closes open handles)
+    shutdown_file_io_state();
+    
     modules_.clear();
     objects_.clear();
     threads_.clear();
@@ -245,6 +251,11 @@ void Kernel::register_hle_functions() {
     register_xboxkrnl();
     register_xboxkrnl_extended();
     register_xam();
+    
+    // Register file I/O HLE functions with proper ordinals
+    register_file_io_exports(hle_functions_, [this](u32 module, u32 ordinal) {
+        return make_import_key(module, ordinal);
+    });
 }
 
 // register_xboxkrnl, register_xboxkrnl_extended, and register_xam

@@ -19,6 +19,10 @@
 
 namespace x360mu {
 
+// Forward declarations
+class Memory;
+class AudioMixer;
+
 /**
  * XMA frame header
  */
@@ -197,6 +201,146 @@ private:
     static const f32 quantization_table[];
     static const f32 scale_factor_table[];
     static const s16 huffman_table[];
+};
+
+/**
+ * XMA Processor
+ * 
+ * Manages multiple XMA hardware contexts for parallel audio decoding.
+ * Xbox 360 games typically use multiple XMA contexts for different audio streams.
+ */
+class XmaProcessor {
+public:
+    XmaProcessor();
+    ~XmaProcessor();
+    
+    /**
+     * Initialize the XMA processor
+     */
+    Status initialize(class Memory* memory, class AudioMixer* mixer);
+    
+    /**
+     * Shutdown and release all resources
+     */
+    void shutdown();
+    
+    /**
+     * Create a new XMA hardware context
+     * Returns context ID or UINT32_MAX on failure
+     */
+    u32 create_context();
+    
+    /**
+     * Destroy an XMA context
+     */
+    void destroy_context(u32 context_id);
+    
+    /**
+     * Get context for modification
+     */
+    XmaContext* get_context(u32 context_id);
+    
+    /**
+     * Get context (const)
+     */
+    const XmaContext* get_context(u32 context_id) const;
+    
+    /**
+     * Set input buffer for a context (double buffering supported)
+     */
+    void set_input_buffer(u32 context_id, GuestAddr buffer, u32 size, u32 buffer_index);
+    
+    /**
+     * Set output buffer for a context
+     */
+    void set_output_buffer(u32 context_id, GuestAddr buffer, u32 size);
+    
+    /**
+     * Configure context parameters
+     */
+    void set_context_sample_rate(u32 context_id, u32 sample_rate);
+    void set_context_channels(u32 context_id, u32 num_channels);
+    void set_context_loop(u32 context_id, bool enabled, u32 loop_start, u32 loop_end);
+    
+    /**
+     * Enable (start) context decoding
+     */
+    void enable_context(u32 context_id);
+    
+    /**
+     * Disable (stop) context decoding
+     */
+    void disable_context(u32 context_id);
+    
+    /**
+     * Check if context is active
+     */
+    bool is_context_active(u32 context_id) const;
+    
+    /**
+     * Check if input buffer has been consumed
+     */
+    bool is_input_buffer_consumed(u32 context_id, u32 buffer_index) const;
+    
+    /**
+     * Get current output write position
+     */
+    u32 get_output_write_offset(u32 context_id) const;
+    
+    /**
+     * Process all active contexts
+     * Should be called regularly from the emulation loop
+     */
+    void process();
+    
+    /**
+     * Process a specific number of packets for a context
+     */
+    u32 process_context(u32 context_id, u32 max_packets);
+    
+    /**
+     * Get statistics
+     */
+    struct Stats {
+        u32 active_contexts;
+        u64 total_packets_decoded;
+        u64 total_samples_decoded;
+        u32 decode_errors;
+    };
+    Stats get_stats() const;
+    
+private:
+    static constexpr u32 MAX_CONTEXTS = 256;
+    static constexpr u32 XMA_PACKET_SIZE = 2048;
+    
+    struct HardwareContext {
+        std::unique_ptr<XmaContext> ctx;
+        std::unique_ptr<XmaDecoder> decoder;
+        u32 voice_id;           // Associated mixer voice
+        bool buffer_0_consumed;
+        bool buffer_1_consumed;
+    };
+    
+    std::array<std::unique_ptr<HardwareContext>, MAX_CONTEXTS> contexts_;
+    std::mutex contexts_mutex_;
+    
+    Memory* memory_ = nullptr;
+    AudioMixer* mixer_ = nullptr;
+    
+    std::atomic<bool> running_{false};
+    u32 next_context_id_ = 0;
+    
+    // Statistics
+    Stats stats_{};
+    
+    // Decode a single packet from context
+    u32 decode_packet(HardwareContext& hw_ctx, u32 context_id);
+    
+    // Read XMA packet from guest memory
+    bool read_xma_packet(HardwareContext& hw_ctx, u8* packet_data);
+    
+    // Write decoded PCM to output buffer
+    void write_pcm_output(HardwareContext& hw_ctx, const s16* pcm_data, u32 sample_count);
 };
 
 /**
