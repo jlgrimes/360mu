@@ -21,7 +21,8 @@ protected:
         ASSERT_EQ(memory_->initialize(), Status::Ok);
         
         cpu_ = std::make_unique<Cpu>();
-        ASSERT_EQ(cpu_->initialize(memory_.get()), Status::Ok);
+        CpuConfig cpu_config{};
+        ASSERT_EQ(cpu_->initialize(memory_.get(), cpu_config), Status::Ok);
         
         scheduler_ = std::make_unique<ThreadScheduler>();
         ASSERT_EQ(scheduler_->initialize(memory_.get(), nullptr, 1), Status::Ok);
@@ -472,3 +473,4 @@ TEST_F(ThreadingTest, InvalidHandle) {
 
 } // namespace test
 } // namespace x360mu
+
