@@ -66,16 +66,20 @@ endif()
 set(GPU_SOURCES
     src/gpu/xenos/command_processor.cpp
     src/gpu/xenos/shader_translator.cpp
+    src/gpu/xenos/edram.cpp
+    src/gpu/xenos/texture.cpp
     src/gpu/vulkan/vulkan_backend.cpp
 )
 
 set(APU_SOURCES
     src/apu/xma_decoder.cpp
+    src/apu/android_audio.cpp
 )
 
 set(KERNEL_SOURCES
     src/kernel/hle/xboxkrnl.cpp
     src/kernel/hle/xam.cpp
+    src/kernel/xex_loader.cpp
 )
 
 set(MEMORY_SOURCES
@@ -195,6 +199,12 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
     
     include(GoogleTest)
     gtest_discover_tests(x360mu_tests)
+    
+    # XEX Test Tool
+    add_executable(xex_test
+        tools/xex_test.cpp
+    )
+    target_link_libraries(xex_test x360mu_core)
 endif()
 
 # Install rules
