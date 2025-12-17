@@ -140,6 +140,11 @@ private:
     std::string volume_id_;
     bool mounted_ = false;
     
+    // XGD (Xbox Game Disc) support
+    bool is_xgd_ = false;
+    u64 xgd_base_offset_ = 0;
+    u32 xgd_sector_offset_ = 0;  // Adjustment for sector numbers
+    
     // Primary volume descriptor
     u32 volume_space_size_ = 0;
     u16 logical_block_size_ = SECTOR_SIZE;
@@ -207,6 +212,23 @@ private:
      * Convert ISO date to timestamp
      */
     u64 iso_date_to_timestamp(const u8* date);
+    
+    /**
+     * Try mounting as Xbox Game Disc (XGD) format
+     */
+    Status try_xgd_mount();
+    
+    /**
+     * Parse XGD directory
+     */
+    Status parse_xgd_directory(u32 sector, u32 size, const std::string& parent_path);
+    
+    /**
+     * Parse XGD directory entry (recursive tree traversal)
+     */
+    void parse_xgd_entry(const u8* data, u32 size, u32 offset,
+                         const std::string& parent_path,
+                         std::vector<IsoCachedEntry>& entries);
 };
 
 } // namespace x360mu

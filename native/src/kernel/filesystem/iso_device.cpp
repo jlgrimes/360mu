@@ -48,8 +48,16 @@ Status IsoDevice::mount(const std::string& iso_path) {
     
     iso_path_ = iso_path;
     
-    // Read primary volume descriptor
-    Status status = read_pvd();
+    // Try Xbox Game Disc format first (XGD2/XGD3)
+    Status status = try_xgd_mount();
+    if (status == Status::Ok) {
+        mounted_ = true;
+        LOGI("IsoDevice: Mounted XGD %s (Volume: %s)", iso_path.c_str(), volume_id_.c_str());
+        return Status::Ok;
+    }
+    
+    // Fall back to standard ISO 9660
+    status = read_pvd();
     if (status != Status::Ok) {
         fclose(iso_file_);
         iso_file_ = nullptr;
@@ -69,6 +77,173 @@ Status IsoDevice::mount(const std::string& iso_path) {
     LOGI("IsoDevice: Mounted %s (Volume: %s)", iso_path.c_str(), volume_id_.c_str());
     
     return Status::Ok;
+}
+
+Status IsoDevice::try_xgd_mount() {
+    // Xbox Game Disc magic signature
+    static const char XGD_MAGIC[] = "MICROSOFT*XBOX*MEDIA";
+    static const size_t XGD_MAGIC_LEN = 20;
+    
+    // Known game partition offsets for different XGD formats
+    static const u64 XGD_OFFSETS[] = {
+        0x0FDA0000,  // XGD2 (most common for Xbox 360)
+        0x0FD90000,  // XGD2 alternate
+        0x02080000,  // XGD3
+        0x00000000,  // Start of file (extracted ISO)
+    };
+    
+    u8 header[2048];
+    
+    for (u64 base_offset : XGD_OFFSETS) {
+        if (fseeko(iso_file_, base_offset, SEEK_SET) != 0) {
+            continue;
+        }
+        
+        if (fread(header, 1, sizeof(header), iso_file_) != sizeof(header)) {
+            continue;
+        }
+        
+        // Check for Xbox magic at start of sector
+        if (memcmp(header, XGD_MAGIC, XGD_MAGIC_LEN) == 0) {
+            LOGI("IsoDevice: Found XGD signature at offset 0x%llX", (unsigned long long)base_offset);
+            
+            // XGD header structure:
+            // 0x00: "MICROSOFT*XBOX*MEDIA" (20 bytes)
+            // 0x14: Root directory sector (4 bytes LE)
+            // 0x18: Root directory size (4 bytes LE)
+            // 0x1C: Image creation timestamp
+            // ...
+            
+            u32 root_sector = *reinterpret_cast<u32*>(header + 0x14);
+            u32 root_size = *reinterpret_cast<u32*>(header + 0x18);
+            
+            // XGD has a 32-sector offset between header and actual filesystem
+            constexpr u32 XGD_SECTOR_OFFSET = 32;
+            
+            LOGI("IsoDevice: XGD root sector: %u (raw), size: %u", root_sector, root_size);
+            
+            // Store base offset and sector adjustment for calculations
+            xgd_base_offset_ = base_offset;
+            xgd_sector_offset_ = XGD_SECTOR_OFFSET;
+            is_xgd_ = true;
+            volume_id_ = "XBOX360";
+            
+            // Parse XGD root directory (don't adjust here, parse_xgd_directory will do it)
+            Status status = parse_xgd_directory(root_sector, root_size, "");
+            if (status == Status::Ok) {
+                return Status::Ok;
+            }
+            
+            // Reset if parsing failed
+            is_xgd_ = false;
+            xgd_base_offset_ = 0;
+        }
+    }
+    
+    return Status::NotFound;
+}
+
+Status IsoDevice::parse_xgd_directory(u32 sector, u32 size, const std::string& parent_path) {
+    if (size == 0) {
+        return Status::Ok;
+    }
+    
+    // Adjust sector number and calculate byte offset
+    u32 adjusted_sector = sector;
+    if (adjusted_sector >= xgd_sector_offset_) {
+        adjusted_sector -= xgd_sector_offset_;
+    }
+    u64 offset = xgd_base_offset_ + static_cast<u64>(adjusted_sector) * SECTOR_SIZE;
+    
+    // Read directory data
+    std::vector<u8> dir_data(size);
+    if (fseeko(iso_file_, offset, SEEK_SET) != 0) {
+        return Status::IoError;
+    }
+    if (fread(dir_data.data(), 1, size, iso_file_) != size) {
+        return Status::IoError;
+    }
+    
+    std::vector<IsoCachedEntry> entries;
+    
+    // Parse XGD directory entries
+    // XGD directory entry format (each entry aligned to 4 bytes):
+    // 0x00: Left subtree offset (2 bytes) - in 4-byte units
+    // 0x02: Right subtree offset (2 bytes) - in 4-byte units
+    // 0x04: Sector number (4 bytes)
+    // 0x08: File size (4 bytes)
+    // 0x0C: Attributes (1 byte)
+    // 0x0D: Name length (1 byte)
+    // 0x0E: Name (variable, padded to 4-byte boundary)
+    
+    // Start from root entry at offset 0
+    parse_xgd_entry(dir_data.data(), size, 0, parent_path, entries);
+    
+    // Cache directory listing
+    std::string dir_path = normalize_path(parent_path.empty() ? "/" : parent_path);
+    dir_cache_[parent_path.empty() ? "" : dir_path] = entries;
+    
+    return Status::Ok;
+}
+
+void IsoDevice::parse_xgd_entry(const u8* data, u32 size, u32 entry_offset, 
+                                 const std::string& parent_path,
+                                 std::vector<IsoCachedEntry>& entries) {
+    // entry_offset is in 4-byte units, convert to bytes
+    u32 byte_offset = entry_offset * 4;
+    
+    // 0xFFFF means null pointer, and we need at least 14 bytes for an entry
+    if (entry_offset == 0xFFFF || byte_offset + 14 > size) {
+        return;
+    }
+    
+    const u8* entry = data + byte_offset;
+    u16 left = *reinterpret_cast<const u16*>(entry + 0);
+    u16 right = *reinterpret_cast<const u16*>(entry + 2);
+    u32 sector = *reinterpret_cast<const u32*>(entry + 4);
+    u32 file_size = *reinterpret_cast<const u32*>(entry + 8);
+    u8 attribs = entry[12];
+    u8 name_len = entry[13];
+    
+    // Check if we can read the full name
+    if (name_len > 0 && byte_offset + 14 + name_len <= size) {
+        std::string name(reinterpret_cast<const char*>(entry + 14), name_len);
+        
+        IsoCachedEntry cached;
+        cached.name = name;
+        cached.lba = sector;
+        cached.size = file_size;
+        cached.is_directory = (attribs & 0x10) != 0;
+        cached.creation_time = 0;
+        
+        if (parent_path.empty()) {
+            cached.full_path = name;
+        } else {
+            cached.full_path = parent_path + "/" + name;
+        }
+        
+        // Add to cache
+        std::string lookup_path = normalize_path(cached.full_path);
+        file_cache_[lookup_path] = cached;
+        entries.push_back(cached);
+        
+        LOGD("IsoDevice: XGD %s: %s (sector: %u, size: %u)",
+             cached.is_directory ? "DIR" : "FILE",
+             cached.full_path.c_str(), sector, file_size);
+        
+        // Recursively parse subdirectories
+        if (cached.is_directory && file_size > 0) {
+            parse_xgd_directory(sector, file_size, cached.full_path);
+        }
+    }
+    
+    // Traverse tree (left and right are word offsets, not null = valid)
+    if (left != 0 && left != 0xFFFF) {
+        parse_xgd_entry(data, size, left, parent_path, entries);
+    }
+    if (right != 0 && right != 0xFFFF) {
+        parse_xgd_entry(data, size, right, parent_path, entries);
+    }
 }
 
 void IsoDevice::unmount() {
@@ -527,8 +702,12 @@ s64 IsoDevice::read(u32 handle, void* buffer, u64 size) {
         return 0;
     }
     
-    // Calculate file offset
-    u64 file_offset = static_cast<u64>(file.lba) * SECTOR_SIZE + file.position;
+    // Calculate file offset (account for XGD offsets if applicable)
+    u32 adjusted_lba = file.lba;
+    if (is_xgd_ && adjusted_lba >= xgd_sector_offset_) {
+        adjusted_lba -= xgd_sector_offset_;
+    }
+    u64 file_offset = xgd_base_offset_ + static_cast<u64>(adjusted_lba) * SECTOR_SIZE + file.position;
     
     // Read data
     Status status = read_bytes(file_offset, to_read, buffer);
@@ -647,10 +826,11 @@ Status IsoDevice::list_directory(const std::string& path, std::vector<DirEntry>&
     }
     
     // Look up in dir cache
-    auto it = dir_cache_.find(normalized.empty() ? "/" : normalized);
+    // Root directory is cached as "" (empty string) by parse_directory
+    auto it = dir_cache_.find(normalized);
     if (it == dir_cache_.end()) {
-        // Try without leading slash
-        it = dir_cache_.find(normalized);
+        // Try with leading slash as fallback
+        it = dir_cache_.find("/" + normalized);
     }
     
     if (it == dir_cache_.end()) {
