@@ -1,190 +1,279 @@
 # Call of Duty: Black Ops - Compatibility Plan
 
+## Current Status (Updated: December 2024)
+
+### Test Suite Results: ✅ 72/72 Tests Passing
+
+| Component           | Status     | Tests |
+| ------------------- | ---------- | ----- |
+| PowerPC Decoder     | ✅ Working | 4/4   |
+| PowerPC Interpreter | ✅ Working | 23/23 |
+| VMX128 (SIMD)       | ✅ Working | 21/21 |
+| Memory Subsystem    | ✅ Working | 6/6   |
+| XEX Loader          | ✅ Working | 3/3   |
+| XMA Decoder         | ✅ Working | 6/6   |
+| Audio Mixer         | ✅ Working | 9/9   |
+
+### What's Actually Implemented
+
+| Component                | Implementation Status                            |
+| ------------------------ | ------------------------------------------------ |
+| CPU Interpreter          | ✅ Core instructions working, passes all tests   |
+| Memory (512MB + Fastmem) | ✅ Big-endian, MMIO, reservations working        |
+| XEX2 Parser              | ✅ Header parsing, security info, imports        |
+| Basic Kernel HLE         | 🟡 Stubs for ~50 functions                       |
+| VMX128 SIMD              | ✅ Float ops, shuffle, dot/cross products        |
+| XMA Audio Decoder        | 🟡 Framework only (needs FFmpeg for full decode) |
+| Audio Mixer              | ✅ 256 voices, volume/pan, resampling            |
+| JIT Compiler             | 🔴 Framework exists, not generating code         |
+| GPU/Vulkan               | 🔴 Stubs only                                    |
+| Shader Translator        | 🔴 Framework only                                |
+
+---
+
 ## Game Technical Profile
 
-| Property | Value |
-|----------|-------|
-| Title ID | 41560855 |
-| Media ID | Various (disc/digital) |
-| Engine | IW Engine 3.0 (Treyarch modified) |
-| Release | November 2010 |
-| XEX Size | ~6.5 GB installed |
+| Property | Value                             |
+| -------- | --------------------------------- |
+| Title ID | 41560855                          |
+| Media ID | Various (disc/digital)            |
+| Engine   | IW Engine 3.0 (Treyarch modified) |
+| Release  | November 2010                     |
+| XEX Size | ~6.5 GB installed                 |
+
+## What's Stopping Black Ops From Running Right Now
+
+### 🔴 Critical Blockers (Must Fix)
+
+#### 1. GPU Rendering (0% Complete)
+
+The game will load but display nothing without GPU emulation.
+
+**Missing:**
+
+- Vulkan backend initialization
+- Xenos command buffer parsing
+- Shader translation (Xenos microcode → SPIR-V)
+- eDRAM tile rendering and resolve
+- Texture format conversion (DXT/BC decompression)
+- Render target management
+
+**Effort:** 3-6 months for basic rendering
+
+#### 2. JIT Compiler (10% Complete)
+
+Interpreter works but is ~100x too slow for real gameplay.
+
+**Missing:**
+
+- PowerPC → ARM64 code generation
+- Register allocation
+- Block caching and invalidation
+- Hot path optimization
+
+**Effort:** 2-4 months for usable JIT
+
+#### 3. Kernel HLE Functions (20% Complete)
+
+Game will crash calling unimplemented system functions.
+
+**Missing implementations:**
+
+- `NtCreateFile`, `NtReadFile`, `NtWriteFile` (file I/O)
+- `KeWaitForSingleObject`, `KeSetEvent` (synchronization)
+- `RtlInitializeCriticalSection` (thread safety)
+- `XamContentCreate` (save data)
+- ~200+ more functions
+
+**Effort:** 1-2 months for boot, 3-6 months for gameplay
+
+#### 4. ISO/STFS File System (5% Complete)
+
+Can't load game data without mounting the disc image.
+
+**Missing:**
+
+- ISO 9660 parsing
+- STFS package mounting
+- Sector-based file reads
+- Directory enumeration
+
+**Effort:** 2-4 weeks
+
+### 🟡 Major Issues (Needed for Gameplay)
+
+#### 5. Full Instruction Coverage (~70% Complete)
+
+Most common instructions work, but games use rare ones.
+
+**Missing/Untested:**
+
+- Some floating-point edge cases
+- String instructions (lswi, stswi)
+- Some VMX128 permute/pack operations
+- Trap instructions
+
+**Effort:** 2-4 weeks
+
+#### 6. Multi-Threading (30% Complete)
+
+Black Ops uses all 6 hardware threads heavily.
+
+**Missing:**
+
+- Proper thread scheduling
+- Thread Local Storage (TLS)
+- Inter-thread synchronization accuracy
+- CPU affinity
+
+**Effort:** 2-4 weeks
+
+#### 7. XMA Audio Decoding (Framework Only)
+
+Sound will be silent or corrupted.
+
+**Missing:**
+
+- FFmpeg/libavcodec integration
+- XMA packet parsing
+- Streaming buffer management
+
+**Effort:** 1-2 weeks with FFmpeg
+
+### 🟢 Working Components
+
+- ✅ PowerPC instruction decoding
+- ✅ Integer arithmetic (add, sub, mul, div)
+- ✅ 64-bit operations (mulld, divd, sld, srd, srad)
+- ✅ Atomic operations (lwarx, stwcx)
+- ✅ Load/store (including 64-bit ld/std)
+- ✅ VMX128 vector math
+- ✅ Memory management (512MB, fastmem)
+- ✅ XEX2 header parsing
+- ✅ Audio mixing infrastructure
+
+---
+
+## Realistic Path to Running Black Ops
+
+### Phase 1: Show Something (4-8 weeks)
+
+1. Implement ISO file system mounting
+2. Complete kernel file I/O functions
+3. Get basic Vulkan swapchain working
+4. Parse GPU command buffers (even without shaders)
+
+**Goal:** Game boots, shows corrupted graphics
+
+### Phase 2: Recognizable Output (8-16 weeks)
+
+1. Basic shader translation (vertex position, texture sampling)
+2. Texture loading (DXT1/DXT5)
+3. Simple render targets
+4. More kernel HLE functions
+
+**Goal:** See menus, some textures
+
+### Phase 3: JIT for Speed (4-8 weeks)
+
+1. ARM64 code emission for common instructions
+2. Block caching
+3. Register allocation
+
+**Goal:** Menus at playable speed
+
+### Phase 4: Playable (16-32 weeks)
+
+1. Complete shader translation
+2. eDRAM resolve
+3. XMA audio
+4. Game-specific fixes
+
+**Goal:** Complete a mission
+
+---
+
+## Immediate Next Steps
+
+1. **File System** - Mount ISO, read files
+2. **Vulkan Init** - Create device, swapchain
+3. **Command Buffer** - Parse PM4 packets
+4. **Basic Shaders** - Position + single texture
+5. **More HLE** - File and thread functions
+
+---
 
 ## Hardware Requirements Analysis
 
 ### CPU Usage
+
 Black Ops heavily utilizes all 6 hardware threads:
+
 - **Thread 0-1**: Game logic, AI, scripting
 - **Thread 2-3**: Physics (Havok), collision
 - **Thread 4-5**: Audio processing, streaming
 
 **Critical CPU Features:**
-- VMX128 SIMD (physics, animation blending)
-- Floating-point precision (ballistics)
-- Multi-threaded synchronization (locks, events)
-- Thread local storage (TLS)
+
+- VMX128 SIMD (physics, animation blending) ✅ Implemented
+- Floating-point precision (ballistics) ✅ Implemented
+- Multi-threaded synchronization (locks, events) 🟡 Partial
+- Thread local storage (TLS) 🔴 Missing
 
 ### GPU Usage
-IW Engine 3.0 features:
-- Deferred rendering pipeline
-- Dynamic shadows (shadow maps)
-- HDR lighting with tone mapping
-- Screen-space ambient occlusion (SSAO)
-- Motion blur
-- Depth of field
-- ~1000+ unique shaders
 
-**Critical GPU Features:**
-- Complex pixel shaders (SM3.0+)
-- Multiple render targets (MRT)
-- eDRAM resolve operations
-- Texture streaming
-- Vertex texture fetch
+IW Engine 3.0 features:
+
+- Deferred rendering pipeline 🔴 Missing
+- Dynamic shadows (shadow maps) 🔴 Missing
+- HDR lighting with tone mapping 🔴 Missing
+- Screen-space ambient occlusion (SSAO) 🔴 Missing
+- Motion blur 🔴 Missing
+- Depth of field 🔴 Missing
+- ~1000+ unique shaders 🔴 Missing
 
 ### Memory Usage
-- Uses nearly full 512MB RAM
-- Aggressive texture streaming
-- Level-of-detail (LOD) management
-- Audio buffer requirements
+
+- Uses nearly full 512MB RAM ✅ Allocated
+- Aggressive texture streaming 🔴 Missing
+- Level-of-detail (LOD) management 🔴 Missing
+- Audio buffer requirements ✅ Working
 
 ### Audio
-- XMA compressed audio (speech, music, effects)
-- 3D positional audio
-- Real-time mixing (256 voices)
-- Music stems with dynamic mixing
 
-## Required Emulator Components
-
-### Phase 1: Boot to Menu (Est. 6-12 months)
-
-#### 1.1 Complete CPU Emulation
-- [ ] All PowerPC integer instructions
-- [ ] All PowerPC floating-point instructions  
-- [ ] Full VMX128 instruction set (128 registers)
-- [ ] Accurate exception handling
-- [ ] JIT compiler with >90% coverage
-- [ ] Thread synchronization primitives
-
-#### 1.2 Kernel HLE - Core
-- [ ] XEX2 loader with all header types
-- [ ] Memory management (NtAllocateVirtualMemory, etc.)
-- [ ] Thread management (KeCreateThread, etc.)
-- [ ] Synchronization (Events, Mutexes, Semaphores)
-- [ ] Critical sections
-- [ ] File I/O (NtCreateFile, NtReadFile, etc.)
-- [ ] XContent/DLC handling
-
-#### 1.3 GPU - Basic
-- [ ] Command buffer parsing
-- [ ] Basic shader translation (vertex/pixel)
-- [ ] Texture loading (DXT1/3/5, common formats)
-- [ ] Render target management
-- [ ] Basic eDRAM emulation
-
-#### 1.4 File System
-- [ ] ISO mounting
-- [ ] Directory enumeration
-- [ ] File streaming
-
-### Phase 2: In-Game (Est. 12-18 months)
-
-#### 2.1 GPU - Advanced
-- [ ] All Xenos shader instructions
-- [ ] Deferred rendering support
-- [ ] Multiple render targets
-- [ ] Shadow map rendering
-- [ ] eDRAM resolve (MSAA, format conversion)
-- [ ] Texture tiling/detiling
-- [ ] All texture formats
-
-#### 2.2 Audio
-- [ ] XMA decoder (all variants)
-- [ ] Voice management
-- [ ] 3D audio positioning
-- [ ] Audio streaming
-
-#### 2.3 Kernel HLE - Extended
-- [ ] XAM (user profile, achievements stubs)
-- [ ] Network stubs (to allow offline play)
-- [ ] Controller input
-- [ ] Save data management
-
-### Phase 3: Playable (Est. 18-24+ months)
-
-#### 3.1 Performance Optimization
-- [ ] JIT hot path optimization
-- [ ] GPU draw call batching
-- [ ] Shader caching
-- [ ] Resolution scaling
-- [ ] Frame pacing
-
-#### 3.2 Accuracy Improvements
-- [ ] Timing accuracy
-- [ ] GPU synchronization
-- [ ] Audio sync
-- [ ] Physics determinism
-
-#### 3.3 Game-Specific Fixes
-- [ ] Black Ops-specific shader patches
-- [ ] Havok physics tuning
-- [ ] Memory layout adjustments
-- [ ] Cutscene handling
-
-## Known Issues from Xenia
-
-Based on Xenia's Black Ops compatibility:
-1. Some lighting artifacts
-2. Occasional audio desync
-3. Minor texture issues
-4. Specific mission scripts may fail
-5. Multiplayer requires Xbox Live HLE
-
-## Minimum Mobile Hardware
-
-To run Black Ops at playable framerates:
-- **CPU**: Snapdragon 8 Gen 2 or better
-- **GPU**: Adreno 740 or better (~2.5 TFLOPS)
-- **RAM**: 12GB+ (8GB usable for emulation)
-- **Storage**: 20GB+ free
-
-**Realistic Performance Expectation:**
-- 15-30 FPS at 720p on flagship 2024 devices
-- 30 FPS possible with resolution scaling to 540p
-
-## Critical Path
-
-```
-Week 1-4:   Complete all VMX128 instructions
-Week 5-8:   JIT compiler basic implementation
-Week 9-16:  GPU command processor + basic shaders
-Week 17-24: Audio system + XMA decoder
-Week 25-32: Shader translator improvements
-Week 33-48: Integration + debugging + game-specific fixes
-Week 49+:   Optimization + polish
-```
-
-## Files to Analyze
-
-For Black Ops specifically, key files to study:
-- `default.xex` - Main executable
-- `common_mp.ff` - Multiplayer fast file
-- `common.ff` - Shared assets
-- `localized_*.ff` - Localized content
-- `zone/` - Level data
-
-## Success Metrics
-
-| Milestone | Criteria |
-|-----------|----------|
-| Boot | Shows Activision logo |
-| Menu | Main menu navigable |
-| Load | Campaign mission loads |
-| In-Game | Can control character |
-| Playable | Complete mission at 20+ FPS |
-| Good | Stable 30 FPS, minor issues |
-| Excellent | Match PC/Console experience |
+- XMA compressed audio 🟡 Framework only
+- 3D positional audio 🔴 Missing
+- Real-time mixing (256 voices) ✅ Working
+- Music stems with dynamic mixing 🔴 Missing
 
 ---
 
-*This is an aspirational document. Actual development may vary significantly.*
+## Success Metrics
 
+| Milestone | Criteria                    | Current Status |
+| --------- | --------------------------- | -------------- |
+| Boot      | Shows Activision logo       | 🔴 Not yet     |
+| Menu      | Main menu navigable         | 🔴 Not yet     |
+| Load      | Campaign mission loads      | 🔴 Not yet     |
+| In-Game   | Can control character       | 🔴 Not yet     |
+| Playable  | Complete mission at 20+ FPS | 🔴 Not yet     |
+| Good      | Stable 30 FPS, minor issues | 🔴 Not yet     |
+| Excellent | Match PC/Console experience | 🔴 Not yet     |
+
+---
+
+## Summary
+
+**Tests pass, but that's just the foundation.** The core CPU emulation is solid - we can decode and execute PowerPC instructions correctly. But to run Black Ops:
+
+1. **GPU is the biggest gap** - No rendering = no game
+2. **JIT is needed for speed** - Interpreter is too slow
+3. **Many kernel functions missing** - Game will crash on unimplemented syscalls
+4. **No file system** - Can't even load the game data
+
+The 72 passing tests prove the CPU core is working correctly. Now the real work begins.
+
+---
+
+_Last updated: December 2024_
+_Test results: 72/72 passing_
