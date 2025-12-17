@@ -9,45 +9,23 @@
 #include "x360mu/types.h"
 #include <vector>
 #include <memory>
+#include <array>
 #include <unordered_map>
-
-// Vulkan forward declarations
-typedef struct VkInstance_T* VkInstance;
-typedef struct VkPhysicalDevice_T* VkPhysicalDevice;
-typedef struct VkDevice_T* VkDevice;
-typedef struct VkQueue_T* VkQueue;
-typedef struct VkCommandPool_T* VkCommandPool;
-typedef struct VkCommandBuffer_T* VkCommandBuffer;
-typedef struct VkSurfaceKHR_T* VkSurfaceKHR;
-typedef struct VkSwapchainKHR_T* VkSwapchainKHR;
-typedef struct VkImage_T* VkImage;
-typedef struct VkImageView_T* VkImageView;
-typedef struct VkRenderPass_T* VkRenderPass;
-typedef struct VkFramebuffer_T* VkFramebuffer;
-typedef struct VkPipeline_T* VkPipeline;
-typedef struct VkPipelineLayout_T* VkPipelineLayout;
-typedef struct VkPipelineCache_T* VkPipelineCache;
-typedef struct VkDescriptorSetLayout_T* VkDescriptorSetLayout;
-typedef struct VkDescriptorPool_T* VkDescriptorPool;
-typedef struct VkDescriptorSet_T* VkDescriptorSet;
-typedef struct VkShaderModule_T* VkShaderModule;
-typedef struct VkBuffer_T* VkBuffer;
-typedef struct VkDeviceMemory_T* VkDeviceMemory;
-typedef struct VkSampler_T* VkSampler;
-typedef struct VkFence_T* VkFence;
-typedef struct VkSemaphore_T* VkSemaphore;
+#include <vulkan/vulkan.h>
 
 namespace x360mu {
 
 class Memory;
 struct RenderState;
 
+constexpr u32 MAX_FRAMES_IN_FLIGHT = 2;
+
 /**
  * Vulkan buffer with memory
  */
 struct VulkanBuffer {
-    VkBuffer buffer = nullptr;
-    VkDeviceMemory memory = nullptr;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
     u64 size = 0;
     void* mapped = nullptr;
 };
@@ -56,43 +34,61 @@ struct VulkanBuffer {
  * Vulkan image with view
  */
 struct VulkanImage {
-    VkImage image = nullptr;
-    VkDeviceMemory memory = nullptr;
-    VkImageView view = nullptr;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
     u32 width = 0;
     u32 height = 0;
-    u32 format = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
 };
 
 /**
- * Per-frame resources (double/triple buffering)
- */
-struct FrameResources {
-    VkCommandBuffer command_buffer = nullptr;
-    VkFence fence = nullptr;
-    VkSemaphore image_available = nullptr;
-    VkSemaphore render_finished = nullptr;
-    
-    // Per-frame descriptor pool
-    VkDescriptorPool descriptor_pool = nullptr;
-    
-    // Dynamic buffers for this frame
-    VulkanBuffer uniform_buffer;
-    VulkanBuffer vertex_buffer;
-    VulkanBuffer index_buffer;
-};
-
-/**
- * Compiled pipeline state
+ * Pipeline render state (used to create graphics pipelines)
  */
 struct PipelineState {
-    u64 hash;
-    VkPipeline pipeline = nullptr;
-    VkPipelineLayout layout = nullptr;
+    VkPrimitiveTopology primitive_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPolygonMode polygon_mode = VK_POLYGON_MODE_FILL;
+    VkCullModeFlags cull_mode = VK_CULL_MODE_BACK_BIT;
+    VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    
+    VkBool32 depth_test_enable = VK_TRUE;
+    VkBool32 depth_write_enable = VK_TRUE;
+    VkCompareOp depth_compare_op = VK_COMPARE_OP_LESS;
+    
+    VkBool32 stencil_test_enable = VK_FALSE;
+    VkStencilOp stencil_fail_op = VK_STENCIL_OP_KEEP;
+    VkStencilOp stencil_pass_op = VK_STENCIL_OP_KEEP;
+    VkCompareOp stencil_compare_op = VK_COMPARE_OP_ALWAYS;
+    
+    VkBool32 blend_enable = VK_FALSE;
+    VkBlendFactor src_color_blend = VK_BLEND_FACTOR_ONE;
+    VkBlendFactor dst_color_blend = VK_BLEND_FACTOR_ZERO;
+    VkBlendOp color_blend_op = VK_BLEND_OP_ADD;
+    VkBlendFactor src_alpha_blend = VK_BLEND_FACTOR_ONE;
+    VkBlendFactor dst_alpha_blend = VK_BLEND_FACTOR_ZERO;
+    VkBlendOp alpha_blend_op = VK_BLEND_OP_ADD;
+    VkColorComponentFlags color_write_mask = VK_COLOR_COMPONENT_R_BIT | 
+                                              VK_COLOR_COMPONENT_G_BIT | 
+                                              VK_COLOR_COMPONENT_B_BIT | 
+                                              VK_COLOR_COMPONENT_A_BIT;
+    
+    u64 compute_hash() const {
+        // FNV-1a hash of the state
+        u64 hash = 14695981039346656037ULL;
+        const u8* data = reinterpret_cast<const u8*>(this);
+        for (size_t i = 0; i < sizeof(*this); i++) {
+            hash ^= data[i];
+            hash *= 1099511628211ULL;
+        }
+        return hash;
+    }
 };
 
 /**
  * Vulkan rendering backend
+ * 
+ * Handles all Vulkan rendering for the emulator, translating
+ * Xbox 360 Xenos GPU commands to Vulkan draw calls.
  */
 class VulkanBackend {
 public:
@@ -100,9 +96,9 @@ public:
     ~VulkanBackend();
     
     /**
-     * Initialize Vulkan
+     * Initialize Vulkan with a native window
      */
-    Status initialize(const std::string& cache_path);
+    Status initialize(void* native_window, u32 width, u32 height);
     
     /**
      * Shutdown and release resources
@@ -110,14 +106,9 @@ public:
     void shutdown();
     
     /**
-     * Set native window surface
+     * Handle window resize
      */
-    Status set_surface(void* native_window);
-    
-    /**
-     * Handle surface resize
-     */
-    void resize(u32 width, u32 height);
+    Status resize(u32 width, u32 height);
     
     /**
      * Begin a new frame
@@ -127,40 +118,14 @@ public:
     /**
      * End frame and present
      */
-    void end_frame();
+    Status end_frame();
     
     /**
-     * Begin render pass
+     * Get or create a graphics pipeline
      */
-    void begin_render_pass(const VulkanImage& color_target, const VulkanImage* depth_target);
-    
-    /**
-     * End render pass
-     */
-    void end_render_pass();
-    
-    /**
-     * Bind pipeline for draw
-     */
-    void bind_pipeline(const PipelineState& pipeline);
-    
-    /**
-     * Set viewport and scissor
-     */
-    void set_viewport(f32 x, f32 y, f32 width, f32 height, f32 min_depth, f32 max_depth);
-    void set_scissor(u32 x, u32 y, u32 width, u32 height);
-    
-    /**
-     * Bind vertex/index buffers
-     */
-    void bind_vertex_buffer(const VulkanBuffer& buffer, u64 offset);
-    void bind_index_buffer(const VulkanBuffer& buffer, u64 offset, bool use_32bit);
-    
-    /**
-     * Draw commands
-     */
-    void draw(u32 vertex_count, u32 first_vertex);
-    void draw_indexed(u32 index_count, u32 first_index, s32 vertex_offset);
+    VkPipeline get_or_create_pipeline(const PipelineState& state,
+                                       VkShaderModule vertex_shader,
+                                       VkShaderModule fragment_shader);
     
     /**
      * Create shader module from SPIR-V
@@ -168,105 +133,134 @@ public:
     VkShaderModule create_shader_module(const std::vector<u32>& spirv);
     
     /**
-     * Create pipeline
+     * Destroy shader module
      */
-    PipelineState create_pipeline(
-        VkShaderModule vertex_shader,
-        VkShaderModule fragment_shader,
-        const RenderState& state
-    );
+    void destroy_shader_module(VkShaderModule module);
+    
+    /**
+     * Bind graphics pipeline
+     */
+    void bind_pipeline(VkPipeline pipeline);
+    
+    /**
+     * Bind vertex buffer
+     */
+    void bind_vertex_buffer(VkBuffer buffer, VkDeviceSize offset = 0);
+    
+    /**
+     * Bind index buffer
+     */
+    void bind_index_buffer(VkBuffer buffer, VkDeviceSize offset, VkIndexType type);
+    
+    /**
+     * Bind descriptor set
+     */
+    void bind_descriptor_set(VkDescriptorSet set);
+    
+    /**
+     * Draw primitives
+     */
+    void draw(u32 vertex_count, u32 instance_count = 1, 
+              u32 first_vertex = 0, u32 first_instance = 0);
+    
+    /**
+     * Draw indexed primitives
+     */
+    void draw_indexed(u32 index_count, u32 instance_count = 1,
+                      u32 first_index = 0, s32 vertex_offset = 0, 
+                      u32 first_instance = 0);
     
     /**
      * Create buffer
      */
-    VulkanBuffer create_buffer(u64 size, u32 usage, bool host_visible);
+    VulkanBuffer create_buffer(u64 size, VkBufferUsageFlags usage, 
+                               VkMemoryPropertyFlags properties);
+    
+    /**
+     * Destroy buffer
+     */
     void destroy_buffer(VulkanBuffer& buffer);
     
     /**
      * Create image
      */
-    VulkanImage create_image(u32 width, u32 height, u32 format, u32 usage);
+    VulkanImage create_image(u32 width, u32 height, VkFormat format,
+                             VkImageUsageFlags usage);
+    
+    /**
+     * Destroy image
+     */
     void destroy_image(VulkanImage& image);
-    
-    /**
-     * Upload data to buffer
-     */
-    void upload_buffer(const VulkanBuffer& buffer, const void* data, u64 size, u64 offset = 0);
-    
-    /**
-     * Upload data to image
-     */
-    void upload_image(const VulkanImage& image, const void* data, u32 width, u32 height);
     
     // Accessors
     VkDevice device() const { return device_; }
     VkPhysicalDevice physical_device() const { return physical_device_; }
+    VkCommandBuffer current_command_buffer() const { return command_buffers_[current_frame_]; }
     u32 graphics_queue_family() const { return graphics_queue_family_; }
+    VkDescriptorPool descriptor_pool() const { return descriptor_pool_; }
     
 private:
     // Instance and device
-    VkInstance instance_ = nullptr;
-    VkPhysicalDevice physical_device_ = nullptr;
-    VkDevice device_ = nullptr;
+    VkInstance instance_ = VK_NULL_HANDLE;
+    VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
+    VkDevice device_ = VK_NULL_HANDLE;
     
     // Queues
-    VkQueue graphics_queue_ = nullptr;
-    VkQueue present_queue_ = nullptr;
+    VkQueue graphics_queue_ = VK_NULL_HANDLE;
     u32 graphics_queue_family_ = 0;
     
     // Surface and swapchain
-    VkSurfaceKHR surface_ = nullptr;
-    VkSwapchainKHR swapchain_ = nullptr;
+    VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+    VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     std::vector<VkImage> swapchain_images_;
-    std::vector<VkImageView> swapchain_views_;
-    u32 swapchain_width_ = 0;
-    u32 swapchain_height_ = 0;
-    u32 current_image_ = 0;
+    std::vector<VkImageView> swapchain_image_views_;
+    VkFormat swapchain_format_ = VK_FORMAT_UNDEFINED;
+    VkExtent2D swapchain_extent_ = {};
+    u32 current_image_index_ = 0;
     
-    // Command pools
-    VkCommandPool command_pool_ = nullptr;
-    
-    // Per-frame resources (double buffering)
-    static constexpr u32 FRAMES_IN_FLIGHT = 2;
-    std::array<FrameResources, FRAMES_IN_FLIGHT> frames_;
-    u32 current_frame_ = 0;
-    
-    // Render pass
-    VkRenderPass render_pass_ = nullptr;
+    // Render pass and framebuffers
+    VkRenderPass render_pass_ = VK_NULL_HANDLE;
     std::vector<VkFramebuffer> framebuffers_;
     
+    // Command pool and buffers
+    VkCommandPool command_pool_ = VK_NULL_HANDLE;
+    std::vector<VkCommandBuffer> command_buffers_;
+    
+    // Synchronization
+    std::vector<VkSemaphore> image_available_semaphores_;
+    std::vector<VkSemaphore> render_finished_semaphores_;
+    std::vector<VkFence> in_flight_fences_;
+    u32 current_frame_ = 0;
+    
+    // Descriptor resources
+    VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSetLayout> descriptor_set_layouts_;
+    VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
+    
     // Pipeline cache
-    VkPipelineCache pipeline_cache_ = nullptr;
-    std::unordered_map<u64, PipelineState> pipeline_map_;
+    std::unordered_map<u64, VkPipeline> pipeline_cache_;
     
-    // Default resources
-    VkSampler default_sampler_ = nullptr;
-    VkDescriptorSetLayout descriptor_set_layout_ = nullptr;
+    // eDRAM emulation (Xbox 360 has 10MB embedded DRAM)
+    VkBuffer edram_buffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory edram_memory_ = VK_NULL_HANDLE;
     
-    // State
-    std::string cache_path_;
-    bool in_frame_ = false;
-    bool in_render_pass_ = false;
+    // Window dimensions
+    u32 width_ = 0;
+    u32 height_ = 0;
     
     // Helper methods
-    Status create_instance();
-    Status select_physical_device();
-    Status create_device();
-    Status create_swapchain();
-    Status create_render_pass();
-    Status create_framebuffers();
-    Status create_command_pool();
-    Status create_frame_resources();
-    Status create_pipeline_cache();
-    Status create_default_resources();
+    VkResult create_instance();
+    VkResult create_surface(void* native_window);
+    VkResult create_device();
+    VkResult create_swapchain();
+    VkResult create_render_pass();
+    VkResult create_framebuffers();
+    VkResult create_command_resources();
+    VkResult create_sync_objects();
+    VkResult create_descriptor_resources();
+    VkResult create_edram_resources();
     
-    void cleanup_swapchain();
-    void save_pipeline_cache();
-    
-    u32 find_memory_type(u32 type_filter, u32 properties);
-    VkCommandBuffer begin_single_time_commands();
-    void end_single_time_commands(VkCommandBuffer cmd);
+    u32 find_memory_type(u32 type_filter, VkMemoryPropertyFlags properties);
 };
 
 } // namespace x360mu
-

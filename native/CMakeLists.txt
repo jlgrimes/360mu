@@ -46,66 +46,44 @@ endif()
 # Source files organized by module
 set(CORE_SOURCES
     src/core/emulator.cpp
-    src/core/config.cpp
 )
 
 set(CPU_SOURCES
     src/cpu/xenon/cpu.cpp
     src/cpu/xenon/decoder.cpp
     src/cpu/xenon/interpreter.cpp
-    src/cpu/xenon/registers.cpp
     src/cpu/vmx128/vmx.cpp
 )
 
 if(X360MU_ENABLE_JIT)
     list(APPEND CPU_SOURCES
-        src/cpu/xenon/jit/jit.cpp
-        src/cpu/xenon/jit/ir.cpp
-        src/cpu/xenon/jit/arm64_emitter.cpp
-        src/cpu/xenon/jit/optimizer.cpp
-        src/cpu/xenon/jit/block_cache.cpp
+        src/cpu/jit/jit_compiler.cpp
+        src/cpu/jit/arm64_emitter.cpp
     )
     add_definitions(-DX360MU_JIT_ENABLED)
 endif()
 
 set(GPU_SOURCES
-    src/gpu/xenos/gpu.cpp
     src/gpu/xenos/command_processor.cpp
     src/gpu/xenos/shader_translator.cpp
-    src/gpu/xenos/texture_cache.cpp
-    src/gpu/xenos/edram.cpp
     src/gpu/vulkan/vulkan_backend.cpp
-    src/gpu/vulkan/pipeline_cache.cpp
-    src/gpu/vulkan/memory_manager.cpp
-    src/gpu/vulkan/swapchain.cpp
 )
 
 set(APU_SOURCES
-    src/apu/audio.cpp
     src/apu/xma_decoder.cpp
-    src/apu/mixer.cpp
 )
 
 set(KERNEL_SOURCES
-    src/kernel/kernel.cpp
-    src/kernel/xex_loader.cpp
     src/kernel/hle/xboxkrnl.cpp
     src/kernel/hle/xam.cpp
-    src/kernel/hle/exports.cpp
-    src/kernel/filesystem/vfs.cpp
-    src/kernel/filesystem/iso_device.cpp
 )
 
 set(MEMORY_SOURCES
     src/memory/memory.cpp
-    src/memory/fastmem.cpp
-    src/memory/heap.cpp
-    src/memory/page_table.cpp
 )
 
-set(INPUT_SOURCES
-    src/input/input.cpp
-    src/input/gamepad.cpp
+set(JNI_SOURCES
+    src/jni/jni_bridge.cpp
 )
 
 # Combine all sources
@@ -116,7 +94,6 @@ set(ALL_SOURCES
     ${APU_SOURCES}
     ${KERNEL_SOURCES}
     ${MEMORY_SOURCES}
-    ${INPUT_SOURCES}
 )
 
 # Include directories
@@ -179,13 +156,7 @@ if(ANDROID)
         ${AAUDIO_LIB}
     )
     
-    # JNI bridge
-    set(JNI_SOURCES
-        src/jni/jni_bridge.cpp
-        src/jni/jni_emulator.cpp
-        src/jni/jni_input.cpp
-    )
-    
+    # JNI bridge - sources already defined above
     add_library(x360mu_jni SHARED ${JNI_SOURCES})
     target_link_libraries(x360mu_jni x360mu_core ${LOG_LIB})
 else()
