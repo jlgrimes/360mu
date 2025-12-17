@@ -332,7 +332,7 @@ Status XexLoader::parse_security_info(const u8* data, u32 offset) {
 }
 
 Status XexLoader::parse_import_libraries(const u8* data, u32 offset, u32 data_size) {
-    if (offset + 8 > data_size) {
+    if (offset + 12 > data_size) {
         LOGW("Import table offset 0x%08X exceeds data size", offset);
         return Status::Ok;  // Not fatal, just skip imports
     }
@@ -340,17 +340,24 @@ Status XexLoader::parse_import_libraries(const u8* data, u32 offset, u32 data_si
     const u8* ptr = data + offset;
     const u8* data_end = data + data_size;
     
+    // XEX2 Import Header format:
+    // - u32 total_size: Size of entire import header including strings
+    // - u32 string_table_size: Size of string table
+    // - u32 library_count: Number of import libraries
+    u32 total_size = read_u32_be(ptr); ptr += 4;
     u32 string_table_size = read_u32_be(ptr); ptr += 4;
     u32 library_count = read_u32_be(ptr); ptr += 4;
     
     // Sanity check
-    if (library_count > 100 || string_table_size > 0x10000) {
-        LOGW("Suspicious import table values: %u libs, %u string bytes (possibly encrypted XEX)",
-             library_count, string_table_size);
+    if (library_count > 100 || string_table_size > 0x10000 || total_size > 0x100000) {
+        LOGW("Suspicious import table values: %u libs, %u string bytes, %u total",
+             library_count, string_table_size, total_size);
         return Status::Ok;  // Skip imports
     }
     
-    // String table follows
+    LOGI("Import libraries: %u libraries, %u bytes of strings", library_count, string_table_size);
+    
+    // String table follows header
     const char* strings = reinterpret_cast<const char*>(ptr);
     ptr += string_table_size;
     
@@ -359,40 +366,78 @@ Status XexLoader::parse_import_libraries(const u8* data, u32 offset, u32 data_si
         return Status::Ok;
     }
     
-    LOGD("Import libraries: %u libraries, %u bytes of strings",
-         library_count, string_table_size);
-    
+    // Parse each library
     for (u32 i = 0; i < library_count && ptr + 40 <= data_end; i++) {
         XexImportLibrary lib;
         
-        u32 name_offset = read_u32_be(ptr); ptr += 4;
-        if (name_offset < string_table_size) {
-            lib.name = std::string(strings + name_offset);
-        }
+        // Library record format:
+        // - u32 record_size
+        // - 20 bytes SHA-1 digest
+        // - u32 import_id
+        // - u32 version
+        // - u32 version_min (optional)
+        // - u16 name_index (into string table, multiply by string entry size)
+        // - u16 import_count
+        // - import addresses follow
         
-        // Skip unknown fields
-        ptr += 4;  // Unknown
+        u32 record_size = read_u32_be(ptr); ptr += 4;
         
-        lib.version_min = read_u32_be(ptr); ptr += 4;
-        lib.version = read_u32_be(ptr); ptr += 4;
-        
-        memcpy(lib.digest, ptr, 20); ptr += 20;
-        
-        lib.import_count = read_u32_be(ptr); ptr += 4;
-        
-        // Sanity check import count
-        if (lib.import_count > 10000) {
-            LOGW("Suspicious import count %u for %s", lib.import_count, lib.name.c_str());
+        if (record_size < 28 || ptr + record_size - 4 > data_end) {
+            LOGW("Invalid import library record size: %u", record_size);
             break;
         }
         
-        // Read imports
-        for (u32 j = 0; j < lib.import_count && ptr + 4 <= data_end; j++) {
-            u32 import_addr = read_u32_be(ptr); ptr += 4;
-            lib.imports.push_back(import_addr);
+        const u8* record_start = ptr;
+        
+        // SHA-1 digest (20 bytes)
+        memcpy(lib.digest, ptr, 20); ptr += 20;
+        
+        // Import ID (used to identify which library)
+        u32 import_id = read_u32_be(ptr); ptr += 4;
+        
+        // Version
+        lib.version = read_u32_be(ptr); ptr += 4;
+        
+        // Version min
+        lib.version_min = read_u32_be(ptr); ptr += 4;
+        
+        // Name index (byte offset into string table) and import count
+        u16 name_index = read_u16_be(ptr); ptr += 2;
+        lib.import_count = read_u16_be(ptr); ptr += 2;
+        
+        // Get library name from string table
+        // name_index is an entry index into null-terminated strings, not byte offset
+        const char* str_ptr = strings;
+        const char* str_end = strings + string_table_size;
+        u16 current_index = 0;
+        while (str_ptr < str_end && current_index < name_index) {
+            // Skip to next string
+            while (str_ptr < str_end && *str_ptr != '\0') str_ptr++;
+            if (str_ptr < str_end) str_ptr++;  // Skip null terminator
+            current_index++;
+        }
+        if (str_ptr < str_end && current_index == name_index) {
+            lib.name = std::string(str_ptr);
+        } else {
+            lib.name = "<unknown>";
         }
         
-        LOGD("  Import lib: %s v%u.%u.%u.%u (%u imports)",
+        // Read import addresses/ordinals
+        // Each import is 4 bytes - the value encodes the thunk address or ordinal info
+        for (u32 j = 0; j < lib.import_count && ptr + 4 <= data_end; j++) {
+            u32 import_value = read_u32_be(ptr); ptr += 4;
+            
+            // The import value is typically:
+            // - High byte: flags/type
+            // - Low 24 bits: ordinal or address offset
+            // For syscall ordinals, we use the lower bits
+            lib.imports.push_back(import_value);
+        }
+        
+        // Move ptr to next record based on record_size (not import count)
+        ptr = record_start - 4 + record_size;
+        
+        LOGI("  Import lib: %s v%u.%u.%u.%u (%u imports)",
              lib.name.c_str(),
              (lib.version >> 24) & 0xFF,
              (lib.version >> 16) & 0xFF,
