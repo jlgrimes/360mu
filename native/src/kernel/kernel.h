@@ -245,59 +245,8 @@ private:
     }
 };
 
-/**
- * Virtual file system for Xbox 360 paths
- */
-class VirtualFileSystem {
-public:
-    VirtualFileSystem();
-    ~VirtualFileSystem();
-    
-    Status initialize(const std::string& data_path, const std::string& save_path);
-    void shutdown();
-    
-    // Mount/unmount
-    Status mount_iso(const std::string& device, const std::string& iso_path);
-    Status mount_folder(const std::string& device, const std::string& host_path);
-    void unmount(const std::string& device);
-    void unmount_all();
-    
-    // Path translation
-    std::string translate_path(const std::string& xbox_path);
-    
-    // File operations
-    Status open_file(const std::string& path, u32 access, u32& handle_out);
-    Status close_file(u32 handle);
-    Status read_file(u32 handle, void* buffer, u64 size, u64& bytes_read);
-    Status write_file(u32 handle, const void* buffer, u64 size, u64& bytes_written);
-    Status seek_file(u32 handle, s64 offset, u32 origin, u64& new_position);
-    Status get_file_size(u32 handle, u64& size_out);
-    
-    // Directory operations
-    Status create_directory(const std::string& path);
-    Status query_directory(const std::string& path, std::vector<std::string>& entries);
-    
-private:
-    struct Mount {
-        std::string device;
-        std::string host_path;
-        bool is_iso;
-    };
-    
-    struct OpenFile {
-        u32 handle;
-        std::string path;
-        void* native_handle;
-        u32 access;
-    };
-    
-    std::vector<Mount> mounts_;
-    std::unordered_map<u32, OpenFile> open_files_;
-    u32 next_file_handle_ = 1;
-    
-    std::string data_path_;
-    std::string save_path_;
-};
+// VirtualFileSystem is defined in filesystem/vfs.h
+// #include "filesystem/vfs.h" to use it
 
 // Helper functions for HLE modules
 void init_hle_state(VirtualFileSystem* vfs);

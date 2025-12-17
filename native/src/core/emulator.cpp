@@ -10,6 +10,7 @@
 #include "apu/audio.h"
 #include "memory/memory.h"
 #include "kernel/kernel.h"
+#include "kernel/filesystem/vfs.h"
 
 #include <atomic>
 #include <thread>

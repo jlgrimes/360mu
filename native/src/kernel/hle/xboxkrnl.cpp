@@ -14,6 +14,7 @@
  */
 
 #include "../kernel.h"
+#include "../filesystem/vfs.h"
 #include "../../cpu/xenon/cpu.h"
 #include "../../memory/memory.h"
 #include <cstring>
@@ -840,7 +841,11 @@ static void HLE_NtCreateFile(Cpu* cpu, Memory* memory, u64* args, u64* result) {
     // Check if VFS is available
     if (g_hle.vfs) {
         u32 vfs_handle;
-        Status status = g_hle.vfs->open_file(host_path, desired_access, vfs_handle);
+        // Convert Xbox access flags to VFS FileAccess
+        FileAccess vfs_access = (desired_access & (GENERIC_WRITE | FILE_WRITE_DATA)) 
+                                ? FileAccess::ReadWrite 
+                                : FileAccess::Read;
+        Status status = g_hle.vfs->open_file(host_path, vfs_access, vfs_handle);
         
         if (status == Status::Ok) {
             memory->write_u32(handle_ptr, vfs_handle);

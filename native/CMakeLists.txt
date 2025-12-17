@@ -228,8 +228,9 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
     # GPU/Vulkan tests only when Vulkan is available
     set(GPU_TEST_SOURCES "")
     if(X360MU_USE_VULKAN)
-        # Command processor tests can run without full Vulkan (uses mocks)
+        # Shader translator tests (no Vulkan runtime required)
         set(GPU_TEST_SOURCES 
+            tests/gpu/test_shader_translator.cpp
             tests/gpu/test_command_processor.cpp
         )
         if(Vulkan_FOUND)
@@ -272,6 +273,34 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
         tools/xex_test.cpp
     )
     target_link_libraries(xex_test x360mu_core)
+    
+    # =========================================
+    # Integration Test Tools
+    # =========================================
+    
+    # Level 1: ISO Mount Test
+    add_executable(test_iso
+        tools/test_iso.cpp
+    )
+    target_link_libraries(test_iso x360mu_core)
+    
+    # Level 2: XEX Load Test
+    add_executable(test_xex_load
+        tools/test_xex_load.cpp
+    )
+    target_link_libraries(test_xex_load x360mu_core)
+    
+    # Level 3: Execution Test
+    add_executable(test_execute
+        tools/test_execute.cpp
+    )
+    target_link_libraries(test_execute x360mu_core)
+    
+    # Level 4: Syscall Trace
+    add_executable(test_syscalls
+        tools/test_syscalls.cpp
+    )
+    target_link_libraries(test_syscalls x360mu_core)
 endif()
 
 # Install rules
