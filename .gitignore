@@ -1,0 +1,72 @@
+# Build outputs
+build/
+cmake-build-*/
+*.o
+*.so
+*.a
+*.dylib
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/*.iml
+android/captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.ap_
+*.aab
+
+# Native build
+native/build/
+native/cmake-build-*/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.xcodeproj/
+*.xcworkspace/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Logs
+*.log
+logs/
+
+# Temporary
+tmp/
+temp/
+*.tmp
+
+# Cache
+.cache/
+__pycache__/
+
+# Dependencies
+node_modules/
+third_party/ffmpeg/android/
+third_party/ffmpeg/include/
+
+# Shader cache
+*.spv
+shaders/cache/
+
+# Test data
+test_roms/
+*.xex
+*.iso
+*.god
+
+# Secrets
+*.keystore
+*.jks
+secrets.properties
+

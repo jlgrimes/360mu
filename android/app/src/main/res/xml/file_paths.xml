@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <files-path name="games" path="games/" />
+    <files-path name="saves" path="saves/" />
+    <cache-path name="cache" path="/" />
+    <external-files-path name="external" path="." />
+</paths>
+

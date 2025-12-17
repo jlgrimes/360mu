@@ -1,0 +1,5 @@
+#!/bin/sh
+# Gradle wrapper stub - run gradle wrapper task to generate
+echo "Please run './gradlew wrapper' from a system with Gradle installed"
+echo "Or download from: https://services.gradle.org/distributions/gradle-8.5-bin.zip"
+

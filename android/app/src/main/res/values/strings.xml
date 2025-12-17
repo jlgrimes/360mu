@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">360μ</string>
+    <string name="app_description">Xbox 360 Emulator for Android</string>
+    
+    <!-- Library screen -->
+    <string name="library_title">Game Library</string>
+    <string name="library_empty">No games yet</string>
+    <string name="library_add">Add Game</string>
+    <string name="library_browse">Browse Files</string>
+    
+    <!-- Settings -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_cpu">CPU</string>
+    <string name="settings_gpu">Graphics</string>
+    <string name="settings_audio">Audio</string>
+    <string name="settings_controls">Controls</string>
+    <string name="settings_about">About</string>
+    
+    <!-- CPU settings -->
+    <string name="jit_title">JIT Recompiler</string>
+    <string name="jit_description">Enable dynamic recompilation for better performance</string>
+    
+    <!-- GPU settings -->
+    <string name="resolution_title">Resolution Scale</string>
+    <string name="vsync_title">VSync</string>
+    <string name="vsync_description">Synchronize frame rate with display refresh</string>
+    
+    <!-- Audio settings -->
+    <string name="audio_enable_title">Enable Audio</string>
+    <string name="audio_enable_description">Play game audio</string>
+    
+    <!-- Game screen -->
+    <string name="game_loading">Loading game…</string>
+    <string name="game_menu_title">Game Menu</string>
+    <string name="game_resume">Resume</string>
+    <string name="game_reset">Reset</string>
+    <string name="game_save_state">Save State</string>
+    <string name="game_load_state">Load State</string>
+    <string name="game_exit">Exit Game</string>
+    <string name="game_exit_confirm">Are you sure you want to exit? Unsaved progress will be lost.</string>
+    
+    <!-- Common -->
+    <string name="ok">OK</string>
+    <string name="cancel">Cancel</string>
+    <string name="save">Save</string>
+    <string name="load">Load</string>
+    <string name="exit">Exit</string>
+    <string name="back">Back</string>
+    <string name="error">Error</string>
+</resources>
+
