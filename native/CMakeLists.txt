@@ -65,21 +65,36 @@ if(X360MU_ENABLE_JIT)
     add_definitions(-DX360MU_JIT_ENABLED)
 endif()
 
-set(GPU_SOURCES
-    src/gpu/xenos/command_processor.cpp
-    src/gpu/xenos/shader_translator.cpp
-    src/gpu/xenos/spirv_builder.cpp
-    src/gpu/xenos/edram.cpp
-    src/gpu/xenos/texture.cpp
-    src/gpu/vulkan/vulkan_backend.cpp
-)
+# GPU sources - use stubs when Vulkan is not available
+if(X360MU_USE_VULKAN)
+    set(GPU_SOURCES
+        src/gpu/xenos/command_processor.cpp
+        src/gpu/xenos/shader_translator.cpp
+        src/gpu/xenos/spirv_builder.cpp
+        src/gpu/xenos/edram.cpp
+        src/gpu/xenos/texture.cpp
+        src/gpu/vulkan/vulkan_backend.cpp
+    )
+else()
+    set(GPU_SOURCES
+        src/gpu/stub/gpu_stub.cpp
+    )
+endif()
 
-set(APU_SOURCES
-    src/apu/xma_decoder.cpp
-    src/apu/android_audio.cpp
-)
+# APU sources - use stubs when FFmpeg is not available
+if(X360MU_USE_FFMPEG)
+    set(APU_SOURCES
+        src/apu/xma_decoder.cpp
+        src/apu/android_audio.cpp
+    )
+else()
+    set(APU_SOURCES
+        src/apu/stub/apu_stub.cpp
+    )
+endif()
 
 set(KERNEL_SOURCES
+    src/kernel/kernel.cpp
     src/kernel/hle/xboxkrnl.cpp
     src/kernel/hle/xboxkrnl_extended.cpp
     src/kernel/hle/xam.cpp
@@ -116,13 +131,23 @@ include_directories(
 # VMA (Vulkan Memory Allocator) - header only
 add_definitions(-DVMA_IMPLEMENTATION)
 
-# Find Vulkan
-if(ANDROID)
-    # Android has Vulkan in NDK
-    find_library(VULKAN_LIB vulkan)
-else()
-    find_package(Vulkan REQUIRED)
-    set(VULKAN_LIB Vulkan::Vulkan)
+# Find Vulkan (optional for testing)
+option(X360MU_USE_VULKAN "Enable Vulkan rendering" ON)
+
+if(X360MU_USE_VULKAN)
+    if(ANDROID)
+        # Android has Vulkan in NDK
+        find_library(VULKAN_LIB vulkan)
+    else()
+        find_package(Vulkan QUIET)
+        if(Vulkan_FOUND)
+            set(VULKAN_LIB Vulkan::Vulkan)
+            add_definitions(-DX360MU_HAS_VULKAN)
+        else()
+            message(WARNING "Vulkan not found - GPU emulation disabled")
+            set(X360MU_USE_VULKAN OFF)
+        endif()
+    endif()
 endif()
 
 # Find FFmpeg (optional)
@@ -149,9 +174,12 @@ endif()
 add_library(x360mu_core SHARED ${ALL_SOURCES})
 
 target_link_libraries(x360mu_core
-    ${VULKAN_LIB}
     ${FFMPEG_LIBS}
 )
+
+if(X360MU_USE_VULKAN AND VULKAN_LIB)
+    target_link_libraries(x360mu_core ${VULKAN_LIB})
+endif()
 
 if(ANDROID)
     # Android-specific libraries

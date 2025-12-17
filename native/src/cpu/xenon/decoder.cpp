@@ -6,6 +6,7 @@
 
 #include "cpu.h"
 #include <cstdio>
+#include <string>
 
 namespace x360mu {
 

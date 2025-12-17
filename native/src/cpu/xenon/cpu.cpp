@@ -5,7 +5,7 @@
  */
 
 #include "cpu.h"
-#include "../memory/memory.h"
+#include "memory/memory.h"
 
 #ifdef __ANDROID__
 #include <android/log.h>

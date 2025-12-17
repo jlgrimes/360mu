@@ -5,7 +5,7 @@
  */
 
 #include "vmx.h"
-#include "../memory/memory.h"
+#include "memory/memory.h"
 #include <cmath>
 
 #ifdef __ANDROID__
@@ -437,17 +437,12 @@ void Vmx128Unit::vperm(VectorReg& vd, const VectorReg& va, const VectorReg& vb, 
     uint8x16_t c = vld1q_u8(vc.u8x16);
     
     // Combine va and vb
-    uint8x16x2_t ab = {a, b};
-    
     // Use low 5 bits as indices (0-31)
-    uint8x16_t indices = vandq_u8(c, vdupq_n_u8(0x1F));
+    uint8x16_t masked_c = vandq_u8(c, vdupq_n_u8(0x1F));
     
-    // Table lookup (requires splitting for indices >= 16)
-    uint8x16_t result;
-    for (int i = 0; i < 16; i++) {
-        u8 idx = vgetq_lane_u8(indices, i);
-        result = vsetq_lane_u8(idx < 16 ? vgetq_lane_u8(a, idx) : vgetq_lane_u8(b, idx - 16), result, i);
-    }
+    // Use table lookup - combine a and b into a table
+    uint8x16x2_t table = {a, b};
+    uint8x16_t result = vqtbl2q_u8(table, masked_c);
     
     vst1q_u8(vd.u8x16, result);
 }

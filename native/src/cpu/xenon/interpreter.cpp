@@ -5,7 +5,7 @@
  */
 
 #include "cpu.h"
-#include "../memory/memory.h"
+#include "memory/memory.h"
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -268,7 +268,11 @@ void Interpreter::exec_integer(ThreadContext& ctx, const DecodedInst& d) {
     }
 }
 
-void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
+// NOTE: exec_integer_ext31 is implemented in interpreter_extended.cpp
+// This prevents duplicate symbol errors
+
+#if 0  // Disabled - using extended version instead
+void Interpreter::exec_integer_ext31_DISABLED(ThreadContext& ctx, const DecodedInst& d) {
     u64 ra = ctx.gpr[d.ra];
     u64 rb = ctx.gpr[d.rb];
     u64 result = 0;
@@ -485,6 +489,7 @@ void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
         update_cr0(ctx, static_cast<s64>(ctx.gpr[d.rd]));
     }
 }
+#endif  // exec_integer_ext31_DISABLED
 
 void Interpreter::exec_load_store(ThreadContext& ctx, const DecodedInst& d) {
     GuestAddr addr;

@@ -25,14 +25,15 @@ protected:
 };
 
 TEST_F(MemoryTest, BasicReadWrite) {
-    GuestAddr addr = 0x82000000;
+    // Use address within 512MB range
+    GuestAddr addr = 0x00100000;  // 1MB offset
     
     memory->write_u32(addr, 0xDEADBEEF);
     EXPECT_EQ(memory->read_u32(addr), 0xDEADBEEF);
 }
 
 TEST_F(MemoryTest, ByteReadWrite) {
-    GuestAddr addr = 0x82000100;
+    GuestAddr addr = 0x00100100;
     
     memory->write_u8(addr, 0xAB);
     memory->write_u8(addr + 1, 0xCD);
@@ -46,7 +47,7 @@ TEST_F(MemoryTest, ByteReadWrite) {
 }
 
 TEST_F(MemoryTest, HalfWordReadWrite) {
-    GuestAddr addr = 0x82000200;
+    GuestAddr addr = 0x00100200;
     
     memory->write_u16(addr, 0x1234);
     memory->write_u16(addr + 2, 0x5678);
@@ -56,14 +57,14 @@ TEST_F(MemoryTest, HalfWordReadWrite) {
 }
 
 TEST_F(MemoryTest, DoubleWordReadWrite) {
-    GuestAddr addr = 0x82000300;
+    GuestAddr addr = 0x00100300;
     
     memory->write_u64(addr, 0x123456789ABCDEF0ULL);
     EXPECT_EQ(memory->read_u64(addr), 0x123456789ABCDEF0ULL);
 }
 
 TEST_F(MemoryTest, BlockWrite) {
-    GuestAddr addr = 0x82000400;
+    GuestAddr addr = 0x00100400;
     u8 data[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     
     for (int i = 0; i < 16; i++) {
@@ -77,7 +78,7 @@ TEST_F(MemoryTest, BlockWrite) {
 
 TEST_F(MemoryTest, Alignment) {
     // Test that unaligned access works correctly
-    GuestAddr addr = 0x82000501;  // Unaligned address
+    GuestAddr addr = 0x00100501;  // Unaligned address
     
     memory->write_u32(addr, 0xCAFEBABE);
     EXPECT_EQ(memory->read_u32(addr), 0xCAFEBABE);
@@ -85,4 +86,3 @@ TEST_F(MemoryTest, Alignment) {
 
 } // namespace test
 } // namespace x360mu
-

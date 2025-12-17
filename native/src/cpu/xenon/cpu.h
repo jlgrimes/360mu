@@ -9,6 +9,11 @@
 #include "x360mu/types.h"
 #include <memory>
 #include <array>
+#include <string>
+
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
 
 namespace x360mu {
 

@@ -12,6 +12,7 @@
 #include <vector>
 #include <unordered_map>
 #include <functional>
+#include <array>
 
 namespace x360mu {
 
@@ -71,15 +72,7 @@ enum class XexHeaderType : u32 {
     ExportsToExportsByName = 0x00E10402,
 };
 
-/**
- * Import library entry
- */
-struct XexImportLibrary {
-    std::string name;
-    u32 version;
-    u32 min_version;
-    std::vector<u32> ordinals;
-};
+// XexImportLibrary is defined in xex_loader.h
 
 /**
  * Loaded module info
@@ -90,7 +83,6 @@ struct LoadedModule {
     GuestAddr base_address;
     u64 size;
     GuestAddr entry_point;
-    std::vector<XexImportLibrary> imports;
     bool is_exe;
 };
 
@@ -239,6 +231,7 @@ private:
     // HLE registration
     void register_hle_functions();
     void register_xboxkrnl();
+    void register_xboxkrnl_extended();
     void register_xam();
     
     // Import lookup key

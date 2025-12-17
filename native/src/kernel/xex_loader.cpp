@@ -631,15 +631,15 @@ void XexTestHarness::disassemble_entry(u32 instruction_count) const {
                 break;
             case 32:  // lwz
                 printf("lwz     r%u, %d(r%u)", (inst >> 21) & 0x1F,
-                       static_cast<i16>(inst & 0xFFFF), (inst >> 16) & 0x1F);
+                       static_cast<s16>(inst & 0xFFFF), (inst >> 16) & 0x1F);
                 break;
             case 36:  // stw
                 printf("stw     r%u, %d(r%u)", (inst >> 21) & 0x1F,
-                       static_cast<i16>(inst & 0xFFFF), (inst >> 16) & 0x1F);
+                       static_cast<s16>(inst & 0xFFFF), (inst >> 16) & 0x1F);
                 break;
             case 14:  // addi
                 printf("addi    r%u, r%u, %d", (inst >> 21) & 0x1F,
-                       (inst >> 16) & 0x1F, static_cast<i16>(inst & 0xFFFF));
+                       (inst >> 16) & 0x1F, static_cast<s16>(inst & 0xFFFF));
                 break;
             case 15:  // addis
                 printf("addis   r%u, r%u, 0x%04X", (inst >> 21) & 0x1F,

@@ -8,8 +8,11 @@
 #pragma once
 
 #include "x360mu/types.h"
-#include "../xenon/cpu.h"
+#include "cpu/xenon/cpu.h"
+
+#ifdef __aarch64__
 #include <arm_neon.h>
+#endif
 
 namespace x360mu {
 

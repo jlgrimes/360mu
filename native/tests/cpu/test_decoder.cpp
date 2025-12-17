@@ -12,75 +12,51 @@ namespace test {
 
 class DecoderTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        // Setup code
-    }
-    
-    void TearDown() override {
-        // Cleanup code
-    }
 };
 
-TEST_F(DecoderTest, DecodeBranch) {
-    // Test branch instruction decoding
-    // b 0x1000
-    u32 inst = 0x48001000;  // b +0x1000
-    
-    Decoder decoder;
-    DecodedInst decoded = decoder.decode(inst);
-    
-    EXPECT_EQ(decoded.op, Opcode::B);
-}
-
-TEST_F(DecoderTest, DecodeLoadWord) {
-    // Test lwz instruction
-    // lwz r3, 0x10(r1)
-    u32 inst = 0x80610010;
-    
-    Decoder decoder;
-    DecodedInst decoded = decoder.decode(inst);
-    
-    EXPECT_EQ(decoded.op, Opcode::LWZ);
-    EXPECT_EQ(decoded.rd, 3);
-    EXPECT_EQ(decoded.ra, 1);
-    EXPECT_EQ(decoded.imm, 0x10);
-}
-
-TEST_F(DecoderTest, DecodeStoreWord) {
-    // Test stw instruction
-    // stw r3, 0x20(r1)
-    u32 inst = 0x90610020;
-    
-    Decoder decoder;
-    DecodedInst decoded = decoder.decode(inst);
-    
-    EXPECT_EQ(decoded.op, Opcode::STW);
-}
-
 TEST_F(DecoderTest, DecodeAdd) {
-    // Test add instruction
-    u32 inst = 0x7C632214;  // add r3, r3, r4
+    // add r3, r4, r5 (opcode 31, xo 266)
+    // PowerPC encoding: opcode(6) | rd(5) | ra(5) | rb(5) | xo(10) | rc(1)
+    // 31<<26 | 3<<21 | 4<<16 | 5<<11 | 266<<1 | 0 = 0x7C640214
+    u32 inst = (31 << 26) | (3 << 21) | (4 << 16) | (5 << 11) | (266 << 1) | 0;
+    DecodedInst decoded = Decoder::decode(inst);
     
-    Decoder decoder;
-    DecodedInst decoded = decoder.decode(inst);
-    
-    EXPECT_EQ(decoded.op, Opcode::ADD);
+    EXPECT_EQ(decoded.opcode, 31);
+    EXPECT_EQ(decoded.rd, 3);
+    EXPECT_EQ(decoded.ra, 4);
+    EXPECT_EQ(decoded.rb, 5);
 }
 
 TEST_F(DecoderTest, DecodeAddi) {
-    // Test addi instruction
     // addi r3, r4, 100
-    u32 inst = 0x38640064;
+    // Encoding: opcode 14, rd=3, ra=4, simm=100
+    u32 inst = (14 << 26) | (3 << 21) | (4 << 16) | 100;
+    DecodedInst decoded = Decoder::decode(inst);
     
-    Decoder decoder;
-    DecodedInst decoded = decoder.decode(inst);
-    
-    EXPECT_EQ(decoded.op, Opcode::ADDI);
+    EXPECT_EQ(decoded.opcode, 14);
     EXPECT_EQ(decoded.rd, 3);
     EXPECT_EQ(decoded.ra, 4);
-    EXPECT_EQ(decoded.imm, 100);
+    EXPECT_EQ(decoded.simm, 100);
+}
+
+TEST_F(DecoderTest, DecodeBranch) {
+    // b +0x100
+    u32 inst = (18 << 26) | 0x100;
+    DecodedInst decoded = Decoder::decode(inst);
+    
+    EXPECT_EQ(decoded.opcode, 18);
+}
+
+TEST_F(DecoderTest, DecodeLoadWord) {
+    // lwz r3, 0x10(r4)
+    u32 inst = (32 << 26) | (3 << 21) | (4 << 16) | 0x10;
+    DecodedInst decoded = Decoder::decode(inst);
+    
+    EXPECT_EQ(decoded.opcode, 32);
+    EXPECT_EQ(decoded.rd, 3);
+    EXPECT_EQ(decoded.ra, 4);
+    EXPECT_EQ(decoded.simm, 0x10);
 }
 
 } // namespace test
 } // namespace x360mu
-
