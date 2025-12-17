@@ -87,6 +87,10 @@ public:
     void write_u32(GuestAddr addr, u32 value);
     void write_u64(GuestAddr addr, u64 value);
     
+    // ----- Address translation -----
+    
+    GuestAddr translate_address(GuestAddr addr);
+    
     // ----- Bulk memory operations -----
     
     void read_bytes(GuestAddr addr, void* dest, u64 size);

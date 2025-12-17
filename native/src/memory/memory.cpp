@@ -227,6 +227,20 @@ bool Memory::handle_fault(void* fault_addr, bool is_write) {
     return false;
 }
 
+// Translate virtual address to physical address
+// Xbox 360 memory map:
+// 0x00000000-0x1FFFFFFF: Physical memory (512 MB)
+// 0x80000000-0x9FFFFFFF: Virtual usermode (maps to physical)
+// 0xA0000000+: Various system regions
+GuestAddr Memory::translate_address(GuestAddr addr) {
+    // Usermode virtual range maps to physical by clearing top bits
+    if (addr >= 0x80000000 && addr < 0xA0000000) {
+        return addr & 0x1FFFFFFF;
+    }
+    // Physical addresses pass through
+    return addr;
+}
+
 // Memory access with byte swapping (Xbox 360 is big-endian)
 u8 Memory::read_u8(GuestAddr addr) {
     if (is_mmio(addr)) {
@@ -237,8 +251,9 @@ u8 Memory::read_u8(GuestAddr addr) {
         return 0;
     }
     
-    if (addr >= main_memory_size_) return 0;
-    return static_cast<u8*>(main_memory_)[addr];
+    GuestAddr phys_addr = translate_address(addr);
+    if (phys_addr >= main_memory_size_) return 0;
+    return static_cast<u8*>(main_memory_)[phys_addr];
 }
 
 u16 Memory::read_u16(GuestAddr addr) {
@@ -250,9 +265,10 @@ u16 Memory::read_u16(GuestAddr addr) {
         return 0;
     }
     
-    if (addr + 1 >= main_memory_size_) return 0;
+    GuestAddr phys_addr = translate_address(addr);
+    if (phys_addr + 1 >= main_memory_size_) return 0;
     u16 value;
-    memcpy(&value, static_cast<u8*>(main_memory_) + addr, sizeof(u16));
+    memcpy(&value, static_cast<u8*>(main_memory_) + phys_addr, sizeof(u16));
     return byte_swap(value); // Big-endian to host
 }
 
@@ -265,9 +281,10 @@ u32 Memory::read_u32(GuestAddr addr) {
         return 0;
     }
     
-    if (addr + 3 >= main_memory_size_) return 0;
+    GuestAddr phys_addr = translate_address(addr);
+    if (phys_addr + 3 >= main_memory_size_) return 0;
     u32 value;
-    memcpy(&value, static_cast<u8*>(main_memory_) + addr, sizeof(u32));
+    memcpy(&value, static_cast<u8*>(main_memory_) + phys_addr, sizeof(u32));
     return byte_swap(value);
 }
 
@@ -282,9 +299,10 @@ u64 Memory::read_u64(GuestAddr addr) {
         return 0;
     }
     
-    if (addr + 7 >= main_memory_size_) return 0;
+    GuestAddr phys_addr = translate_address(addr);
+    if (phys_addr + 7 >= main_memory_size_) return 0;
     u64 value;
-    memcpy(&value, static_cast<u8*>(main_memory_) + addr, sizeof(u64));
+    memcpy(&value, static_cast<u8*>(main_memory_) + phys_addr, sizeof(u64));
     return byte_swap(value);
 }
 
@@ -297,8 +315,10 @@ void Memory::write_u8(GuestAddr addr, u8 value) {
         return;
     }
     
-    if (addr >= main_memory_size_) return;
-    static_cast<u8*>(main_memory_)[addr] = value;
+    // Translate virtual to physical address
+    GuestAddr phys_addr = translate_address(addr);
+    if (phys_addr >= main_memory_size_) return;
+    static_cast<u8*>(main_memory_)[phys_addr] = value;
     notify_write(addr, 1);
 }
 
@@ -311,9 +331,10 @@ void Memory::write_u16(GuestAddr addr, u16 value) {
         return;
     }
     
-    if (addr + 1 >= main_memory_size_) return;
+    GuestAddr phys_addr = translate_address(addr);
+    if (phys_addr + 1 >= main_memory_size_) return;
     value = byte_swap(value); // Host to big-endian
-    memcpy(static_cast<u8*>(main_memory_) + addr, &value, sizeof(u16));
+    memcpy(static_cast<u8*>(main_memory_) + phys_addr, &value, sizeof(u16));
     notify_write(addr, 2);
 }
 
@@ -326,9 +347,10 @@ void Memory::write_u32(GuestAddr addr, u32 value) {
         return;
     }
     
-    if (addr + 3 >= main_memory_size_) return;
+    GuestAddr phys_addr = translate_address(addr);
+    if (phys_addr + 3 >= main_memory_size_) return;
     value = byte_swap(value);
-    memcpy(static_cast<u8*>(main_memory_) + addr, &value, sizeof(u32));
+    memcpy(static_cast<u8*>(main_memory_) + phys_addr, &value, sizeof(u32));
     notify_write(addr, 4);
 }
 
@@ -342,9 +364,10 @@ void Memory::write_u64(GuestAddr addr, u64 value) {
         return;
     }
     
-    if (addr + 7 >= main_memory_size_) return;
+    GuestAddr phys_addr = translate_address(addr);
+    if (phys_addr + 7 >= main_memory_size_) return;
     value = byte_swap(value);
-    memcpy(static_cast<u8*>(main_memory_) + addr, &value, sizeof(u64));
+    memcpy(static_cast<u8*>(main_memory_) + phys_addr, &value, sizeof(u64));
     notify_write(addr, 8);
 }
 

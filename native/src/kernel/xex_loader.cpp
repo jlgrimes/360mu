@@ -5,6 +5,7 @@
  */
 
 #include "xex_loader.h"
+#include "xex_crypto.h"
 #include "../memory/memory.h"
 #include <fstream>
 #include <cstring>
@@ -250,6 +251,36 @@ Status XexLoader::parse_optional_headers(const u8* data, u32 size, u32 count) {
             case XexHeaderId::kImportLibraries:
                 parse_import_libraries(data, value, size);
                 break;
+            
+            case XexHeaderId::kBaseFileFormat:
+                // File format descriptor
+                if (value < size - 8) {
+                    const u8* fmt = data + value;
+                    u32 info_size = read_u32_be(fmt);
+                    u32 enc_comp = read_u32_be(fmt + 4);
+                    // High 16 bits = encryption type, Low 16 bits = compression type
+                    module_->encryption_type = (enc_comp >> 16) & 0xFFFF;
+                    module_->compression_type = enc_comp & 0xFFFF;
+                    LOGI("File format: size=%u, encryption=%u, compression=%u",
+                         info_size, module_->encryption_type, module_->compression_type);
+                    
+                    // Store compression blocks if present (for basic compression)
+                    if (module_->compression_type == 1 && info_size > 8) {
+                        // Parse compression blocks - each block is 8 bytes (data_size, zero_size)
+                        u32 block_count = (info_size - 8) / 8;
+                        const u8* blocks = fmt + 8;
+                        LOGI("Parsing %u compression blocks:", block_count);
+                        for (u32 b = 0; b < block_count && blocks + 8 <= data + size; b++) {
+                            u32 data_size = read_u32_be(blocks);
+                            u32 zero_size = read_u32_be(blocks + 4);
+                            module_->compression_blocks.push_back({data_size, zero_size});
+                            LOGI("  Block %u: data=%u (0x%X), zeros=%u (0x%X)",
+                                 b, data_size, data_size, zero_size, zero_size);
+                            blocks += 8;
+                        }
+                    }
+                }
+                break;
                 
             case XexHeaderId::kOriginalPeName:
                 if (value < size) {
@@ -286,8 +317,8 @@ Status XexLoader::parse_security_info(const u8* data, u32 offset) {
     module_->security_info.import_table_count = read_u32_be(ptr + 24);
     memcpy(module_->security_info.import_digest, ptr + 28, 20);
     memcpy(module_->security_info.media_id, ptr + 48, 16);
-    memcpy(module_->security_info.file_key, ptr + 64, 16);
-    module_->security_info.export_table_offset = read_u32_be(ptr + 80);
+    memcpy(module_->security_info.file_key, ptr + 72, 16);  // Session key at offset 336 from security start
+    module_->security_info.export_table_offset = read_u32_be(ptr + 88);
     memcpy(module_->security_info.header_hash, ptr + 84, 20);
     module_->security_info.game_region = read_u32_be(ptr + 104);
     module_->security_info.image_flags = read_u32_be(ptr + 108);
@@ -375,28 +406,167 @@ Status XexLoader::parse_import_libraries(const u8* data, u32 offset, u32 data_si
     return Status::Ok;
 }
 
-Status XexLoader::parse_pe_image(const u8* data, u32 offset, u32 size) {
+Status XexLoader::parse_pe_image(const u8* data, u32 offset, u32 raw_size) {
     // The PE image in XEX can be:
-    // 1. Uncompressed
-    // 2. LZX compressed
-    // 3. Basic compressed (simple blocks)
+    // 1. Uncompressed, unencrypted
+    // 2. Encrypted (AES-128-CBC)
+    // 3. Compressed (LZX or basic)
+    // 4. Encrypted AND compressed
     
-    // For now, assume uncompressed and just copy
+    LOGI("Parsing PE image: offset=0x%X, raw_size=%u", offset, raw_size);
+    
+    // Allocate space for the decrypted/decompressed image
     module_->image_data.resize(module_->image_size);
     
-    if (offset + size > module_->image_size) {
-        size = module_->image_size - offset;
+    // Make a copy of the encrypted data to work with
+    std::vector<u8> working_data(data + offset, data + offset + raw_size);
+    
+    // For basic compression, decryption happens block-by-block below
+    // For other modes, decrypt the whole image first
+    if (module_->encryption_type == 1 && module_->compression_type != 1) {
+        LOGI("Decrypting XEX image (%u bytes)...", raw_size);
+        
+        XexDecryptor decryptor;
+        decryptor.set_key(module_->security_info.file_key);
+        
+        // Use zero IV for XEX decryption
+        u8 iv[16] = {0};
+        
+        Status status = decryptor.decrypt_image(working_data.data(), working_data.size(), iv);
+        if (status != Status::Ok) {
+            LOGE("Failed to decrypt XEX image");
+            return status;
+        }
+        
+        LOGI("Decryption complete");
     }
     
-    // Copy what we have
-    memcpy(module_->image_data.data(), data + offset, 
-           std::min(size, static_cast<u32>(module_->image_data.size())));
+    // Decompress if needed
+    if (module_->compression_type == 2) {
+        // LZX compression
+        LOGI("Decompressing LZX image...");
+        
+        XexDecryptor decryptor;
+        Status status = decryptor.decompress_lzx(
+            working_data.data(), working_data.size(),
+            module_->image_data.data(), module_->image_size);
+        
+        if (status != Status::Ok) {
+            LOGW("LZX decompression failed, using raw data");
+            // Fall back to copying raw data
+            memcpy(module_->image_data.data(), working_data.data(),
+                   std::min(working_data.size(), (size_t)module_->image_size));
+        } else {
+            LOGI("Decompression complete");
+        }
+    } else if (module_->compression_type == 1) {
+        // Basic block compression
+        LOGI("Decompressing basic blocks...");
+        
+        // For basic compression with encryption, we need to decrypt each block
+        // and then append zeros as specified in the block table
+        
+        if (module_->compression_blocks.empty()) {
+            LOGW("No compression blocks found, copying raw data");
+            memcpy(module_->image_data.data(), working_data.data(),
+                   std::min(working_data.size(), (size_t)module_->image_size));
+        } else {
+            XexDecryptor decryptor;
+            decryptor.set_key(module_->security_info.file_key);
+            
+            u32 src_offset = 0;
+            u32 dst_offset = 0;
+            u8 iv[16] = {0};  // IV chains across all blocks
+            
+            for (size_t i = 0; i < module_->compression_blocks.size() && dst_offset < module_->image_size; i++) {
+                u32 data_size = module_->compression_blocks[i].first;
+                u32 zero_size = module_->compression_blocks[i].second;
+                
+                if (src_offset + data_size > working_data.size()) {
+                    LOGW("Block %zu exceeds input data (offset=%u, size=%u, avail=%zu)", 
+                         i, src_offset, data_size, working_data.size());
+                    break;
+                }
+                
+                // Copy and decrypt block
+                if (data_size > 0) {
+                    // Round up to 16-byte boundary for AES
+                    u32 aligned_size = (data_size + 15) & ~15;
+                    
+                    // Make a copy for decryption
+                    std::vector<u8> block_data(working_data.begin() + src_offset,
+                                               working_data.begin() + src_offset + std::min(aligned_size, (u32)working_data.size() - src_offset));
+                    
+                    // Pad to aligned size if needed
+                    if (block_data.size() < aligned_size) {
+                        block_data.resize(aligned_size, 0);
+                    }
+                    
+                    if (module_->encryption_type == 1) {
+                        // Save last 16 bytes of ciphertext for IV chain BEFORE decryption
+                        // Use the actual data_size boundary for IV, aligned to 16 bytes
+                        u8 next_iv[16];
+                        u32 iv_offset = ((data_size + 15) & ~15) - 16;  // Last 16-byte block
+                        if (iv_offset + 16 <= working_data.size() - src_offset) {
+                            memcpy(next_iv, working_data.data() + src_offset + iv_offset, 16);
+                        }
+                        
+                        // Decrypt with current IV
+                        decryptor.decrypt_image(block_data.data(), aligned_size, iv);
+                        
+                        // Update IV for next block
+                        memcpy(iv, next_iv, 16);
+                    }
+                    
+                    // Copy decrypted data to output (only up to data_size, not padding)
+                    u32 copy_size = std::min(data_size, module_->image_size - dst_offset);
+                    memcpy(module_->image_data.data() + dst_offset, block_data.data(), copy_size);
+                    dst_offset += copy_size;
+                    src_offset += data_size;
+                }
+                
+                // Append zeros
+                if (zero_size > 0 && dst_offset < module_->image_size) {
+                    u32 zeros_to_write = std::min(zero_size, module_->image_size - dst_offset);
+                    memset(module_->image_data.data() + dst_offset, 0, zeros_to_write);
+                    dst_offset += zeros_to_write;
+                }
+            }
+            
+            LOGI("Decompressed %u bytes to %u bytes", src_offset, dst_offset);
+            
+            // Debug: Check first 32 bytes of decompressed data
+            if (module_->image_data.size() >= 32) {
+                LOGI("First 32 decompressed bytes: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
+                     module_->image_data[0], module_->image_data[1], module_->image_data[2], module_->image_data[3],
+                     module_->image_data[4], module_->image_data[5], module_->image_data[6], module_->image_data[7],
+                     module_->image_data[8], module_->image_data[9], module_->image_data[10], module_->image_data[11],
+                     module_->image_data[12], module_->image_data[13], module_->image_data[14], module_->image_data[15]);
+            }
+            
+            // Debug: Check data at entry point offset
+            u32 ep_offset = module_->entry_point - module_->base_address;
+            if (ep_offset + 16 <= module_->image_data.size()) {
+                LOGI("Data at entry point offset 0x%X: %02X%02X%02X%02X %02X%02X%02X%02X",
+                     ep_offset,
+                     module_->image_data[ep_offset], module_->image_data[ep_offset+1],
+                     module_->image_data[ep_offset+2], module_->image_data[ep_offset+3],
+                     module_->image_data[ep_offset+4], module_->image_data[ep_offset+5],
+                     module_->image_data[ep_offset+6], module_->image_data[ep_offset+7]);
+            }
+        }
+    } else {
+        // No compression, just copy
+        memcpy(module_->image_data.data(), working_data.data(),
+               std::min(working_data.size(), (size_t)module_->image_size));
+    }
     
-    // Try to parse PE headers from the image
+    // Step 3: Parse PE headers from the decrypted/decompressed image
     const u8* img = module_->image_data.data();
     
     // DOS header check
     if (module_->image_data.size() >= 64 && img[0] == 'M' && img[1] == 'Z') {
+        LOGI("Found valid DOS header (MZ)");
         u32 pe_offset = *reinterpret_cast<const u32*>(img + 60);
         
         if (pe_offset < module_->image_data.size() - 24) {
@@ -405,6 +575,7 @@ Status XexLoader::parse_pe_image(const u8* data, u32 offset, u32 size) {
             u32 signature = *reinterpret_cast<const u32*>(pe);
             
             if (signature == PE_SIGNATURE) {
+                LOGI("Found valid PE signature");
                 // COFF header
                 u16 num_sections = *reinterpret_cast<const u16*>(pe + 6);
                 u16 opt_header_size = *reinterpret_cast<const u16*>(pe + 20);
@@ -425,7 +596,7 @@ Status XexLoader::parse_pe_image(const u8* data, u32 offset, u32 size) {
                     
                     module_->sections.push_back(section);
                     
-                    LOGD("  Section: %-8s VA=0x%08X Size=0x%08X Flags=0x%08X",
+                    LOGI("  Section: %-8s VA=0x%08X Size=0x%08X Flags=0x%08X",
                          section.name.c_str(),
                          section.virtual_address,
                          section.virtual_size,
@@ -433,8 +604,13 @@ Status XexLoader::parse_pe_image(const u8* data, u32 offset, u32 size) {
                     
                     sections += 40;
                 }
+            } else {
+                LOGW("No PE signature found (got 0x%08X), image may still be encrypted", signature);
             }
         }
+    } else {
+        LOGW("No DOS header found, image may still be encrypted (first bytes: %02X %02X)",
+             img[0], img[1]);
     }
     
     return Status::Ok;

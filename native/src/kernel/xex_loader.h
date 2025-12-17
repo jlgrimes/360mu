@@ -203,6 +203,13 @@ struct XexModule {
     // Is this the main executable?
     bool is_title;
     
+    // Encryption/compression
+    u32 encryption_type = 0;  // 0=none, 1=encrypted
+    u32 compression_type = 0; // 0=none, 1=basic, 2=LZX
+    
+    // Basic compression blocks (data_size, zero_size pairs)
+    std::vector<std::pair<u32, u32>> compression_blocks;
+    
     // Module handle for HLE
     u32 handle;
 };
