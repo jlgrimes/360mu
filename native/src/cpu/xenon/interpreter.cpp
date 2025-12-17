@@ -638,6 +638,10 @@ void Interpreter::exec_load_store(ThreadContext& ctx, const DecodedInst& d) {
             exec_load_store_ds(ctx, d);
             return; // exec_load_store_ds handles everything
             
+        case 31: // Extended indexed load/store (lwzx, lbzx, stwx, lwarx, stwcx, etc.)
+            exec_integer_ext31(ctx, d);
+            return;
+            
         default:
             LOGE("Unhandled load/store opcode: %d", d.opcode);
             break;

@@ -359,7 +359,10 @@ DecodedInst Decoder::decode(u32 inst) {
         }
             
         case OP_EXT31: {
-            d.xo = BITS(inst, 22, 30);
+            // X-form instructions use 10-bit XO (bits 21-30)
+            // XO-form instructions use 9-bit XO (bits 22-30), but we extract 10 bits
+            // since constants like SRD=539, SRAD=794 require 10 bits
+            d.xo = BITS(inst, 21, 30);
             
             // Handle common cases
             switch (d.xo) {
@@ -383,6 +386,7 @@ DecodedInst Decoder::decode(u32 inst) {
                 case XO31_MULLD:
                 case XO31_MULHW:
                 case XO31_MULHWU:
+                case XO31_MULHD:
                 case XO31_MULHDU:
                     d.type = DecodedInst::Type::Mul;
                     break;
@@ -539,6 +543,17 @@ DecodedInst Decoder::decode(u32 inst) {
                 case XO31_STVX:
                 case XO31_STVXL:
                     d.type = DecodedInst::Type::VLogical; // Vector store
+                    break;
+                    
+                // Atomic operations
+                case XO31_LWARX:
+                case XO31_LDARX:
+                    d.type = DecodedInst::Type::Load;  // Routed through exec_integer_ext31
+                    break;
+                    
+                case XO31_STWCX:
+                case XO31_STDCX:
+                    d.type = DecodedInst::Type::Store;  // Routed through exec_integer_ext31
                     break;
             }
             break;

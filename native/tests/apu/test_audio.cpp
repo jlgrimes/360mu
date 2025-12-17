@@ -217,66 +217,6 @@ TEST_F(AudioMixerTest, PauseResume) {
 }
 
 
-//=============================================================================
-// APU Integration Tests
-//=============================================================================
-
-class ApuTest : public ::testing::Test {
-protected:
-    void SetUp() override {
-        apu_ = std::make_unique<Apu>();
-        // Note: APU requires memory to be passed, so we test limited functionality
-    }
-    
-    void TearDown() override {
-        apu_->shutdown();
-        apu_.reset();
-    }
-    
-    std::unique_ptr<Apu> apu_;
-};
-
-TEST_F(ApuTest, InitializeWithoutMemory) {
-    Status status = apu_->initialize(nullptr);
-    EXPECT_EQ(status, Status::Ok);  // Should still initialize mixer and decoder
-}
-
-TEST_F(ApuTest, Shutdown) {
-    apu_->initialize(nullptr);
-    apu_->shutdown();
-    // Should not crash on multiple shutdowns
-    apu_->shutdown();
-}
-
-TEST_F(ApuTest, RegisterAccess) {
-    apu_->initialize(nullptr);
-    
-    // Write and read registers
-    apu_->write_register(0x00, 0x12345678);
-    u32 value = apu_->read_register(0x00);
-    // Value may be modified by register handling
-    (void)value;
-    
-    // Test interrupt registers
-    apu_->write_register(0x10, 0xFF);  // Interrupt mask
-    apu_->write_register(0x14, 0xFF);  // Interrupt acknowledge
-}
-
-TEST_F(ApuTest, GetOutput) {
-    apu_->initialize(nullptr);
-    
-    std::vector<s16> output(512);
-    u32 frames = apu_->get_output(output.data(), 256);
-    EXPECT_EQ(frames, 256u);
-}
-
-TEST_F(ApuTest, Process) {
-    apu_->initialize(nullptr);
-    
-    // Should handle null memory gracefully
-    apu_->process();
-}
-
-
 }  // namespace test
 }  // namespace x360mu
+

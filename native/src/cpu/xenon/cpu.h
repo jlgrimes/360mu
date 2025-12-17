@@ -155,7 +155,7 @@ struct ThreadContext {
 struct DecodedInst {
     u32 raw;            // Raw instruction word
     u8 opcode;          // Primary opcode (bits 0-5)
-    u8 xo;              // Extended opcode
+    u16 xo;             // Extended opcode (needs >8 bits for values like divd=489)
     u8 rd, rs, ra, rb;  // Register operands
     u8 rc;              // Record bit
     s16 simm;           // Signed immediate

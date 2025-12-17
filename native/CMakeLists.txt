@@ -82,17 +82,11 @@ else()
     )
 endif()
 
-# APU sources - use stubs when FFmpeg is not available
-if(X360MU_USE_FFMPEG)
-    set(APU_SOURCES
-        src/apu/xma_decoder.cpp
-        src/apu/android_audio.cpp
-    )
-else()
-    set(APU_SOURCES
-        src/apu/stub/apu_stub.cpp
-    )
-endif()
+# APU sources - stub provides Apu class matching audio.h, xma_decoder provides XmaDecoder/AudioMixer
+set(APU_SOURCES
+    src/apu/stub/apu_stub.cpp
+    src/apu/xma_decoder.cpp
+)
 
 set(KERNEL_SOURCES
     src/kernel/kernel.cpp

@@ -34,6 +34,7 @@ extern "C" {
 #else
 #include <cstdio>
 #define LOGI(...) printf("[AUDIO] " __VA_ARGS__); printf("\n")
+#define LOGW(...) printf("[AUDIO WARN] " __VA_ARGS__); printf("\n")
 #define LOGE(...) fprintf(stderr, "[AUDIO ERROR] " __VA_ARGS__); fprintf(stderr, "\n")
 #define LOGD(...) /* debug disabled */
 #endif
@@ -920,76 +921,6 @@ void AudioMixer::resume() {
 
 u32 AudioMixer::get_latency() const {
     return buffer_frames_;
-}
-
-//=============================================================================
-// APU Implementation
-//=============================================================================
-
-Apu::Apu() = default;
-Apu::~Apu() = default;
-
-Status Apu::initialize(Memory* memory) {
-    memory_ = memory;
-    
-    Status status = xma_decoder_.initialize();
-    if (status != Status::Ok) return status;
-    
-    status = mixer_.initialize(48000, 1024);
-    if (status != Status::Ok) return status;
-    
-    registers_.fill(0);
-    running_ = true;
-    
-    LOGI("APU initialized");
-    return Status::Ok;
-}
-
-void Apu::shutdown() {
-    running_ = false;
-    xma_decoder_.shutdown();
-    mixer_.shutdown();
-}
-
-void Apu::process() {
-    if (!running_) return;
-    xma_decoder_.process(memory_);
-}
-
-u32 Apu::get_output(s16* output, u32 frame_count) {
-    return mixer_.get_output(output, frame_count);
-}
-
-void Apu::write_register(u32 offset, u32 value) {
-    if (offset < registers_.size()) {
-        registers_[offset] = value;
-        
-        // Handle specific registers
-        switch (offset) {
-            case 0x00: // Control register
-                if (value & 1) {
-                    // Enable APU
-                }
-                break;
-            case 0x10: // Interrupt enable
-                interrupt_mask_ = value;
-                break;
-            case 0x14: // Interrupt acknowledge
-                interrupt_status_ &= ~value;
-                break;
-        }
-    }
-}
-
-u32 Apu::read_register(u32 offset) const {
-    if (offset < registers_.size()) {
-        switch (offset) {
-            case 0x10: return interrupt_mask_;
-            case 0x14: return interrupt_status_;
-            default: return registers_[offset];
-        }
-    }
-    return 0;
 }
 
 } // namespace x360mu

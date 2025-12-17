@@ -310,33 +310,35 @@ void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
             break;
             
         // --- Shifts (64-bit) ---
-        case 27: // sld
+        case 27: // sld - X-form: RS is at d.rd, RA is destination
             {
+                u64 rs = ctx.gpr[d.rd];  // Source is RS (d.rd position)
                 u32 shift = rb & 0x7F;
                 if (shift < 64) {
-                    result = ra << shift;
+                    result = rs << shift;
                 } else {
                     result = 0;
                 }
-                ctx.gpr[d.ra] = result;
+                ctx.gpr[d.ra] = result;  // Destination is RA (d.ra position)
             }
             break;
             
-        case 539: // srd
+        case 539: // srd - X-form: RS is at d.rd, RA is destination
             {
+                u64 rs = ctx.gpr[d.rd];  // Source is RS (d.rd position)
                 u32 shift = rb & 0x7F;
                 if (shift < 64) {
-                    result = ra >> shift;
+                    result = rs >> shift;
                 } else {
                     result = 0;
                 }
-                ctx.gpr[d.ra] = result;
+                ctx.gpr[d.ra] = result;  // Destination is RA (d.ra position)
             }
             break;
             
-        case 794: // srad
+        case 794: // srad - X-form: RS is at d.rd, RA is destination
             {
-                s64 val = static_cast<s64>(ra);
+                s64 val = static_cast<s64>(ctx.gpr[d.rd]);  // Source is RS (d.rd position)
                 u32 shift = rb & 0x7F;
                 if (shift == 0) {
                     result = val;
@@ -348,7 +350,7 @@ void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
                     result = (val < 0) ? 0xFFFFFFFFFFFFFFFFULL : 0;
                     ctx.xer.ca = (val < 0);
                 }
-                ctx.gpr[d.ra] = result;
+                ctx.gpr[d.ra] = result;  // Destination is RA (d.ra position)
             }
             break;
             
@@ -598,15 +600,13 @@ void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
         case 150: // stwcx. (store word conditional)
             {
                 GuestAddr addr = (d.ra ? ctx.gpr[d.ra] : 0) + ctx.gpr[d.rb];
-                if (memory_->check_reservation(addr, 4)) {
+                bool success = memory_->check_reservation(addr, 4);
+                if (success) {
                     write_u32(ctx, addr, static_cast<u32>(ctx.gpr[d.rs]));
-                    ctx.cr[0].eq = true;
-                } else {
-                    ctx.cr[0].eq = false;
                 }
-                ctx.cr[0].lt = false;
-                ctx.cr[0].gt = false;
-                ctx.cr[0].so = ctx.xer.so;
+                // Set CR0: [lt, gt, eq, so] = [0, 0, success, xer.so]
+                u8 cr0_byte = (success ? 0x2 : 0) | (ctx.xer.so ? 0x1 : 0);
+                ctx.cr[0].from_byte(cr0_byte);
                 memory_->clear_reservation();
             }
             break;
@@ -867,8 +867,9 @@ void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
             break;
     }
     
-    // Update CR0 if Rc bit set (except for compare/SPR/cache ops)
-    if (d.rc && d.xo != 0 && d.xo != 32 && d.xo < 300) {
+    // Update CR0 if Rc bit set (except for compare/SPR/cache/atomic ops that handle CR themselves)
+    // Excluded: CMP=0, CMPL=32, stwcx.=150, stdcx.=214
+    if (d.rc && d.xo != 0 && d.xo != 32 && d.xo != 150 && d.xo != 214 && d.xo < 300) {
         update_cr0(ctx, static_cast<s64>(ctx.gpr[d.rd]));
     }
 }
