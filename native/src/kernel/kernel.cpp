@@ -9,6 +9,7 @@
 #include "cpu/xenon/cpu.h"
 #include "xex_loader.h"
 #include "filesystem/vfs.h"
+#include <unordered_set>
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -210,23 +211,25 @@ void Kernel::input_stick(u32 player, u32 stick, f32 x, f32 y) {
 }
 
 void Kernel::handle_syscall(u32 ordinal, u32 module_ordinal) {
-    // Log ALL syscalls for debugging
-    static int syscall_log_count = 0;
-    if (syscall_log_count < 20) {
-        LOGI("Syscall: module=%u, ordinal=%u", module_ordinal, ordinal);
-        syscall_log_count++;
-    }
-    
+    // Log unique syscalls for debugging
+    static std::unordered_set<u64> logged_syscalls;
     u64 key = make_import_key(module_ordinal, ordinal);
+    
+    if (logged_syscalls.find(key) == logged_syscalls.end() && logged_syscalls.size() < 100) {
+        auto& ctx = cpu_->get_context(0);
+        LOGI("First call to syscall: module=%u, ordinal=%u (PC=0x%08llX)", 
+             module_ordinal, ordinal, ctx.pc);
+        logged_syscalls.insert(key);
+    }
     
     auto it = hle_functions_.find(key);
     if (it == hle_functions_.end()) {
-        static int syscall_spam_count = 0;
-        if (syscall_spam_count < 5) {
+        static std::unordered_set<u64> logged_unimpl;
+        if (logged_unimpl.find(key) == logged_unimpl.end()) {
             auto& ctx = cpu_->get_context(0);
-            LOGE("Unimplemented syscall: module=%u, ordinal=%u at PC=0x%08llX, r0=0x%llX, LR=0x%llX", 
-                 module_ordinal, ordinal, ctx.pc, ctx.gpr[0], ctx.lr);
-            syscall_spam_count++;
+            LOGE("UNIMPLEMENTED syscall: module=%u, ordinal=%u at PC=0x%08llX, LR=0x%08llX", 
+                 module_ordinal, ordinal, ctx.pc, ctx.lr);
+            logged_unimpl.insert(key);
         }
         return;
     }

@@ -1351,6 +1351,191 @@ static void HLE_XMAGetContextSampleRate(Cpu* cpu, Memory* memory, u64* args, u64
 }
 
 //=============================================================================
+// Video Display Functions (Vd*)
+// These are critical for GPU initialization!
+//=============================================================================
+
+static void HLE_VdGetCurrentDisplayGamma(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // Returns current display gamma ramp
+    // BOOL VdGetCurrentDisplayGamma(PVOID GammaRamp, DWORD Unknown)
+    GuestAddr gamma_ramp = static_cast<GuestAddr>(args[0]);
+    
+    // Return a default gamma ramp (linear 1.0)
+    if (gamma_ramp) {
+        // Gamma ramp is 256 entries per channel (R, G, B), each u16
+        for (int i = 0; i < 256; i++) {
+            u16 value = static_cast<u16>((i << 8) | i);  // Linear ramp
+            memory->write_u16(gamma_ramp + i * 2, value);         // R
+            memory->write_u16(gamma_ramp + 512 + i * 2, value);   // G
+            memory->write_u16(gamma_ramp + 1024 + i * 2, value);  // B
+        }
+    }
+    
+    *result = 1;  // Success
+    LOGI("VdGetCurrentDisplayGamma: returned linear gamma ramp");
+}
+
+static void HLE_VdGetCurrentDisplayInformation(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // BOOL VdGetCurrentDisplayInformation(PVOID DisplayInfo, DWORD InfoSize)
+    GuestAddr info = static_cast<GuestAddr>(args[0]);
+    u32 size = static_cast<u32>(args[1]);
+    
+    if (info && size >= 8) {
+        // Basic display info: width, height
+        memory->write_u32(info, 1280);      // Width
+        memory->write_u32(info + 4, 720);   // Height
+    }
+    
+    *result = 1;  // Success
+    LOGI("VdGetCurrentDisplayInformation: 1280x720");
+}
+
+static void HLE_VdGetCurrentDisplayMode(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // void VdGetCurrentDisplayMode(DWORD* Width, DWORD* Height, DWORD* RefreshRate)
+    GuestAddr width_ptr = static_cast<GuestAddr>(args[0]);
+    GuestAddr height_ptr = static_cast<GuestAddr>(args[1]);
+    GuestAddr refresh_ptr = static_cast<GuestAddr>(args[2]);
+    
+    if (width_ptr) memory->write_u32(width_ptr, 1280);
+    if (height_ptr) memory->write_u32(height_ptr, 720);
+    if (refresh_ptr) memory->write_u32(refresh_ptr, 60);
+    
+    *result = 0;  // Success
+    LOGI("VdGetCurrentDisplayMode: 1280x720 @ 60Hz");
+}
+
+static void HLE_VdInitializeEngines(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // DWORD VdInitializeEngines(DWORD Unknown1, PVOID Callback, PVOID Unknown2, PVOID Unknown3, PVOID Unknown4)
+    // This is critical for GPU initialization!
+    LOGI("VdInitializeEngines called - GPU engines initialized");
+    *result = 0;  // Success
+}
+
+static void HLE_VdInitializeRingBuffer(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // DWORD VdInitializeRingBuffer(PVOID RingBuffer, DWORD Size)
+    GuestAddr ring_buffer = static_cast<GuestAddr>(args[0]);
+    u32 size = static_cast<u32>(args[1]);
+    
+    LOGI("VdInitializeRingBuffer: buffer=0x%08X, size=0x%X", ring_buffer, size);
+    *result = 0;  // Success
+}
+
+static void HLE_VdSetDisplayMode(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // DWORD VdSetDisplayMode(DWORD Width, DWORD Height, DWORD RefreshRate, DWORD Flags)
+    u32 width = static_cast<u32>(args[0]);
+    u32 height = static_cast<u32>(args[1]);
+    u32 refresh = static_cast<u32>(args[2]);
+    
+    LOGI("VdSetDisplayMode: %ux%u @ %uHz", width, height, refresh);
+    *result = 0;  // Success
+}
+
+static void HLE_VdSetDisplayModeOverride(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // Similar to VdSetDisplayMode but overrides settings
+    *result = 0;  // Success
+}
+
+static void HLE_VdQueryVideoFlags(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // Returns video capability flags
+    // Bit 0: widescreen
+    // Bit 1: HDTV capable
+    // Bit 2: 480p
+    // Bit 3: 720p
+    // Bit 4: 1080i
+    // Bit 5: 1080p
+    *result = 0x3F;  // All features supported
+    LOGI("VdQueryVideoFlags: 0x%llX (all features)", *result);
+}
+
+static void HLE_VdQueryVideoMode(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // void VdQueryVideoMode(PVOID VideoMode)
+    GuestAddr mode_ptr = static_cast<GuestAddr>(args[0]);
+    
+    if (mode_ptr) {
+        // VIDEO_MODE structure:
+        // +0: DisplayWidth (u32)
+        // +4: DisplayHeight (u32)
+        // +8: IsInterlaced (u32)
+        // +12: IsWidescreen (u32)
+        // +16: IsHighDef (u32)
+        // +20: RefreshRate (float)
+        // +24: VideoStandard (u32)
+        // +28: Unknown (u32)
+        // +32: Unknown (u32)
+        memory->write_u32(mode_ptr + 0, 1280);    // Width
+        memory->write_u32(mode_ptr + 4, 720);     // Height
+        memory->write_u32(mode_ptr + 8, 0);       // Progressive
+        memory->write_u32(mode_ptr + 12, 1);      // Widescreen
+        memory->write_u32(mode_ptr + 16, 1);      // HighDef
+        // Write 60.0f as float
+        u32 refresh_float;
+        float refresh = 60.0f;
+        memcpy(&refresh_float, &refresh, sizeof(float));
+        memory->write_u32(mode_ptr + 20, refresh_float);
+        memory->write_u32(mode_ptr + 24, 1);      // VideoStandard (NTSC=0, PAL=1)
+    }
+    
+    *result = 0;
+    LOGI("VdQueryVideoMode: 1280x720p60");
+}
+
+static void HLE_VdSetGraphicsInterruptCallback(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // void VdSetGraphicsInterruptCallback(PVOID Callback, PVOID Context)
+    GuestAddr callback = static_cast<GuestAddr>(args[0]);
+    GuestAddr context = static_cast<GuestAddr>(args[1]);
+    
+    LOGI("VdSetGraphicsInterruptCallback: callback=0x%08X, context=0x%08X", callback, context);
+    // Store these for later use if needed
+    *result = 0;
+}
+
+static void HLE_VdIsHSIOTrainingSucceeded(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // BOOL VdIsHSIOTrainingSucceeded()
+    // Returns whether High-Speed I/O training succeeded
+    *result = 1;  // Yes
+}
+
+static void HLE_VdPersistDisplay(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // void VdPersistDisplay(PVOID Unknown1, PVOID Unknown2)
+    *result = 0;  // Success
+}
+
+static void HLE_VdRetrainEDRAMWorker(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // void VdRetrainEDRAMWorker(DWORD Unknown)
+    *result = 0;
+}
+
+static void HLE_VdRetrainEDRAM(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // void VdRetrainEDRAM(DWORD Unknown1, DWORD Unknown2, DWORD Unknown3, PVOID Unknown4, PVOID Unknown5)
+    *result = 0;
+}
+
+static void HLE_VdCallGraphicsNotificationRoutines(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // void VdCallGraphicsNotificationRoutines(DWORD Reason)
+    *result = 0;
+}
+
+static void HLE_VdEnableRingBufferRPtrWriteBack(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // void VdEnableRingBufferRPtrWriteBack(PVOID Address, DWORD BlockSize)
+    GuestAddr addr = static_cast<GuestAddr>(args[0]);
+    u32 block_size = static_cast<u32>(args[1]);
+    
+    LOGI("VdEnableRingBufferRPtrWriteBack: addr=0x%08X, blockSize=%u", addr, block_size);
+    *result = 0;
+}
+
+static void HLE_VdSwap(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // void VdSwap(...)
+    // This triggers a frame swap/present
+    *result = 0;
+}
+
+static void HLE_VdEnableDisableClockGating(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // void VdEnableDisableClockGating(BOOL Enable)
+    *result = 0;
+}
+
+//=============================================================================
 // APC (Asynchronous Procedure Calls)
 //=============================================================================
 
@@ -1490,24 +1675,59 @@ void Kernel::register_xboxkrnl_extended() {
     hle_functions_[make_import_key(0, 54)] = HLE_KeInitializeApc;
     hle_functions_[make_import_key(0, 61)] = HLE_KeInsertQueueApc;
     
-    // XMA Audio (ordinals are approximate - may need adjustment based on actual Xbox 360 SDK)
-    hle_functions_[make_import_key(0, 450)] = HLE_XMACreateContext;
-    hle_functions_[make_import_key(0, 451)] = HLE_XMADeleteContext;
-    hle_functions_[make_import_key(0, 452)] = HLE_XMASetInputBuffer;
-    hle_functions_[make_import_key(0, 453)] = HLE_XMASetOutputBuffer;
-    hle_functions_[make_import_key(0, 454)] = HLE_XMAEnableContext;
-    hle_functions_[make_import_key(0, 455)] = HLE_XMADisableContext;
-    hle_functions_[make_import_key(0, 456)] = HLE_XMAGetOutputBufferWriteOffset;
-    hle_functions_[make_import_key(0, 457)] = HLE_XMAIsInputBufferConsumed;
-    hle_functions_[make_import_key(0, 458)] = HLE_XMASetContextData;
-    hle_functions_[make_import_key(0, 459)] = HLE_XMABlockWhileInUse;
-    hle_functions_[make_import_key(0, 460)] = HLE_XMAGetContextSampleRate;
+    // Video Display Functions (Vd*) - CRITICAL for GPU initialization!
+    // These ordinals are from the official Xbox 360 kernel
+    hle_functions_[make_import_key(0, 441)] = HLE_VdGetCurrentDisplayGamma;
+    hle_functions_[make_import_key(0, 442)] = HLE_VdGetCurrentDisplayInformation;
+    hle_functions_[make_import_key(0, 444)] = HLE_VdGetCurrentDisplayMode;
+    hle_functions_[make_import_key(0, 445)] = HLE_VdEnableDisableClockGating;
+    hle_functions_[make_import_key(0, 450)] = HLE_VdInitializeEngines;  // Most critical!
+    hle_functions_[make_import_key(0, 451)] = HLE_VdInitializeRingBuffer;
+    hle_functions_[make_import_key(0, 452)] = HLE_VdEnableRingBufferRPtrWriteBack;
+    hle_functions_[make_import_key(0, 455)] = HLE_VdIsHSIOTrainingSucceeded;
+    hle_functions_[make_import_key(0, 462)] = HLE_VdPersistDisplay;
+    hle_functions_[make_import_key(0, 463)] = HLE_VdRetrainEDRAMWorker;
+    hle_functions_[make_import_key(0, 464)] = HLE_VdRetrainEDRAM;
+    hle_functions_[make_import_key(0, 465)] = HLE_VdCallGraphicsNotificationRoutines;
+    hle_functions_[make_import_key(0, 467)] = HLE_VdSetDisplayMode;
+    hle_functions_[make_import_key(0, 468)] = HLE_VdSetDisplayModeOverride;
+    hle_functions_[make_import_key(0, 469)] = HLE_VdQueryVideoFlags;
+    hle_functions_[make_import_key(0, 470)] = HLE_VdQueryVideoMode;
+    hle_functions_[make_import_key(0, 471)] = HLE_VdSetGraphicsInterruptCallback;
+    hle_functions_[make_import_key(0, 474)] = HLE_VdSwap;
+    
+    // XMA Audio Functions - CORRECT ordinals (548+)
+    hle_functions_[make_import_key(0, 548)] = HLE_XMACreateContext;
+    hle_functions_[make_import_key(0, 549)] = HLE_XMADeleteContext;
+    hle_functions_[make_import_key(0, 550)] = HLE_XMASetInputBuffer;
+    hle_functions_[make_import_key(0, 551)] = HLE_XMASetOutputBuffer;
+    hle_functions_[make_import_key(0, 552)] = HLE_XMAEnableContext;
+    hle_functions_[make_import_key(0, 553)] = HLE_XMADisableContext;
+    hle_functions_[make_import_key(0, 554)] = HLE_XMAGetOutputBufferWriteOffset;
+    hle_functions_[make_import_key(0, 555)] = HLE_XMAIsInputBufferConsumed;
+    hle_functions_[make_import_key(0, 556)] = HLE_XMASetContextData;
+    hle_functions_[make_import_key(0, 557)] = HLE_XMABlockWhileInUse;
+    hle_functions_[make_import_key(0, 558)] = HLE_XMAGetContextSampleRate;
     
     // High ordinal functions (from newer SDK versions)
-    // 2168: KeSetEventBoostPriority - sets thread boost priority when event is signaled
+    // 2168: KeSetEventBoostPriority - sets event to signaled state and boosts priority
+    // LONG KeSetEventBoostPriority(PRKEVENT Event, PRKTHREAD Thread)
+    // Returns previous signal state
     hle_functions_[make_import_key(0, 2168)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
-        // Stub - just return success, priority boost doesn't affect emulation
-        *result = 0;  // STATUS_SUCCESS
+        GuestAddr event = static_cast<GuestAddr>(args[0]);
+        
+        if (event == 0) {
+            *result = 0;
+            return;
+        }
+        
+        // Read previous signal state from dispatcher header (+4)
+        s32 prev_state = static_cast<s32>(memory->read_u32(event + 4));
+        
+        // Set event to signaled state (signal_state = 1)
+        memory->write_u32(event + 4, 1);
+        
+        *result = static_cast<u64>(prev_state);
     };
     
     // 2508: KfAcquireSpinLock - fast spinlock acquire
