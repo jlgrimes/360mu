@@ -1187,6 +1187,83 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
     // Load value to store
     load_gpr(emit, arm64::X1, inst.rs);
     
+    // Check if this is an MMIO access (GPU registers at physical 0x7FC00000-0x7FFFFFFF)
+    // MMIO addresses are physical addresses < 0x80000000 but >= 0x7FC00000
+    // Virtual addresses (0x80000000+) are NOT MMIO even after masking
+    
+    // First check: if addr >= 0x80000000, it's virtual, not MMIO
+    emit.MOV_imm(arm64::X16, 0x80000000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* is_virtual = emit.current();
+    emit.B_cond(arm64_cond::CS, 0);  // Branch if addr >= 0x80000000 (virtual, skip MMIO)
+    
+    // Second check: if addr < 0x7FC00000, it's normal physical memory, not MMIO
+    emit.MOV_imm(arm64::X16, GPU_MMIO_BASE);  // 0x7FC00000
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* not_mmio = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch if addr < 0x7FC00000 (not MMIO)
+    
+    // === MMIO PATH ===
+    // Call helper function: jit_mmio_write_XX(memory, addr, value)
+    // X0 = addr (untranslated), X1 = value
+    
+    // Save original EA to X2 before we clobber registers
+    emit.ORR(arm64::X2, arm64::XZR, arm64::X0);  // X2 = original addr
+    
+    // Load memory pointer into X0
+    emit.LDR(arm64::X0, arm64::CTX_REG, offsetof(ThreadContext, memory));
+    
+    // Setup args: X0=memory, X1=addr, X2=value
+    // Currently: X0=memory, X1=value, X2=addr
+    // Swap X1 and X2
+    emit.ORR(arm64::X16, arm64::XZR, arm64::X1);  // X16 = value (temp)
+    emit.ORR(arm64::X1, arm64::XZR, arm64::X2);   // X1 = addr
+    emit.ORR(arm64::X2, arm64::XZR, arm64::X16);  // X2 = value
+    
+    // Determine helper function based on store size
+    u64 mmio_helper = 0;
+    switch (inst.opcode) {
+        case 36: case 37: // stw/stwu
+            mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u32);
+            break;
+        case 38: case 39: // stb/stbu
+            mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u8);
+            break;
+        case 44: case 45: // sth/sthu
+            mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u16);
+            break;
+        case 62: // std/stdu
+            mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u64);
+            break;
+        case 31: // Extended stores - check xo
+            switch (inst.xo) {
+                case 151: mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u32); break; // stwx
+                case 215: mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u8); break;  // stbx
+                case 407: mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u16); break; // sthx
+                case 149: mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u64); break; // stdx
+                default:  mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u32); break;
+            }
+            break;
+        default:
+            mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u32);
+            break;
+    }
+    
+    emit.MOV_imm(arm64::X16, mmio_helper);
+    emit.BLR(arm64::X16);
+    
+    // Jump past fastmem path
+    u8* skip_fastmem = emit.current();
+    emit.B(0);
+    
+    // === FASTMEM PATH ===
+    // Patch both branches to here
+    emit.patch_branch(reinterpret_cast<u32*>(is_virtual), emit.current());
+    emit.patch_branch(reinterpret_cast<u32*>(not_mmio), emit.current());
+    
+    // Reload value since MMIO path may have clobbered X1
+    load_gpr(emit, arm64::X1, inst.rs);
+    
     // Translate virtual address to physical and add fastmem base
     emit_translate_address(emit, arm64::X0);
     
@@ -1237,6 +1314,10 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
             }
             break;
     }
+    
+    // === DONE ===
+    // Patch skip_fastmem branch to here
+    emit.patch_branch(reinterpret_cast<u32*>(skip_fastmem), emit.current());
     
     // Update RA for update forms (use saved EA from X3)
     if (is_update && inst.ra != 0) {
@@ -1834,9 +1915,10 @@ void JitCompiler::load_gpr(ARM64Emitter& emit, int arm_reg, int ppc_reg) {
 }
 
 void JitCompiler::store_gpr(ARM64Emitter& emit, int ppc_reg, int arm_reg) {
-    if (ppc_reg != 0) {
-        emit.STR(arm_reg, arm64::CTX_REG, ctx_offset_gpr(ppc_reg));
-    }
+    // Note: r0 CAN be written to as a destination register in most instructions.
+    // The "r0 = 0" special case only applies when r0 is used as a BASE register
+    // for load/store address calculation (rA field), not when it's a destination (rD).
+    emit.STR(arm_reg, arm64::CTX_REG, ctx_offset_gpr(ppc_reg));
 }
 
 void JitCompiler::load_fpr(ARM64Emitter& emit, int neon_reg, int ppc_reg) {

@@ -225,11 +225,11 @@ u32 Gpu::read_register(u32 offset) {
 }
 
 void Gpu::write_register(u32 offset, u32 value) {
-    // Log first few register writes to verify MMIO is working
+    // Log ALL register writes for debugging
     static int write_count = 0;
-    if (write_count < 20) {
-        LOGI("GPU write_register: offset=0x%04X value=0x%08X", offset, value);
-        write_count++;
+    write_count++;
+    if (write_count <= 50 || (write_count % 1000 == 0)) {
+        LOGI("GPU write_register #%d: offset=0x%04X value=0x%08X", write_count, offset, value);
     }
     
     if (offset < registers_.size()) {

@@ -335,6 +335,13 @@ Status Kernel::resolve_imports(LoadedModule& /*module*/) {
 void Kernel::install_import_thunks(const XexModule& module) {
     LOGI("Installing import thunks for %zu libraries", module.imports.size());
     
+    // Debug: Check what's at a specific problematic address BEFORE patching
+    u32 debug_addr = 0x82612520;
+    u32 before1 = memory_->read_u32(debug_addr);
+    u32 before2 = memory_->read_u32(debug_addr + 4);
+    LOGI("Before patching: [0x%08X]=0x%08X, [0x%08X]=0x%08X", 
+         debug_addr, before1, debug_addr + 4, before2);
+    
     // Thunk area base - allocate space above the loaded image
     // We'll place generated thunks here if the XEX doesn't specify thunk addresses
     GuestAddr thunk_area_base = module.base_address + module.image_size;
@@ -399,11 +406,18 @@ void Kernel::install_import_thunks(const XexModule& module) {
             // Write: sc (syscall instruction)
             // PowerPC sc: 010001 00000 00000 0000000000000010 -> 0x44000002
             memory_->write_u32(write_addr, 0x44000002);
+            GuestAddr sc_addr = write_addr;  // Remember where sc was written
             write_addr += 4;
 
             // Write: blr (branch to link register - return)
             // PowerPC blr: 010011 00000 00000 00000 0000010000 0 -> 0x4E800020
             memory_->write_u32(write_addr, 0x4E800020);
+            
+            // Log first few thunks and any near 0x82612520 for debugging
+            if (total_thunks < 5 || (thunk_addr >= 0x82612500 && thunk_addr <= 0x82612540)) {
+                LOGI("    Thunk %u: addr=0x%08X, sc_at=0x%08X, ordinal=%u, encoded=0x%08X",
+                     total_thunks, thunk_addr, sc_addr, ordinal, encoded);
+            }
             
             total_thunks++;
         }
@@ -411,6 +425,12 @@ void Kernel::install_import_thunks(const XexModule& module) {
     
     LOGI("Installed %u import thunks (thunk area: 0x%08X - 0x%08X)", 
          total_thunks, thunk_area_base, thunk_ptr);
+    
+    // Debug: Check what's at the problematic address AFTER patching
+    u32 after1 = memory_->read_u32(0x82612520);
+    u32 after2 = memory_->read_u32(0x82612524);
+    LOGI("After patching: [0x82612520]=0x%08X, [0x82612524]=0x%08X", 
+         after1, after2);
 }
 
 //=============================================================================
