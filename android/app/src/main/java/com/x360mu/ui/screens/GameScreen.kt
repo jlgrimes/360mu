@@ -28,7 +28,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.x360mu.core.NativeEmulator
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlin.math.sqrt
 
 private const val TAG = "360mu-GameScreen"
@@ -56,12 +58,16 @@ fun GameScreen(
         loadError = null
         
         try {
-            Log.i(TAG, "Calling emulator.loadGame()...")
-            val loaded = emulator.loadGame(gamePath)
+            // Load game on IO thread to avoid blocking UI
+            val loaded = withContext(Dispatchers.IO) {
+                Log.i(TAG, "Calling emulator.loadGame() on IO thread...")
+                emulator.loadGame(gamePath)
+            }
             Log.i(TAG, "loadGame returned: $loaded")
             
             if (loaded) {
                 Log.i(TAG, "Game loaded successfully, calling emulator.run()...")
+                // run() starts the emulation thread internally, so it's quick
                 val running = emulator.run()
                 Log.i(TAG, "run() returned: $running")
                 emulatorState = emulator.state.name

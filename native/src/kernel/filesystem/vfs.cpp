@@ -20,10 +20,12 @@
 #include <android/log.h>
 #define LOG_TAG "x360mu-vfs"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #else
 #include <cstdio>
 #define LOGI(...) printf(__VA_ARGS__); printf("\n")
+#define LOGD(...) printf(__VA_ARGS__); printf("\n")
 #define LOGE(...) fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n")
 #endif
 
@@ -596,12 +598,58 @@ std::string VirtualFileSystem::normalize_path(const std::string& path) {
 }
 
 bool VirtualFileSystem::parse_device(const std::string& path, std::string& device, std::string& relative) {
+    // Handle NT-style paths: \Device\Cdrom0\path or \\Device\Cdrom0\path
+    if (path.size() > 1 && (path[0] == '\\' || path[0] == '/')) {
+        std::string lower_path = path;
+        for (auto& c : lower_path) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        
+        // Check for \device\ prefix
+        size_t device_start = 0;
+        if (lower_path.find("\\device\\") == 0 || lower_path.find("/device/") == 0) {
+            device_start = 8; // Skip "\device\"
+        } else if (lower_path.find("\\\\device\\") == 0 || lower_path.find("//device/") == 0) {
+            device_start = 9; // Skip "\\device\"
+        }
+        
+        if (device_start > 0) {
+            // Find the end of device name (next slash)
+            size_t device_end = path.find_first_of("\\/", device_start);
+            if (device_end == std::string::npos) {
+                // Device name only, no file
+                device = path.substr(device_start);
+                relative = "";
+            } else {
+                device = path.substr(device_start, device_end - device_start);
+                relative = path.substr(device_end + 1);
+            }
+            
+            // Convert device name to lowercase
+            for (auto& c : device) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            
+            // Normalize slashes in relative path
+            for (auto& c : relative) {
+                if (c == '\\') {
+                    c = '/';
+                }
+            }
+            
+            LOGD("VFS parse_device (NT-style): path='%s' -> device='%s', relative='%s'", 
+                 path.c_str(), device.c_str(), relative.c_str());
+            return true;
+        }
+    }
+    
+    // Handle DOS-style paths: Device:\path
     size_t colon = path.find(':');
     if (colon == std::string::npos) {
         return false;
     }
     
-    device = path.substr(0, colon + 1);
+    device = path.substr(0, colon);
     
     // Convert device name to lowercase
     for (auto& c : device) {
@@ -625,27 +673,49 @@ bool VirtualFileSystem::parse_device(const std::string& path, std::string& devic
         }
     }
     
+    LOGD("VFS parse_device (DOS-style): path='%s' -> device='%s', relative='%s'", 
+         path.c_str(), device.c_str(), relative.c_str());
     return true;
 }
 
 VfsDevice* VirtualFileSystem::find_device(const std::string& path, std::string& relative_path) {
     std::string device_name;
     if (!parse_device(path, device_name, relative_path)) {
+        LOGD("VFS find_device: parse_device failed for '%s'", path.c_str());
         return nullptr;
     }
     
     // Find matching mount
     for (auto& mount : mounts_) {
-        std::string mount_lower = mount.mount_point;
-        for (auto& c : mount_lower) {
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        }
+        // Extract just the device name from mount point for comparison
+        // Mount point can be: \Device\Cdrom0, Cdrom0:, etc.
+        std::string mount_device;
+        std::string mount_unused;
         
-        if (mount_lower == device_name) {
-            return mount.device.get();
+        if (parse_device(mount.mount_point, mount_device, mount_unused)) {
+            // Both parsed - compare device names
+            if (mount_device == device_name) {
+                LOGD("VFS find_device: matched '%s' to mount '%s'", device_name.c_str(), mount.mount_point.c_str());
+                return mount.device.get();
+            }
+        } else {
+            // Mount point doesn't parse - try direct comparison
+            std::string mount_lower = mount.mount_point;
+            for (auto& c : mount_lower) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            
+            // Try comparing with and without prefix
+            if (mount_lower == device_name || 
+                mount_lower == "\\device\\" + device_name ||
+                mount_lower == "/device/" + device_name) {
+                LOGD("VFS find_device: matched '%s' to mount '%s' (direct)", device_name.c_str(), mount.mount_point.c_str());
+                return mount.device.get();
+            }
         }
     }
     
+    LOGD("VFS find_device: no match for device '%s'", device_name.c_str());
     return nullptr;
 }
 

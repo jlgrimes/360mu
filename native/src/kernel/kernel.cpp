@@ -8,6 +8,7 @@
 #include "memory/memory.h"
 #include "cpu/xenon/cpu.h"
 #include "xex_loader.h"
+#include "filesystem/vfs.h"
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -73,8 +74,57 @@ void Kernel::reset() {
 
 Status Kernel::load_xex(const std::string& path) {
     XexLoader loader;
+    Status status;
     
-    Status status = loader.load_file(path, memory_);
+    // Check if this is a VFS path (e.g., \Device\Cdrom0\default.xex)
+    bool is_vfs_path = (path.find("\\Device\\") == 0 || path.find("device\\") == 0);
+    
+    if (is_vfs_path && vfs_) {
+        // Read via VFS
+        LOGI("Loading XEX via VFS: %s", path.c_str());
+        
+        u32 handle;
+        status = vfs_->open_file(path, FileAccess::Read, handle);
+        if (status != Status::Ok) {
+            LOGE("Failed to open file: %s", path.c_str());
+            return status;
+        }
+        
+        // Get file size
+        u64 file_size;
+        status = vfs_->get_file_size(handle, file_size);
+        if (status != Status::Ok) {
+            vfs_->close_file(handle);
+            LOGE("Failed to get file size: %s", path.c_str());
+            return status;
+        }
+        
+        // Read file data
+        std::vector<u8> data(file_size);
+        u64 bytes_read;
+        status = vfs_->read_file(handle, data.data(), file_size, bytes_read);
+        vfs_->close_file(handle);
+        
+        if (status != Status::Ok || bytes_read != file_size) {
+            LOGE("Failed to read file: %s (read %llu of %llu)", 
+                 path.c_str(), (unsigned long long)bytes_read, (unsigned long long)file_size);
+            return Status::Error;
+        }
+        
+        // Extract filename for module name
+        std::string name = path;
+        auto pos = name.find_last_of("/\\");
+        if (pos != std::string::npos) {
+            name = name.substr(pos + 1);
+        }
+        
+        // Load from buffer
+        status = loader.load_buffer(data.data(), static_cast<u32>(file_size), name, memory_);
+    } else {
+        // Load directly from filesystem
+        status = loader.load_file(path, memory_);
+    }
+    
     if (status != Status::Ok) {
         LOGE("Failed to load XEX: %s", path.c_str());
         return status;
