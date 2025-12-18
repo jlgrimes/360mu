@@ -29,7 +29,7 @@ android {
                     "-DANDROID_STL=c++_shared",
                     "-DX360MU_ENABLE_JIT=ON",
                     "-DX360MU_USE_VULKAN=ON",
-                    "-DX360MU_USE_FFMPEG=ON"
+                    "-DX360MU_USE_FFMPEG=OFF"
                 )
             }
         }
@@ -62,6 +62,7 @@ android {
     
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     
     externalNativeBuild {

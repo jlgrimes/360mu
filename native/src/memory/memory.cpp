@@ -67,10 +67,10 @@ Status Memory::initialize() {
          main_memory_size_ / MB, main_memory_);
     
     // Initialize page table
-    u64 page_count = main_memory_size_ / memory::PAGE_SIZE;
+    u64 page_count = main_memory_size_ / memory::MEM_PAGE_SIZE;
     page_table_.resize(page_count);
     for (u64 i = 0; i < page_count; i++) {
-        page_table_[i].physical_addr = i * memory::PAGE_SIZE;
+        page_table_[i].physical_addr = i * memory::MEM_PAGE_SIZE;
         page_table_[i].flags = MemoryRegion::Read | MemoryRegion::Write;
         page_table_[i].valid = true;
     }
@@ -208,12 +208,12 @@ bool Memory::handle_fault(void* fault_addr, bool is_write) {
     if (guest_addr < main_memory_size_) {
         // Map the page
         void* page_addr = reinterpret_cast<void*>(
-            base + align_down(guest_addr, static_cast<GuestAddr>(memory::PAGE_SIZE))
+            base + align_down(guest_addr, static_cast<GuestAddr>(memory::MEM_PAGE_SIZE))
         );
         
         void* mapped = mmap(
             page_addr,
-            memory::PAGE_SIZE,
+            memory::MEM_PAGE_SIZE,
             PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
             -1, 0
@@ -431,7 +431,7 @@ Status Memory::allocate(GuestAddr base, u64 size, u32 flags) {
     std::lock_guard<std::mutex> lock(mutex_);
     
     // Check alignment
-    if (!is_aligned(base, static_cast<GuestAddr>(memory::PAGE_SIZE))) {
+    if (!is_aligned(base, static_cast<GuestAddr>(memory::MEM_PAGE_SIZE))) {
         return Status::InvalidArgument;
     }
     
@@ -441,8 +441,8 @@ Status Memory::allocate(GuestAddr base, u64 size, u32 flags) {
     }
     
     // Update page table
-    u64 start_page = base / memory::PAGE_SIZE;
-    u64 page_count = (size + memory::PAGE_SIZE - 1) / memory::PAGE_SIZE;
+    u64 start_page = base / memory::MEM_PAGE_SIZE;
+    u64 page_count = (size + memory::MEM_PAGE_SIZE - 1) / memory::MEM_PAGE_SIZE;
     
     for (u64 i = 0; i < page_count; i++) {
         page_table_[start_page + i].flags = flags;
@@ -467,8 +467,8 @@ void Memory::free(GuestAddr base) {
     for (auto it = regions_.begin(); it != regions_.end(); ++it) {
         if (it->base == base) {
             // Clear page table entries
-            u64 start_page = base / memory::PAGE_SIZE;
-            u64 page_count = (it->size + memory::PAGE_SIZE - 1) / memory::PAGE_SIZE;
+            u64 start_page = base / memory::MEM_PAGE_SIZE;
+            u64 page_count = (it->size + memory::MEM_PAGE_SIZE - 1) / memory::MEM_PAGE_SIZE;
             
             for (u64 i = 0; i < page_count; i++) {
                 page_table_[start_page + i].flags = 0;
@@ -484,8 +484,8 @@ void Memory::free(GuestAddr base) {
 Status Memory::protect(GuestAddr base, u64 size, u32 flags) {
     std::lock_guard<std::mutex> lock(mutex_);
     
-    u64 start_page = base / memory::PAGE_SIZE;
-    u64 page_count = (size + memory::PAGE_SIZE - 1) / memory::PAGE_SIZE;
+    u64 start_page = base / memory::MEM_PAGE_SIZE;
+    u64 page_count = (size + memory::MEM_PAGE_SIZE - 1) / memory::MEM_PAGE_SIZE;
     
     for (u64 i = 0; i < page_count; i++) {
         if (start_page + i < page_table_.size()) {

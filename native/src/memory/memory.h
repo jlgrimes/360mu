@@ -16,6 +16,11 @@
 
 namespace x360mu {
 
+namespace memory {
+    constexpr u32 MEM_PAGE_SIZE = 4096;
+    constexpr u32 MEM_PAGE_SHIFT = 12;
+}
+
 // MMIO handler types
 using MmioReadHandler = std::function<u32(GuestAddr addr)>;
 using MmioWriteHandler = std::function<void(GuestAddr addr, u32 value)>;

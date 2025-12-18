@@ -10,6 +10,7 @@
 #pragma once
 
 #include "x360mu/types.h"
+#include <array>
 #include <atomic>
 #include <vector>
 #include <mutex>

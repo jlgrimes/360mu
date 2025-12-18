@@ -8,6 +8,7 @@
 
 #include "x360mu/types.h"
 #include "texture.h"  // For TextureFormat, TextureDimension
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>

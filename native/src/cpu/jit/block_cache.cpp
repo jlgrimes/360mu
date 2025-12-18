@@ -38,8 +38,8 @@ namespace x360mu {
 class BlockCache {
 public:
     // Page size for SMC detection (4KB)
-    static constexpr u32 PAGE_SIZE = 4096;
-    static constexpr u32 PAGE_SHIFT = 12;
+    static constexpr u32 BLOCK_PAGE_SIZE = 4096;
+    static constexpr u32 BLOCK_PAGE_SHIFT = 12;
     
     // Maximum blocks before eviction
     static constexpr u32 MAX_BLOCKS = 16384;
@@ -106,8 +106,8 @@ public:
      * Invalidate blocks overlapping address range
      */
     void invalidate(GuestAddr addr, u32 size) {
-        GuestAddr start_page = addr >> PAGE_SHIFT;
-        GuestAddr end_page = (addr + size - 1) >> PAGE_SHIFT;
+        GuestAddr start_page = addr >> BLOCK_PAGE_SHIFT;
+        GuestAddr end_page = (addr + size - 1) >> BLOCK_PAGE_SHIFT;
         
         for (GuestAddr page = start_page; page <= end_page; page++) {
             auto it = page_blocks_.find(page);
@@ -328,8 +328,8 @@ private:
     
     // Page tracking for invalidation
     void register_pages(CompiledBlock* block) {
-        GuestAddr start_page = block->start_addr >> PAGE_SHIFT;
-        GuestAddr end_page = (block->start_addr + block->size * 4 - 1) >> PAGE_SHIFT;
+        GuestAddr start_page = block->start_addr >> BLOCK_PAGE_SHIFT;
+        GuestAddr end_page = (block->start_addr + block->size * 4 - 1) >> BLOCK_PAGE_SHIFT;
         
         for (GuestAddr page = start_page; page <= end_page; page++) {
             page_blocks_[page].push_back(block);
@@ -337,8 +337,8 @@ private:
     }
     
     void unregister_pages(CompiledBlock* block) {
-        GuestAddr start_page = block->start_addr >> PAGE_SHIFT;
-        GuestAddr end_page = (block->start_addr + block->size * 4 - 1) >> PAGE_SHIFT;
+        GuestAddr start_page = block->start_addr >> BLOCK_PAGE_SHIFT;
+        GuestAddr end_page = (block->start_addr + block->size * 4 - 1) >> BLOCK_PAGE_SHIFT;
         
         for (GuestAddr page = start_page; page <= end_page; page++) {
             auto it = page_blocks_.find(page);

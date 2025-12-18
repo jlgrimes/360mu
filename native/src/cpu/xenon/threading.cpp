@@ -99,14 +99,14 @@ GuestThread* ThreadScheduler::create_thread(GuestAddr entry_point, GuestAddr par
     
     // Allocate stack
     stack_size = std::max(stack_size, 64u * 1024u);  // Minimum 64KB
-    stack_size = align_up(stack_size, static_cast<u32>(memory::PAGE_SIZE));
+    stack_size = align_up(stack_size, static_cast<u32>(memory::MEM_PAGE_SIZE));
     
     // Find free stack space
     static GuestAddr next_stack = 0x70000000;
     thread->stack_base = next_stack;
     thread->stack_size = stack_size;
     thread->stack_limit = thread->stack_base + stack_size;
-    next_stack += stack_size + memory::PAGE_SIZE;  // Guard page
+    next_stack += stack_size + memory::MEM_PAGE_SIZE;  // Guard page
     
     // Allocate stack memory
     memory_->allocate(thread->stack_base, stack_size,

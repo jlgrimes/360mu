@@ -296,8 +296,8 @@ static void HLE_NtAllocateVirtualMemory(Cpu* cpu, Memory* memory, u64* args, u64
     u32 requested_size = memory->read_u32(region_size_ptr);
     
     // Align size to page boundary (64KB on Xbox 360)
-    u32 aligned_size = align_up(requested_size, static_cast<u32>(memory::PAGE_SIZE));
-    if (aligned_size == 0) aligned_size = memory::PAGE_SIZE;
+    u32 aligned_size = align_up(requested_size, static_cast<u32>(memory::MEM_PAGE_SIZE));
+    if (aligned_size == 0) aligned_size = memory::MEM_PAGE_SIZE;
     
     std::lock_guard<std::mutex> lock(g_hle.alloc_mutex);
     
@@ -305,7 +305,7 @@ static void HLE_NtAllocateVirtualMemory(Cpu* cpu, Memory* memory, u64* args, u64
     
     if (requested_base != 0) {
         // Caller requested specific address
-        base_addr = align_down(requested_base, static_cast<GuestAddr>(memory::PAGE_SIZE));
+        base_addr = align_down(requested_base, static_cast<GuestAddr>(memory::MEM_PAGE_SIZE));
         
         // Check if already allocated
         auto it = g_hle.virtual_allocations.find(base_addr);
@@ -331,14 +331,14 @@ static void HLE_NtAllocateVirtualMemory(Cpu* cpu, Memory* memory, u64* args, u64
             base_addr = 0x7FFF0000 - aligned_size;  // Top-down allocation
         } else {
             base_addr = g_hle.next_virtual_addr;
-            g_hle.next_virtual_addr += aligned_size + memory::PAGE_SIZE;  // Leave gap
+            g_hle.next_virtual_addr += aligned_size + memory::MEM_PAGE_SIZE;  // Leave gap
         }
     }
     
     // Ensure address is within valid range
     if (base_addr + aligned_size > memory::MAIN_MEMORY_SIZE) {
         // Try a different region
-        base_addr = 0x40000000 + (g_hle.virtual_allocations.size() * memory::PAGE_SIZE);
+        base_addr = 0x40000000 + (g_hle.virtual_allocations.size() * memory::MEM_PAGE_SIZE);
     }
     
     // Perform allocation
@@ -442,7 +442,7 @@ static void HLE_NtQueryVirtualMemory(Cpu* cpu, Memory* memory, u64* args, u64* r
     memory->write_u32(info_ptr + 0, base_addr);
     memory->write_u32(info_ptr + 4, 0);
     memory->write_u32(info_ptr + 8, 0);
-    memory->write_u32(info_ptr + 12, memory::PAGE_SIZE);
+    memory->write_u32(info_ptr + 12, memory::MEM_PAGE_SIZE);
     memory->write_u32(info_ptr + 16, 0);  // MEM_FREE
     memory->write_u32(info_ptr + 20, 0);
     memory->write_u32(info_ptr + 24, 0);

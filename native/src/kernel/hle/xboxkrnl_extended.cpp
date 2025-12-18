@@ -147,12 +147,12 @@ static void HLE_MmAllocatePhysicalMemory(Cpu* cpu, Memory* memory, u64* args, u6
     u32 protect = static_cast<u32>(args[2]);
     
     // Align to page size
-    size = align_up(size, static_cast<u32>(memory::PAGE_SIZE));
+    size = align_up(size, static_cast<u32>(memory::MEM_PAGE_SIZE));
     
     std::lock_guard<std::mutex> lock(g_ext_hle.phys_mutex);
     
     GuestAddr addr = g_ext_hle.next_physical_addr;
-    g_ext_hle.next_physical_addr += size + memory::PAGE_SIZE;  // Leave gap
+    g_ext_hle.next_physical_addr += size + memory::MEM_PAGE_SIZE;  // Leave gap
     
     // Perform allocation
     u32 mem_flags = MemoryRegion::Read | MemoryRegion::Write;
@@ -187,7 +187,7 @@ static void HLE_MmAllocatePhysicalMemoryEx(Cpu* cpu, Memory* memory, u64* args, 
     GuestAddr max_addr = static_cast<GuestAddr>(args[4]);
     u32 alignment = static_cast<u32>(args[5]);
     
-    if (alignment == 0) alignment = memory::PAGE_SIZE;
+    if (alignment == 0) alignment = memory::MEM_PAGE_SIZE;
     size = align_up(size, alignment);
     
     std::lock_guard<std::mutex> lock(g_ext_hle.phys_mutex);
@@ -203,7 +203,7 @@ static void HLE_MmAllocatePhysicalMemoryEx(Cpu* cpu, Memory* memory, u64* args, 
         addr = align_up(min_addr, static_cast<GuestAddr>(alignment));
     }
     
-    g_ext_hle.next_physical_addr = addr + size + memory::PAGE_SIZE;
+    g_ext_hle.next_physical_addr = addr + size + memory::MEM_PAGE_SIZE;
     
     u32 mem_flags = MemoryRegion::Read | MemoryRegion::Write;
     if (protect & 0x10) mem_flags |= MemoryRegion::Execute;
@@ -325,7 +325,7 @@ static void HLE_MmQueryStatistics(Cpu* cpu, Memory* memory, u64* args, u64* resu
     memory->write_u32(stats_ptr + 24, 0);               // ImagePages
     memory->write_u32(stats_ptr + 28, 0);               // HeapPages
     memory->write_u32(stats_ptr + 32, 0);               // VirtualMappedPages
-    memory->write_u32(stats_ptr + 36, memory::PAGE_SIZE); // PageSize
+    memory->write_u32(stats_ptr + 36, memory::MEM_PAGE_SIZE); // PageSize
     
     *result = STATUS_SUCCESS;
 }
@@ -355,10 +355,10 @@ static void HLE_ExCreateThread(Cpu* cpu, Memory* memory, u64* args, u64* result)
     
     // Default stack size
     if (stack_size == 0) stack_size = 64 * KB;
-    stack_size = align_up(stack_size, static_cast<u32>(memory::PAGE_SIZE));
+    stack_size = align_up(stack_size, static_cast<u32>(memory::MEM_PAGE_SIZE));
     
     // Allocate stack
-    GuestAddr stack_base = 0x70000000 + (g_ext_hle.threads.size() * (stack_size + memory::PAGE_SIZE));
+    GuestAddr stack_base = 0x70000000 + (g_ext_hle.threads.size() * (stack_size + memory::MEM_PAGE_SIZE));
     memory->allocate(stack_base, stack_size, MemoryRegion::Read | MemoryRegion::Write);
     
     // Generate IDs
