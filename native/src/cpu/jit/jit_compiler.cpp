@@ -47,6 +47,18 @@ extern "C" void jit_mmio_write_u16(void* mem, GuestAddr addr, u16 value) {
     static_cast<Memory*>(mem)->write_u16(addr, value);
 }
 
+// Debug helper to trace store addresses
+extern "C" void jit_trace_store(GuestAddr addr) {
+    static int trace_count = 0;
+    // Log stores to GPU-ish range
+    if (addr >= 0x7F000000 && addr < 0x80000000) {
+        if (trace_count < 20) {
+            LOGI("Store to potential MMIO: addr=0x%08llX", (unsigned long long)addr);
+            trace_count++;
+        }
+    }
+}
+
 extern "C" void jit_mmio_write_u32(void* mem, GuestAddr addr, u32 value) {
     static int call_count = 0;
     if (call_count < 10) {
@@ -1152,11 +1164,11 @@ void JitCompiler::compile_load(ARM64Emitter& emit, const DecodedInst& inst) {
 }
 
 void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
-    // Debug: Log first store compilation
+    // Debug: Log stores that might be MMIO related (addresses < 0x80000000 or containing 0x7FC)
     static int store_compile_count = 0;
     if (store_compile_count < 3) {
-        LOGI("Compiling store #%d: opcode=%d, fastmem_enabled=%d, fastmem_base=%p",
-             store_compile_count, inst.opcode, fastmem_enabled_ ? 1 : 0, fastmem_base_);
+        LOGI("Compiling store #%d: opcode=%d, ra=%d, simm=0x%04X, fastmem=%d",
+             store_compile_count, inst.opcode, inst.ra, (u16)inst.simm, fastmem_enabled_ ? 1 : 0);
         store_compile_count++;
     }
     
@@ -1695,11 +1707,8 @@ void JitCompiler::compile_syscall(ARM64Emitter& emit, const DecodedInst& inst) {
     emit.MOV_imm(arm64::X0, 1);
     emit.STRB(arm64::X0, arm64::CTX_REG, offsetof(ThreadContext, interrupted));
     
-    // Store current PC for syscall handler
-    // PC should point to instruction after syscall
-    // (already incremented by block compiler)
-    
     // Return from block to handle syscall
+    // Note: PC is NOT updated here - the dispatcher will handle PC advancement
     emit_block_epilogue(emit);
 }
 

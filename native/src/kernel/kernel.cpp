@@ -210,6 +210,13 @@ void Kernel::input_stick(u32 player, u32 stick, f32 x, f32 y) {
 }
 
 void Kernel::handle_syscall(u32 ordinal, u32 module_ordinal) {
+    // Log ALL syscalls for debugging
+    static int syscall_log_count = 0;
+    if (syscall_log_count < 20) {
+        LOGI("Syscall: module=%u, ordinal=%u", module_ordinal, ordinal);
+        syscall_log_count++;
+    }
+    
     u64 key = make_import_key(module_ordinal, ordinal);
     
     auto it = hle_functions_.find(key);

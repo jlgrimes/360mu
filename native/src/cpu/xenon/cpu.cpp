@@ -154,6 +154,14 @@ void Cpu::dispatch_syscall(ThreadContext& ctx) {
     u32 ordinal = ctx.gpr[0] & 0xFFFF;
     u32 module = (ctx.gpr[0] >> 16) & 0xFF;
     
+    // Debug: Log syscall dispatch
+    static int dispatch_count = 0;
+    if (dispatch_count < 10) {
+        LOGI("dispatch_syscall: r0=0x%llX -> module=%u, ordinal=%u, PC=0x%llX",
+             ctx.gpr[0], module, ordinal, ctx.pc);
+        dispatch_count++;
+    }
+    
     if (kernel_) {
         kernel_->handle_syscall(ordinal, module);
     } else {
