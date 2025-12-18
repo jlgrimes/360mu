@@ -341,6 +341,14 @@ int ThreadScheduler::priority_to_queue_index(ThreadPriority priority) const {
 u64 ThreadScheduler::run(u64 cycles) {
     u64 total_executed = 0;
     
+    // #region agent log - NEW HYPOTHESIS G: Check if scheduler is running threads
+    static int sched_log = 0;
+    if (sched_log++ < 10) {
+        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+        if (f) { fprintf(f, "{\"hypothesisId\":\"G\",\"location\":\"threading.cpp:run\",\"message\":\"scheduler run\",\"data\":{\"call\":%d,\"cycles\":%llu,\"num_host_threads\":%u,\"has_cpu\":%d}}\n", sched_log, (unsigned long long)cycles, num_host_threads_, cpu_!=nullptr); fclose(f); }
+    }
+    // #endregion
+    
     // If we have host threads running, they manage current_thread via hw_thread_main.
     // We just need to wake them up and let them handle thread scheduling.
     // Only manually set current_thread if no host threads are running for hw thread 0.

@@ -198,15 +198,21 @@ void CommandProcessor::write_register(u32 index, u32 value) {
 }
 
 bool CommandProcessor::process(GuestAddr ring_base, u32 ring_size, u32& read_ptr, u32 write_ptr) {
-    // #region agent log
+    // #region agent log - Hypothesis C: Check if commands are being processed
     static int cp_log_count = 0;
-    if (cp_log_count++ < 10) {
+    cp_log_count++;
+    bool has_commands = (read_ptr != write_ptr);
+    if (cp_log_count <= 20 || (has_commands && cp_log_count <= 100)) {
         FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"D\",\"location\":\"command_processor.cpp:process\",\"message\":\"CP process called\",\"data\":{\"ring_base\":%u,\"ring_size\":%u,\"read_ptr\":%u,\"write_ptr\":%u}}\n", ring_base, ring_size, read_ptr, write_ptr); fclose(f); }
+        if (f) { fprintf(f, "{\"hypothesisId\":\"C\",\"location\":\"command_processor.cpp:process\",\"message\":\"CP process entry\",\"data\":{\"call\":%d,\"ring_base\":%u,\"ring_size\":%u,\"read_ptr\":%u,\"write_ptr\":%u,\"has_commands\":%d}}\n", cp_log_count, ring_base, ring_size, read_ptr, write_ptr, has_commands); fclose(f); }
     }
     // #endregion
     
     frame_complete_ = false;
+    
+    // #region agent log - Hypothesis C: Track packets processed
+    u32 packets_in_this_call = 0;
+    // #endregion
     
     // Process packets until read catches up to write
     while (read_ptr != write_ptr) {
@@ -225,11 +231,20 @@ bool CommandProcessor::process(GuestAddr ring_base, u32 ring_size, u32& read_ptr
         // Advance read pointer (with wrap)
         read_ptr = (read_ptr + packets_consumed) % ring_size;
         packets_processed_++;
+        packets_in_this_call++;
         
         if (frame_complete_) {
             break;
         }
     }
+    
+    // #region agent log - Hypothesis C: Log packets processed count
+    static int cp_exit_log = 0;
+    if (cp_exit_log++ < 20 || packets_in_this_call > 0) {
+        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+        if (f) { fprintf(f, "{\"hypothesisId\":\"C\",\"location\":\"command_processor.cpp:process_exit\",\"message\":\"CP process done\",\"data\":{\"packets_processed\":%u,\"frame_complete\":%d,\"total_packets\":%llu}}\n", packets_in_this_call, frame_complete_, packets_processed_); fclose(f); }
+    }
+    // #endregion
     
     return frame_complete_;
 }

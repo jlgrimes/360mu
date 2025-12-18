@@ -235,9 +235,24 @@ u8* JitCompiler::get_memory_base() const {
 u64 JitCompiler::execute(ThreadContext& ctx, u64 cycles) {
     u64 cycles_executed = 0;
     
+    // #region agent log - NEW HYPOTHESIS I: Check JIT execution path
+    static int jit_exec_log = 0;
+    if (jit_exec_log++ < 30) {
+        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+        if (f) { fprintf(f, "{\"hypothesisId\":\"I\",\"location\":\"jit_compiler.cpp:execute\",\"message\":\"JIT execute entry\",\"data\":{\"call\":%d,\"fastmem_enabled\":%d,\"has_dispatcher\":%d,\"pc_before\":%u}}\n", jit_exec_log, fastmem_enabled_, dispatcher_!=nullptr, (u32)ctx.pc); fclose(f); }
+    }
+    // #endregion
+    
 #ifdef __aarch64__
     // JIT requires fastmem to be enabled - without it, memory accesses will crash
     if (!fastmem_enabled_) {
+        // #region agent log - Hypothesis I: fastmem not enabled
+        static int no_fastmem_log = 0;
+        if (no_fastmem_log++ < 5) {
+            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+            if (f) { fprintf(f, "{\"hypothesisId\":\"I\",\"location\":\"jit_compiler.cpp:execute\",\"message\":\"FASTMEM NOT ENABLED - falling back\",\"data\":{}}\n"); fclose(f); }
+        }
+        // #endregion
         // Return 0 to signal CPU should fall back to interpreter
         // Don't set interrupted - that's for syscalls
         return 0;
@@ -247,6 +262,11 @@ u64 JitCompiler::execute(ThreadContext& ctx, u64 cycles) {
     if (dispatcher_) {
         ctx.running = true;
         ctx.interrupted = false;
+        
+        // #region agent log - Hypothesis I: About to enter block loop
+        static int loop_entry_log = 0;
+        GuestAddr start_pc = ctx.pc;
+        // #endregion
         
         // Store cycle limit in context or use register
         while (ctx.running && !ctx.interrupted && cycles_executed < cycles) {
@@ -258,12 +278,56 @@ u64 JitCompiler::execute(ThreadContext& ctx, u64 cycles) {
                 break;
             }
             
+            // #region agent log - Hypothesis I: Block compiled, about to execute
+            static int block_exec_log = 0;
+            GuestAddr pc_before = ctx.pc;
+            if (block_exec_log++ < 20) {
+                FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+                if (f) { fprintf(f, "{\"hypothesisId\":\"I\",\"location\":\"jit_compiler.cpp:execute\",\"message\":\"executing block\",\"data\":{\"block_num\":%d,\"pc\":%u,\"block_size\":%u}}\n", block_exec_log, (u32)ctx.pc, block->size); fclose(f); }
+            }
+            // #endregion
+            
             // Execute the block
             using BlockFn = void(*)(ThreadContext*, u8*);
             BlockFn fn = reinterpret_cast<BlockFn>(block->code);
             
             // Execute the block (fastmem_base is now embedded in block code)
             fn(&ctx, nullptr);
+            
+            // #region agent log - Hypothesis I: After block execution
+            if (block_exec_log <= 20) {
+                FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+                if (f) { fprintf(f, "{\"hypothesisId\":\"I\",\"location\":\"jit_compiler.cpp:execute\",\"message\":\"after block\",\"data\":{\"pc_before\":%u,\"pc_after\":%u,\"running\":%d,\"interrupted\":%d}}\n", (u32)pc_before, (u32)ctx.pc, ctx.running, ctx.interrupted); fclose(f); }
+            }
+            // #endregion
+            
+            // #region agent log - Hypothesis K: Detect and BREAK spin loops in JIT
+            static GuestAddr jit_last_pc = 0;
+            static int jit_spin_count = 0;
+            if (ctx.pc == pc_before) {
+                jit_spin_count++;
+                if (jit_spin_count == 50 || jit_spin_count == 500 || jit_spin_count == 5000) {
+                    FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+                    if (f) { fprintf(f, "{\"hypothesisId\":\"K\",\"location\":\"jit_compiler.cpp:execute\",\"message\":\"JIT SPIN LOOP\",\"data\":{\"pc\":%u,\"count\":%d,\"r3\":%llu,\"r4\":%llu,\"r5\":%llu}}\n", (u32)ctx.pc, jit_spin_count, ctx.gpr[3], ctx.gpr[4], ctx.gpr[5]); fclose(f); }
+                }
+                
+                // FIX: Break out of spin loops after 10000 iterations
+                // This allows games to proceed past initialization busy-waits
+                if (jit_spin_count >= 10000) {
+                    static int break_log = 0;
+                    if (break_log++ < 20) {
+                        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+                        if (f) { fprintf(f, "{\"hypothesisId\":\"FIX\",\"location\":\"jit_compiler.cpp:execute\",\"message\":\"BREAKING SPIN LOOP\",\"data\":{\"pc\":%u}}\n", (u32)ctx.pc); fclose(f); }
+                    }
+                    // Advance PC past the loop instruction to break out
+                    ctx.pc += 4;
+                    jit_spin_count = 0;
+                }
+            } else {
+                jit_spin_count = 0;
+            }
+            jit_last_pc = ctx.pc;
+            // #endregion
             
             cycles_executed += block->size;
             block->execution_count++;
@@ -1215,37 +1279,47 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
     // Load value to store
     load_gpr(emit, arm64::X1, inst.rs);
     
-    // Check if this is an MMIO access (GPU registers at physical 0x7FC00000-0x7FFFFFFF)
-    // MMIO addresses are physical addresses < 0x80000000 but >= 0x7FC00000
-    // Virtual addresses (0x80000000+) are NOT MMIO even after masking
+    // Save original virtual address for MMIO path (X2 = original EA)
+    emit.ORR(arm64::X2, arm64::XZR, arm64::X0);
     
-    // First check: if addr >= 0x80000000, it's virtual, not MMIO
+    // === FIX: Check MMIO AFTER address translation ===
+    // First translate virtual to physical (without adding fastmem base)
+    // Virtual addresses 0x80000000-0x9FFFFFFF map to physical by &0x1FFFFFFF
     emit.MOV_imm(arm64::X16, 0x80000000ULL);
     emit.CMP(arm64::X0, arm64::X16);
-    u8* is_virtual = emit.current();
-    emit.B_cond(arm64_cond::CS, 0);  // Branch if addr >= 0x80000000 (virtual, skip MMIO)
+    u8* not_virtual = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch if addr < 0x80000000 (already physical)
     
-    // Second check: if addr < 0x7FC00000, it's normal physical memory, not MMIO
+    // It's virtual - check if in translatable range (0x80000000-0x9FFFFFFF)
+    emit.MOV_imm(arm64::X16, 0xA0000000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* above_virtual = emit.current();
+    emit.B_cond(arm64_cond::CS, 0);  // Branch if addr >= 0xA0000000 (not in usermode virtual)
+    
+    // Translate: physical = virtual & 0x1FFFFFFF
+    emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
+    emit.AND(arm64::X0, arm64::X0, arm64::X16);
+    
+    // Patch branches to continue here
+    emit.patch_branch(reinterpret_cast<u32*>(not_virtual), emit.current());
+    emit.patch_branch(reinterpret_cast<u32*>(above_virtual), emit.current());
+    
+    // Now X0 = physical address - check if it's in GPU MMIO range (0x7FC00000-0x7FFFFFFF)
     emit.MOV_imm(arm64::X16, GPU_MMIO_BASE);  // 0x7FC00000
     emit.CMP(arm64::X0, arm64::X16);
     u8* not_mmio = emit.current();
-    emit.B_cond(arm64_cond::CC, 0);  // Branch if addr < 0x7FC00000 (not MMIO)
+    emit.B_cond(arm64_cond::CC, 0);  // Branch if phys < 0x7FC00000 (not MMIO)
     
     // === MMIO PATH ===
-    // Call helper function: jit_mmio_write_XX(memory, addr, value)
-    // X0 = addr (untranslated), X1 = value
-    
-    // Save original EA to X2 before we clobber registers
-    emit.ORR(arm64::X2, arm64::XZR, arm64::X0);  // X2 = original addr
+    // Call helper function with ORIGINAL virtual address (X2)
+    // jit_mmio_write_XX(memory, addr, value) - Memory class will handle MMIO routing
     
     // Load memory pointer into X0
     emit.LDR(arm64::X0, arm64::CTX_REG, offsetof(ThreadContext, memory));
     
-    // Setup args: X0=memory, X1=addr, X2=value
-    // Currently: X0=memory, X1=value, X2=addr
-    // Swap X1 and X2
+    // Setup args: X0=memory, X1=addr (original virtual), X2=value
     emit.ORR(arm64::X16, arm64::XZR, arm64::X1);  // X16 = value (temp)
-    emit.ORR(arm64::X1, arm64::XZR, arm64::X2);   // X1 = addr
+    emit.ORR(arm64::X1, arm64::XZR, arm64::X2);   // X1 = original addr (from X2)
     emit.ORR(arm64::X2, arm64::XZR, arm64::X16);  // X2 = value
     
     // Determine helper function based on store size
@@ -1285,11 +1359,10 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
     emit.B(0);
     
     // === FASTMEM PATH ===
-    // Patch both branches to here
-    emit.patch_branch(reinterpret_cast<u32*>(is_virtual), emit.current());
     emit.patch_branch(reinterpret_cast<u32*>(not_mmio), emit.current());
     
-    // Reload value since MMIO path may have clobbered X1
+    // Reload original EA and value since we may have clobbered registers
+    emit.ORR(arm64::X0, arm64::XZR, arm64::X2);  // Restore original EA from X2
     load_gpr(emit, arm64::X1, inst.rs);
     
     // Translate virtual address to physical and add fastmem base

@@ -113,6 +113,14 @@ void Cpu::execute(u64 cycles) {
 void Cpu::execute_thread(u32 thread_id, u64 cycles) {
     ThreadContext& ctx = contexts_[thread_id];
     
+    // #region agent log - NEW HYPOTHESIS H: Check if CPU is executing
+    static int exec_log = 0;
+    if (exec_log++ < 20) {
+        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+        if (f) { fprintf(f, "{\"hypothesisId\":\"H\",\"location\":\"cpu.cpp:execute_thread\",\"message\":\"execute_thread called\",\"data\":{\"call\":%d,\"thread_id\":%u,\"running\":%d,\"pc\":%u,\"cycles\":%llu}}\n", exec_log, thread_id, ctx.running, (u32)ctx.pc, (unsigned long long)cycles); fclose(f); }
+    }
+    // #endregion
+    
     if (!ctx.running) {
         return;
     }
@@ -153,6 +161,14 @@ void Cpu::dispatch_syscall(ThreadContext& ctx) {
     // This encoding is set up by the import thunks (Task A.4)
     u32 ordinal = ctx.gpr[0] & 0xFFFF;
     u32 module = (ctx.gpr[0] >> 16) & 0xFF;
+    
+    // #region agent log - HYPOTHESIS L: Check syscalls being made
+    static int syscall_log = 0;
+    if (syscall_log++ < 50) {
+        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+        if (f) { fprintf(f, "{\"hypothesisId\":\"L\",\"location\":\"cpu.cpp:dispatch_syscall\",\"message\":\"SYSCALL\",\"data\":{\"call\":%d,\"r0\":%llu,\"module\":%u,\"ordinal\":%u,\"pc\":%u}}\n", syscall_log, ctx.gpr[0], module, ordinal, (u32)ctx.pc); fclose(f); }
+    }
+    // #endregion
     
     // Debug: Log syscall dispatch
     static int dispatch_count = 0;

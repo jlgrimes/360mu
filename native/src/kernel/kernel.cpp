@@ -246,6 +246,17 @@ void Kernel::handle_syscall(u32 ordinal, u32 module_ordinal) {
                  module_ordinal, ordinal, ctx.pc, ctx.lr);
             logged_unimpl.insert(key);
         }
+        // FIX: Set return value to STATUS_SUCCESS so game doesn't retry in infinite loop
+        auto& ctx = cpu_->get_context(0);
+        ctx.gpr[3] = 0;  // STATUS_SUCCESS
+        
+        // #region agent log - Log unimplemented syscall return
+        static int unimpl_log = 0;
+        if (unimpl_log++ < 20) {
+            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+            if (f) { fprintf(f, "{\"hypothesisId\":\"FIX\",\"location\":\"kernel.cpp:handle_syscall\",\"message\":\"UNIMPL SYSCALL returning SUCCESS\",\"data\":{\"module\":%u,\"ordinal\":%u}}\n", module_ordinal, ordinal); fclose(f); }
+        }
+        // #endregion
         return;
     }
     

@@ -421,6 +421,14 @@ void Emulator::emulation_thread_main() {
         bool frame_complete = false;
         u32 cpu_batches = 0;
         
+        // #region agent log - Hypothesis B: Check if emulation loop is running
+        static int emu_loop_log = 0;
+        if (emu_loop_log++ < 20) {
+            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+            if (f) { fprintf(f, "{\"hypothesisId\":\"B\",\"location\":\"emulator.cpp:frame_start\",\"message\":\"starting frame\",\"data\":{\"iteration\":%d}}\n", emu_loop_log); fclose(f); }
+        }
+        // #endregion
+        
         while (!frame_complete && !emu_thread_->paused && !emu_thread_->should_stop) {
             // Execute via scheduler - this wakes host threads that run guest threads
             scheduler_->run(cpu::CLOCK_SPEED / 60 / 100); // ~1/100th of a frame
