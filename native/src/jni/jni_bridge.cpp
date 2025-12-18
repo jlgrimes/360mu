@@ -80,7 +80,7 @@ Java_com_x360mu_core_NativeEmulator_nativeInitialize(
     config.data_path = jstring_to_string(env, dataPath);
     config.cache_path = jstring_to_string(env, cachePath);
     config.save_path = jstring_to_string(env, savePath);
-    config.enable_jit = enableJit;
+    config.enable_jit = enableJit;  // Re-enabled for debugging
     config.use_vulkan = enableVulkan;
     
     LOGI("Initializing emulator:");

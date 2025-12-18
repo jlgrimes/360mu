@@ -256,6 +256,9 @@ Status Emulator::run() {
     
     LOGI("Starting emulation");
     
+    // Prepare the entry point (start main thread)
+    kernel_->prepare_entry();
+    
     // Start emulation thread if not already started
     if (!emu_thread_->thread.joinable()) {
         emu_thread_->should_stop = false;
@@ -386,6 +389,9 @@ void Emulator::emulation_thread_main() {
         
         // Execute one frame
         auto frame_start = Clock::now();
+        
+        // Start new frame - reset frame_complete flag
+        gpu_->begin_new_frame();
         
         // Run CPU until GPU signals frame complete
         // This is a simplified version - real implementation needs proper synchronization

@@ -26,7 +26,7 @@ class VirtualFileSystem;
  */
 struct EmulatorConfig {
     // CPU settings
-    bool enable_jit = true;
+    bool enable_jit = true;  // Re-enabled for debugging
     u32 jit_cache_size_mb = 128;
     
     // GPU settings

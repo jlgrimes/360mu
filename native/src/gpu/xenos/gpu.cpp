@@ -225,6 +225,13 @@ u32 Gpu::read_register(u32 offset) {
 }
 
 void Gpu::write_register(u32 offset, u32 value) {
+    // Log first few register writes to verify MMIO is working
+    static int write_count = 0;
+    if (write_count < 20) {
+        LOGI("GPU write_register: offset=0x%04X value=0x%08X", offset, value);
+        write_count++;
+    }
+    
     if (offset < registers_.size()) {
         registers_[offset] = value;
         
@@ -232,7 +239,7 @@ void Gpu::write_register(u32 offset, u32 value) {
         switch (offset) {
             case xenos_reg::CP_RB_BASE:
                 ring_buffer_base_ = value;
-                LOGD("Ring buffer base: %08X", value);
+                LOGI("Ring buffer base set: 0x%08X", value);
                 break;
                 
             case xenos_reg::CP_RB_CNTL:

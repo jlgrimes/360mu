@@ -153,7 +153,7 @@ Status Memory::setup_fastmem() {
         return Status::Error;
     }
     
-    // Copy initial memory content
+    // Copy initial memory content to physical region (0x00000000)
     memcpy(fastmem_base_, main_memory_, main_memory_size_);
     
     // Install signal handler for page faults

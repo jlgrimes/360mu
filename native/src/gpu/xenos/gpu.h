@@ -330,6 +330,11 @@ public:
     bool frame_complete() const { return frame_complete_; }
     
     /**
+     * Start a new frame (clears frame_complete flag)
+     */
+    void begin_new_frame() { frame_complete_ = false; }
+    
+    /**
      * Present the frame
      */
     void present();

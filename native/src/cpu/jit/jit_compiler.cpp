@@ -48,6 +48,11 @@ extern "C" void jit_mmio_write_u16(void* mem, GuestAddr addr, u16 value) {
 }
 
 extern "C" void jit_mmio_write_u32(void* mem, GuestAddr addr, u32 value) {
+    static int call_count = 0;
+    if (call_count < 10) {
+        LOGI("MMIO write_u32: addr=0x%08X value=0x%08X", addr, value);
+        call_count++;
+    }
     static_cast<Memory*>(mem)->write_u32(addr, value);
 }
 
@@ -1033,13 +1038,39 @@ void JitCompiler::compile_load(ARM64Emitter& emit, const DecodedInst& inst) {
     bool is_indexed = (inst.opcode == 31);
     
     if (!is_indexed) {
-        calc_ea(emit, arm64::X0, inst.ra, inst.simm);
+        // For DS-form instructions (opcodes 58, 62), low 2 bits are sub-opcode, not offset
+        s32 offset = inst.simm;
+        if (inst.opcode == 58 || inst.opcode == 62) {
+            offset &= ~3;  // Mask off sub-opcode bits
+        }
+        calc_ea(emit, arm64::X0, inst.ra, offset);
     } else {
         calc_ea_indexed(emit, arm64::X0, inst.ra, inst.rb);
     }
     
-    // Add memory base for fastmem
+    // Translate virtual address to physical for fastmem
+    // Xbox 360: addresses 0x80000000-0x9FFFFFFF map to 0x00000000-0x1FFFFFFF
     if (fastmem_enabled_) {
+        // if (addr >= 0x80000000 && addr < 0xA0000000) addr &= 0x1FFFFFFF
+        emit.MOV_imm(arm64::X16, 0x80000000ULL);
+        emit.CMP(arm64::X0, arm64::X16);
+        u8* skip_translate = emit.current();
+        emit.B_cond(arm64_cond::CC, 0);  // Skip if addr < 0x80000000 (CC = unsigned lower)
+        
+        emit.MOV_imm(arm64::X16, 0xA0000000ULL);
+        emit.CMP(arm64::X0, arm64::X16);
+        u8* skip_translate2 = emit.current();
+        emit.B_cond(arm64_cond::CS, 0);  // Skip if addr >= 0xA0000000 (CS = unsigned higher or same)
+        
+        // In range: mask off top bits
+        emit.AND_imm(arm64::X0, arm64::X0, 0x1FFFFFFFULL);
+        
+        u8* done_translate = emit.current();
+        // Patch the skip branches to jump here
+        emit.patch_branch(reinterpret_cast<u32*>(skip_translate), done_translate);
+        emit.patch_branch(reinterpret_cast<u32*>(skip_translate2), done_translate);
+        
+        // Add fastmem base
         emit.ADD(arm64::X0, arm64::X0, arm64::MEM_BASE);
     }
     
@@ -1131,7 +1162,12 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
     bool is_indexed = (inst.opcode == 31);
     
     if (!is_indexed) {
-        calc_ea(emit, arm64::X0, inst.ra, inst.simm);
+        // For DS-form instructions (opcodes 58, 62), low 2 bits are sub-opcode, not offset
+        s32 offset = inst.simm;
+        if (inst.opcode == 58 || inst.opcode == 62) {
+            offset &= ~3;  // Mask off sub-opcode bits
+        }
+        calc_ea(emit, arm64::X0, inst.ra, offset);
     } else {
         calc_ea_indexed(emit, arm64::X0, inst.ra, inst.rb);
     }
@@ -1139,136 +1175,88 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
     // Load value to store
     load_gpr(emit, arm64::X1, inst.rs);
     
-    // Determine store size for MMIO path
-    int store_size = 4; // Default to 32-bit
-    void* mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u32);
-    
-    switch (inst.opcode) {
-        case 36: case 37: // stw, stwu
-            store_size = 4;
-            mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u32);
-            break;
-        case 38: case 39: // stb, stbu
-            store_size = 1;
-            mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u8);
-            break;
-        case 44: case 45: // sth, sthu
-            store_size = 2;
-            mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u16);
-            break;
-        case 52: case 53: case 54: case 55: case 62: // stfs, stfsu, stfd, stfdu, std
-            store_size = 8;
-            mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u64);
-            break;
-        case 31: // Extended stores
-            switch (inst.xo) {
-                case 151: store_size = 4; mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u32); break;
-                case 215: store_size = 1; mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u8); break;
-                case 407: store_size = 2; mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u16); break;
-                case 149: store_size = 8; mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u64); break;
-            }
-            break;
-    }
-    
-    // Check if address might be MMIO (>= 0x7FC00000)
-    // Save address in X2 for potential MMIO path
-    emit.ORR(arm64::X2, arm64::XZR, arm64::X0);  // X2 = X0 (MOV)
-    
-    // Compare against MMIO base
-    emit.MOV_imm(arm64::X3, GPU_MMIO_BASE);
-    emit.CMP(arm64::X0, arm64::X3);
-    
-    // Branch to MMIO slow path if >= GPU_MMIO_BASE (CS = Carry Set = unsigned >=)
-    u8* mmio_branch = emit.current();
-    emit.B_cond(arm64_cond::CS, 0); // Will patch later
-    
-    // === FAST PATH: Normal memory store ===
+    // Translate virtual address to physical for fastmem
+    // Xbox 360: addresses 0x80000000-0x9FFFFFFF map to 0x00000000-0x1FFFFFFF
     if (fastmem_enabled_) {
+        // if (addr >= 0x80000000 && addr < 0xA0000000) addr &= 0x1FFFFFFF
+        emit.MOV_imm(arm64::X16, 0x80000000ULL);
+        emit.CMP(arm64::X0, arm64::X16);
+        u8* skip_translate = emit.current();
+        emit.B_cond(arm64_cond::CC, 0);  // Skip if addr < 0x80000000 (CC = unsigned lower)
+        
+        emit.MOV_imm(arm64::X16, 0xA0000000ULL);
+        emit.CMP(arm64::X0, arm64::X16);
+        u8* skip_translate2 = emit.current();
+        emit.B_cond(arm64_cond::CS, 0);  // Skip if addr >= 0xA0000000 (CS = unsigned higher or same)
+        
+        // In range: mask off top bits
+        emit.AND_imm(arm64::X0, arm64::X0, 0x1FFFFFFFULL);
+        
+        u8* done_translate = emit.current();
+        // Patch the skip branches to jump here
+        emit.patch_branch(reinterpret_cast<u32*>(skip_translate), done_translate);
+        emit.patch_branch(reinterpret_cast<u32*>(skip_translate2), done_translate);
+        
+        // Add fastmem base
         emit.ADD(arm64::X0, arm64::X0, arm64::MEM_BASE);
     }
     
     // Store based on opcode
     switch (inst.opcode) {
-        case 36: case 37: // stw, stwu
+        case 36: // stw
+        case 37: // stwu
             byteswap32(emit, arm64::X1);
             emit.STR(arm64::X1, arm64::X0);
             break;
-        case 38: case 39: // stb, stbu
+        case 38: // stb
+        case 39: // stbu
             emit.STRB(arm64::X1, arm64::X0);
             break;
-        case 44: case 45: // sth, sthu
+        case 44: // sth
+        case 45: // sthu
             byteswap16(emit, arm64::X1);
             emit.STRH(arm64::X1, arm64::X0);
             break;
-        case 52: case 53: case 54: case 55: case 62:
+        case 52: // stfs
+        case 53: // stfsu
+        case 54: // stfd
+        case 55: // stfdu
             byteswap64(emit, arm64::X1);
             emit.STR(arm64::X1, arm64::X0);
             break;
-        case 31:
+        case 62: // std/stdu (DS-form)
+            byteswap64(emit, arm64::X1);
+            emit.STR(arm64::X1, arm64::X0);
+            break;
+        case 31: // Extended stores
             switch (inst.xo) {
-                case 151: byteswap32(emit, arm64::X1); emit.STR(arm64::X1, arm64::X0); break;
-                case 215: emit.STRB(arm64::X1, arm64::X0); break;
-                case 407: byteswap16(emit, arm64::X1); emit.STRH(arm64::X1, arm64::X0); break;
-                case 149: byteswap64(emit, arm64::X1); emit.STR(arm64::X1, arm64::X0); break;
+                case 151: // stwx
+                    byteswap32(emit, arm64::X1);
+                    emit.STR(arm64::X1, arm64::X0);
+                    break;
+                case 215: // stbx
+                    emit.STRB(arm64::X1, arm64::X0);
+                    break;
+                case 407: // sthx
+                    byteswap16(emit, arm64::X1);
+                    emit.STRH(arm64::X1, arm64::X0);
+                    break;
+                case 149: // stdx
+                    byteswap64(emit, arm64::X1);
+                    emit.STR(arm64::X1, arm64::X0);
+                    break;
             }
             break;
     }
-    
-    // Restore original address from X2 for update forms (fast path)
-    emit.ORR(arm64::X0, arm64::XZR, arm64::X2);  // X0 = X2 (original EA)
-    
-    // Jump past MMIO slow path
-    u8* skip_mmio = emit.current();
-    emit.B(0); // Will patch later
-    
-    // === MMIO SLOW PATH ===
-    u8* mmio_target = emit.current();
-    
-    // Patch the conditional branch to jump here
-    emit.patch_branch(reinterpret_cast<u32*>(mmio_branch), mmio_target);
-    
-    // At this point:
-    // X0 = effective address (original)
-    // X1 = value to store
-    // X2 = copy of effective address
-    
-    // Push address and value to stack (for preservation across call)
-    emit.SUB_imm(arm64::SP, arm64::SP, 32);  // Reserve stack space
-    emit.STR(arm64::X2, arm64::SP, 0);       // Save EA
-    emit.STR(arm64::X1, arm64::SP, 8);       // Save value
-    
-    // Call jit_mmio_write_*(memory, addr, value)
-    // X0 = memory (from context)
-    // X1 = addr
-    // X2 = value
-    
-    emit.LDR(arm64::X0, arm64::CTX_REG, offsetof(ThreadContext, memory));
-    emit.ORR(arm64::X1, arm64::XZR, arm64::X2);  // X1 = addr (MOV)
-    emit.LDR(arm64::X2, arm64::SP, 8);  // X2 = value (from stack)
-    
-    // Load helper function address and call
-    emit.MOV_imm(arm64::X4, reinterpret_cast<u64>(mmio_helper));
-    emit.BLR(arm64::X4);
-    
-    // Restore address to X0 for update forms
-    emit.LDR(arm64::X0, arm64::SP, 0);
-    emit.ADD_imm(arm64::SP, arm64::SP, 32);  // Restore stack
-    
-    // === END OF MMIO PATH ===
-    u8* end_target = emit.current();
-    
-    // Patch skip branch
-    emit.patch_branch(reinterpret_cast<u32*>(skip_mmio), end_target);
     
     // Update RA for update forms
     bool is_update = (inst.opcode == 37 || inst.opcode == 39 || 
                       inst.opcode == 45 || inst.opcode == 53 ||
                       inst.opcode == 55);
     if (is_update && inst.ra != 0) {
-        // For fast path, X0 has addr + MEM_BASE, need to subtract
-        // For MMIO path, X0 has the original addr
-        // For both paths, X0 now has the original address
-        // (fast path: subtract MEM_BASE; MMIO path: restored from stack)
+        if (fastmem_enabled_) {
+            emit.SUB(arm64::X0, arm64::X0, arm64::MEM_BASE);
+        }
         store_gpr(emit, inst.ra, arm64::X0);
     }
 }
@@ -2095,6 +2083,10 @@ CompiledBlock* JitCompiler::compile_block_unlocked(GuestAddr addr) {
         DecodedInst decoded = Decoder::decode(ppc_inst);
         decoded.raw = ppc_inst;  // Store raw for some instructions
         
+        // Debug: log each instruction being compiled
+        LOGD("JIT compiling PC=0x%08llX inst=0x%08X type=%d opcode=%d", 
+             (unsigned long long)pc, ppc_inst, (int)decoded.type, decoded.opcode);
+        
         // Compile instruction
         compile_instruction(emit, ctx_template, decoded, pc);
         
@@ -2162,6 +2154,28 @@ CompiledBlock* JitCompiler::compile_block_unlocked(GuestAddr addr) {
     
     LOGD("Compiled block at %08llX (%u instructions, %u bytes)", 
          (unsigned long long)addr, inst_count, (unsigned)block->code_size);
+    
+    // Debug: dump first 64 instructions of compiled code
+    if (block->code_size > 0) {
+        LOGI("Block at %08llX code dump (first %u bytes):", 
+             (unsigned long long)addr, std::min(block->code_size, 256u));
+        u32* code_ptr = reinterpret_cast<u32*>(block->code);
+        for (size_t i = 0; i < std::min((size_t)block->code_size / 4, (size_t)64); i++) {
+            if (i % 8 == 0) {
+                LOGI("  %04zX: %08X %08X %08X %08X %08X %08X %08X %08X",
+                     i * 4,
+                     (i+0 < block->code_size/4) ? code_ptr[i+0] : 0,
+                     (i+1 < block->code_size/4) ? code_ptr[i+1] : 0,
+                     (i+2 < block->code_size/4) ? code_ptr[i+2] : 0,
+                     (i+3 < block->code_size/4) ? code_ptr[i+3] : 0,
+                     (i+4 < block->code_size/4) ? code_ptr[i+4] : 0,
+                     (i+5 < block->code_size/4) ? code_ptr[i+5] : 0,
+                     (i+6 < block->code_size/4) ? code_ptr[i+6] : 0,
+                     (i+7 < block->code_size/4) ? code_ptr[i+7] : 0);
+                i += 7;  // Loop will add 1 more
+            }
+        }
+    }
     
     return block;
 }

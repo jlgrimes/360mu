@@ -266,7 +266,8 @@ static bool encode_logical_imm_impl(u64 imm, bool is_64bit, u32& n, u32& immr, u
     int size = tz + to;
     
     // Check if pattern repeats
-    u64 mask = (1ULL << size) - 1;
+    // Note: (1ULL << 64) is undefined behavior, so handle size=64 specially
+    u64 mask = (size == 64) ? ~0ULL : (1ULL << size) - 1;
     u64 pattern = imm & mask;
     
     // Verify pattern repeats across the entire value
@@ -289,8 +290,11 @@ static bool encode_logical_imm_impl(u64 imm, bool is_64bit, u32& n, u32& immr, u
     if (pattern & 1) {
         // Pattern starts with 1, find where 0s start
         rotation = __builtin_ctzll(~pattern);
-        pattern = (pattern >> rotation) | (pattern << (size - rotation));
-        pattern &= mask;
+        // Note: shifting by 64 is undefined behavior, so handle specially
+        if (rotation > 0 && rotation < size) {
+            pattern = (pattern >> rotation) | (pattern << (size - rotation));
+            pattern &= mask;
+        }
     }
     
     // Verify we have a contiguous sequence of ones
@@ -846,9 +850,25 @@ void ARM64Emitter::ADRP(int rd, s64 offset) {
 
 void ARM64Emitter::patch_branch(u32* patch_site, void* target) {
     s64 offset = reinterpret_cast<u8*>(target) - reinterpret_cast<u8*>(patch_site);
-    s32 imm26 = offset >> 2;
-    u32 opcode = *patch_site & 0xFC000000;
-    *patch_site = opcode | (imm26 & 0x03FFFFFF);
+    u32 inst = *patch_site;
+    
+    // Check instruction type by high bits
+    if ((inst & 0xFF000000) == 0x54000000) {
+        // B.cond: immediate is bits 5-23 (19 bits), condition in bits 0-3
+        s32 imm19 = offset >> 2;
+        u32 cond = inst & 0xF;
+        *patch_site = 0x54000000 | ((imm19 & 0x7FFFF) << 5) | cond;
+    } else if ((inst & 0xFC000000) == 0x14000000 || (inst & 0xFC000000) == 0x94000000) {
+        // B or BL: immediate is bits 0-25 (26 bits)
+        s32 imm26 = offset >> 2;
+        u32 opcode = inst & 0xFC000000;
+        *patch_site = opcode | (imm26 & 0x03FFFFFF);
+    } else {
+        // Unknown branch type - preserve opcode and try imm26 encoding
+        s32 imm26 = offset >> 2;
+        u32 opcode = inst & 0xFC000000;
+        *patch_site = opcode | (imm26 & 0x03FFFFFF);
+    }
 }
 
 //=============================================================================

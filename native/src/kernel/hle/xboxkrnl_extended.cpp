@@ -1502,6 +1502,24 @@ void Kernel::register_xboxkrnl_extended() {
     hle_functions_[make_import_key(0, 459)] = HLE_XMABlockWhileInUse;
     hle_functions_[make_import_key(0, 460)] = HLE_XMAGetContextSampleRate;
     
+    // High ordinal functions (from newer SDK versions)
+    // 2168: KeSetEventBoostPriority - sets thread boost priority when event is signaled
+    hle_functions_[make_import_key(0, 2168)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
+        // Stub - just return success, priority boost doesn't affect emulation
+        *result = 0;  // STATUS_SUCCESS
+    };
+    
+    // 2508: KfAcquireSpinLock - fast spinlock acquire
+    hle_functions_[make_import_key(0, 2508)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
+        // Stub - spinlocks are not needed in single-threaded emulation
+        *result = 0;  // Return old IRQL
+    };
+    
+    // 2528: KfReleaseSpinLock - fast spinlock release
+    hle_functions_[make_import_key(0, 2528)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
+        // Stub - nothing to do
+    };
+    
     LOGI("Registered extended xboxkrnl.exe HLE functions (including XMA audio)");
 }
 
