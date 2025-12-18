@@ -1,7 +1,7 @@
 /**
  * 360μ - Xbox 360 Emulator for Android
  * 
- * SPIR-V Builder Implementation using glslang
+ * SPIR-V Builder Implementation
  * Generates SPIR-V binary from shader translation
  */
 
@@ -9,107 +9,188 @@
 #include <cstring>
 #include <algorithm>
 
-#include <glslang/Public/ShaderLang.h>
-#include <glslang/SPIRV/GlslangToSpv.h>
-#include <glslang/SPIRV/SpvBuilder.h>
-#include <glslang/SPIRV/GLSL.std.450.h>
-
 namespace x360mu {
 
-// Map our storage class enum values to SPIR-V
-namespace StorageClass {
-    constexpr u32 UniformConstant = 0;
-    constexpr u32 Input = 1;
-    constexpr u32 Uniform = 2;
-    constexpr u32 Output = 3;
-    constexpr u32 Private = 6;
-    constexpr u32 Function = 7;
-}
+// SPIR-V magic number and version
+constexpr u32 SPIRV_MAGIC = 0x07230203;
+constexpr u32 SPIRV_VERSION = 0x00010300;  // SPIR-V 1.3
+constexpr u32 SPIRV_GENERATOR = 0x00000000;
 
-// Decoration values
-namespace Decoration {
-    constexpr u32 Block = 2;
-    constexpr u32 BuiltIn = 11;
-    constexpr u32 NoPerspective = 13;
-    constexpr u32 Flat = 14;
-    constexpr u32 Location = 30;
-    constexpr u32 Binding = 33;
-    constexpr u32 DescriptorSet = 34;
-    constexpr u32 Offset = 35;
-    constexpr u32 ArrayStride = 6;
-}
-
-// BuiltIn values
-namespace BuiltIn {
-    constexpr u32 Position = 0;
-    constexpr u32 PointSize = 1;
-    constexpr u32 FragCoord = 15;
-    constexpr u32 FrontFacing = 17;
-    constexpr u32 FragDepth = 22;
-    constexpr u32 VertexIndex = 42;
-    constexpr u32 InstanceIndex = 43;
-}
-
-// Execution modes
-namespace ExecutionMode {
-    constexpr u32 OriginUpperLeft = 7;
-    constexpr u32 DepthReplacing = 12;
-}
-
-// Implementation using glslang's SpvBuilder
-class SpirvBuilderImpl {
-public:
-    SpirvBuilderImpl() 
-        : builder_(spv::SpvBuildLogger::Quiet)
-    {
-        // Initialize glslang once
-        static bool glslang_initialized = false;
-        if (!glslang_initialized) {
-            glslang::InitializeProcess();
-            glslang_initialized = true;
-        }
-    }
+// SPIR-V opcodes
+namespace spv {
+    // Misc
+    constexpr u32 OpNop = 0;
+    constexpr u32 OpUndef = 1;
+    constexpr u32 OpSourceContinued = 2;
+    constexpr u32 OpSource = 3;
+    constexpr u32 OpSourceExtension = 4;
+    constexpr u32 OpName = 5;
+    constexpr u32 OpMemberName = 6;
+    constexpr u32 OpString = 7;
+    constexpr u32 OpLine = 8;
     
-    ~SpirvBuilderImpl() = default;
+    // Decorations
+    constexpr u32 OpDecorate = 71;
+    constexpr u32 OpMemberDecorate = 72;
     
-    spv::Builder& get() { return builder_; }
+    // Types
+    constexpr u32 OpTypeVoid = 19;
+    constexpr u32 OpTypeBool = 20;
+    constexpr u32 OpTypeInt = 21;
+    constexpr u32 OpTypeFloat = 22;
+    constexpr u32 OpTypeVector = 23;
+    constexpr u32 OpTypeMatrix = 24;
+    constexpr u32 OpTypeImage = 25;
+    constexpr u32 OpTypeSampler = 26;
+    constexpr u32 OpTypeSampledImage = 27;
+    constexpr u32 OpTypeArray = 28;
+    constexpr u32 OpTypeRuntimeArray = 29;
+    constexpr u32 OpTypeStruct = 30;
+    constexpr u32 OpTypeOpaque = 31;
+    constexpr u32 OpTypePointer = 32;
+    constexpr u32 OpTypeFunction = 33;
     
-    void begin(ShaderType type) {
-        // Reset builder for new shader
-        builder_.clearAccessChain();
-        
-        // Set source language
-        builder_.setSource(spv::SourceLanguageUnknown, 0);
-        
-        // Add capability
-        builder_.addCapability(spv::CapabilityShader);
-        
-        // Set memory model
-        builder_.setMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
-        
-        shader_type_ = type;
-    }
+    // Constants
+    constexpr u32 OpConstantTrue = 41;
+    constexpr u32 OpConstantFalse = 42;
+    constexpr u32 OpConstant = 43;
+    constexpr u32 OpConstantComposite = 44;
     
-    std::vector<u32> end() {
-        std::vector<u32> spirv;
-        builder_.dump(spirv);
-        return spirv;
-    }
+    // Memory
+    constexpr u32 OpVariable = 59;
+    constexpr u32 OpLoad = 61;
+    constexpr u32 OpStore = 62;
+    constexpr u32 OpAccessChain = 65;
     
-    ShaderType shader_type_ = ShaderType::Vertex;
+    // Function
+    constexpr u32 OpFunction = 54;
+    constexpr u32 OpFunctionParameter = 55;
+    constexpr u32 OpFunctionEnd = 56;
+    constexpr u32 OpFunctionCall = 57;
     
-private:
-    spv::Builder builder_;
-};
-
-// Global impl storage per thread
-static thread_local std::unique_ptr<SpirvBuilderImpl> tls_impl;
-
-static SpirvBuilderImpl& get_impl() {
-    if (!tls_impl) {
-        tls_impl = std::make_unique<SpirvBuilderImpl>();
-    }
-    return *tls_impl;
+    // Control flow
+    constexpr u32 OpLabel = 248;
+    constexpr u32 OpBranch = 249;
+    constexpr u32 OpBranchConditional = 250;
+    constexpr u32 OpSwitch = 251;
+    constexpr u32 OpKill = 252;
+    constexpr u32 OpReturn = 253;
+    constexpr u32 OpReturnValue = 254;
+    constexpr u32 OpLoopMerge = 246;
+    constexpr u32 OpSelectionMerge = 247;
+    
+    // Arithmetic
+    constexpr u32 OpIAdd = 128;
+    constexpr u32 OpFAdd = 129;
+    constexpr u32 OpISub = 130;
+    constexpr u32 OpFSub = 131;
+    constexpr u32 OpIMul = 132;
+    constexpr u32 OpFMul = 133;
+    constexpr u32 OpFDiv = 136;
+    constexpr u32 OpFMod = 141;
+    constexpr u32 OpFNegate = 127;
+    
+    // Vector
+    constexpr u32 OpVectorShuffle = 79;
+    constexpr u32 OpCompositeConstruct = 80;
+    constexpr u32 OpCompositeExtract = 81;
+    constexpr u32 OpCompositeInsert = 82;
+    
+    // Comparison
+    constexpr u32 OpFOrdEqual = 180;
+    constexpr u32 OpFOrdNotEqual = 182;
+    constexpr u32 OpFOrdLessThan = 184;
+    constexpr u32 OpFOrdGreaterThan = 186;
+    constexpr u32 OpFOrdLessThanEqual = 188;
+    constexpr u32 OpFOrdGreaterThanEqual = 190;
+    
+    // Logical
+    constexpr u32 OpSelect = 169;
+    
+    // Image
+    constexpr u32 OpImageSampleImplicitLod = 87;
+    constexpr u32 OpImageSampleExplicitLod = 88;
+    
+    // Extensions
+    constexpr u32 OpExtInstImport = 11;
+    constexpr u32 OpExtInst = 12;
+    
+    // Module
+    constexpr u32 OpCapability = 17;
+    constexpr u32 OpMemoryModel = 14;
+    constexpr u32 OpEntryPoint = 15;
+    constexpr u32 OpExecutionMode = 16;
+    
+    // Capability values
+    constexpr u32 CapabilityShader = 1;
+    
+    // Execution model
+    constexpr u32 ExecutionModelVertex = 0;
+    constexpr u32 ExecutionModelFragment = 4;
+    
+    // Execution mode
+    constexpr u32 ExecutionModeOriginUpperLeft = 7;
+    
+    // Addressing/Memory model
+    constexpr u32 AddressingModelLogical = 0;
+    constexpr u32 MemoryModelGLSL450 = 1;
+    
+    // Storage class
+    constexpr u32 StorageClassInput = 1;
+    constexpr u32 StorageClassOutput = 3;
+    constexpr u32 StorageClassUniform = 2;
+    constexpr u32 StorageClassUniformConstant = 0;
+    constexpr u32 StorageClassFunction = 7;
+    constexpr u32 StorageClassPrivate = 6;
+    
+    // Decoration
+    constexpr u32 DecorationLocation = 30;
+    constexpr u32 DecorationBinding = 33;
+    constexpr u32 DecorationDescriptorSet = 34;
+    constexpr u32 DecorationBuiltIn = 11;
+    constexpr u32 DecorationFlat = 14;
+    constexpr u32 DecorationNoPerspective = 13;
+    constexpr u32 DecorationBlock = 2;
+    constexpr u32 DecorationOffset = 35;
+    
+    // BuiltIn values
+    constexpr u32 BuiltInPosition = 0;
+    constexpr u32 BuiltInPointSize = 1;
+    constexpr u32 BuiltInVertexIndex = 42;
+    constexpr u32 BuiltInInstanceIndex = 43;
+    constexpr u32 BuiltInFragCoord = 15;
+    constexpr u32 BuiltInFrontFacing = 17;
+    constexpr u32 BuiltInFragDepth = 22;
+    
+    // GLSL.std.450 extended instructions
+    constexpr u32 GLSLstd450Round = 1;
+    constexpr u32 GLSLstd450Trunc = 3;
+    constexpr u32 GLSLstd450FAbs = 4;
+    constexpr u32 GLSLstd450Floor = 8;
+    constexpr u32 GLSLstd450Fract = 10;
+    constexpr u32 GLSLstd450Sqrt = 31;
+    constexpr u32 GLSLstd450InverseSqrt = 32;
+    constexpr u32 GLSLstd450Exp = 27;
+    constexpr u32 GLSLstd450Exp2 = 29;
+    constexpr u32 GLSLstd450Log = 28;
+    constexpr u32 GLSLstd450Log2 = 30;
+    constexpr u32 GLSLstd450Sin = 13;
+    constexpr u32 GLSLstd450Cos = 14;
+    constexpr u32 GLSLstd450Pow = 26;
+    constexpr u32 GLSLstd450FMin = 37;
+    constexpr u32 GLSLstd450FMax = 40;
+    constexpr u32 GLSLstd450FClamp = 43;
+    constexpr u32 GLSLstd450FMix = 46;
+    constexpr u32 GLSLstd450Length = 66;
+    constexpr u32 GLSLstd450Normalize = 69;
+    constexpr u32 GLSLstd450Cross = 68;
+    constexpr u32 GLSLstd450Reflect = 71;
+    
+    // Dimension
+    constexpr u32 Dim1D = 0;
+    constexpr u32 Dim2D = 1;
+    constexpr u32 Dim3D = 2;
+    constexpr u32 DimCube = 3;
 }
 
 SpirvBuilder::SpirvBuilder() {
@@ -132,706 +213,713 @@ void SpirvBuilder::begin(ShaderType type) {
     current_function_.clear();
     type_cache_.clear();
     
-    auto& impl = get_impl();
-    impl.begin(type);
-    
-    // Add shader capability using our interface
-    capability(1); // CapabilityShader
+    // Add shader capability
+    capability(spv::CapabilityShader);
     
     // Set memory model
-    memory_model(0, 1); // AddressingModelLogical, MemoryModelGLSL450
+    memory_model(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
 }
 
 std::vector<u32> SpirvBuilder::end() {
-    auto& impl = get_impl();
-    return impl.end();
+    std::vector<u32> result;
+    
+    // Calculate bound (highest ID + 1)
+    u32 bound = next_id_;
+    
+    // Header
+    result.push_back(SPIRV_MAGIC);
+    result.push_back(SPIRV_VERSION);
+    result.push_back(SPIRV_GENERATOR);
+    result.push_back(bound);
+    result.push_back(0);  // Reserved
+    
+    // Sections in order
+    result.insert(result.end(), capabilities_.begin(), capabilities_.end());
+    result.insert(result.end(), extensions_.begin(), extensions_.end());
+    result.insert(result.end(), ext_inst_imports_.begin(), ext_inst_imports_.end());
+    result.insert(result.end(), memory_model_.begin(), memory_model_.end());
+    result.insert(result.end(), entry_points_.begin(), entry_points_.end());
+    result.insert(result.end(), execution_modes_.begin(), execution_modes_.end());
+    result.insert(result.end(), debug_names_.begin(), debug_names_.end());
+    result.insert(result.end(), decorations_.begin(), decorations_.end());
+    result.insert(result.end(), types_constants_.begin(), types_constants_.end());
+    result.insert(result.end(), globals_.begin(), globals_.end());
+    result.insert(result.end(), functions_.begin(), functions_.end());
+    
+    return result;
 }
 
-// Type declarations - delegate to glslang
+void SpirvBuilder::emit(std::vector<u32>& target, u32 word) {
+    target.push_back(word);
+}
+
+void SpirvBuilder::emit_op(std::vector<u32>& target, u32 opcode, u32 result_type, u32 result_id,
+                           const std::vector<u32>& operands) {
+    u32 word_count = 1;  // Opcode word
+    if (result_type != 0) word_count++;
+    if (result_id != 0) word_count++;
+    word_count += operands.size();
+    
+    target.push_back((word_count << 16) | opcode);
+    if (result_type != 0) target.push_back(result_type);
+    if (result_id != 0) target.push_back(result_id);
+    for (u32 op : operands) {
+        target.push_back(op);
+    }
+}
+
+// Type declarations
 u32 SpirvBuilder::type_void() {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.makeVoidType();
-    return static_cast<u32>(id);
+    u64 key = 0x1000000000000000ULL;
+    auto it = type_cache_.find(key);
+    if (it != type_cache_.end()) return it->second;
+    
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpTypeVoid, 0, id, {});
+    type_cache_[key] = id;
+    return id;
 }
 
 u32 SpirvBuilder::type_bool() {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.makeBoolType();
-    return static_cast<u32>(id);
+    u64 key = 0x2000000000000000ULL;
+    auto it = type_cache_.find(key);
+    if (it != type_cache_.end()) return it->second;
+    
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpTypeBool, 0, id, {});
+    type_cache_[key] = id;
+    return id;
 }
 
 u32 SpirvBuilder::type_int(u32 width, bool signed_) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.makeIntType(width);
-    if (!signed_) {
-        id = builder.makeUintType(width);
-    }
-    return static_cast<u32>(id);
+    u64 key = 0x3000000000000000ULL | (static_cast<u64>(width) << 32) | (signed_ ? 1 : 0);
+    auto it = type_cache_.find(key);
+    if (it != type_cache_.end()) return it->second;
+    
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpTypeInt, 0, id, {width, signed_ ? 1u : 0u});
+    type_cache_[key] = id;
+    return id;
 }
 
 u32 SpirvBuilder::type_float(u32 width) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.makeFloatType(width);
-    return static_cast<u32>(id);
+    u64 key = 0x4000000000000000ULL | static_cast<u64>(width);
+    auto it = type_cache_.find(key);
+    if (it != type_cache_.end()) return it->second;
+    
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpTypeFloat, 0, id, {width});
+    type_cache_[key] = id;
+    return id;
 }
 
 u32 SpirvBuilder::type_vector(u32 component_type, u32 count) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.makeVectorType(static_cast<spv::Id>(component_type), count);
-    return static_cast<u32>(id);
+    u64 key = 0x5000000000000000ULL | (static_cast<u64>(component_type) << 16) | count;
+    auto it = type_cache_.find(key);
+    if (it != type_cache_.end()) return it->second;
+    
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpTypeVector, 0, id, {component_type, count});
+    type_cache_[key] = id;
+    return id;
 }
 
 u32 SpirvBuilder::type_matrix(u32 column_type, u32 columns) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.makeMatrixType(static_cast<spv::Id>(column_type), columns, 0);
-    return static_cast<u32>(id);
+    u64 key = 0x6000000000000000ULL | (static_cast<u64>(column_type) << 16) | columns;
+    auto it = type_cache_.find(key);
+    if (it != type_cache_.end()) return it->second;
+    
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpTypeMatrix, 0, id, {column_type, columns});
+    type_cache_[key] = id;
+    return id;
 }
 
 u32 SpirvBuilder::type_array(u32 element_type, u32 length) {
-    auto& builder = get_impl().get();
-    spv::Id length_id = builder.makeUintConstant(length);
-    spv::Id id = builder.makeArrayType(static_cast<spv::Id>(element_type), length_id, 0);
-    return static_cast<u32>(id);
-}
-
-u32 SpirvBuilder::type_runtime_array(u32 element_type) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.makeRuntimeArray(static_cast<spv::Id>(element_type));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpTypeArray, 0, id, {element_type, length});
+    return id;
 }
 
 u32 SpirvBuilder::type_struct(const std::vector<u32>& members) {
-    auto& builder = get_impl().get();
-    std::vector<spv::Id> member_ids;
-    for (u32 m : members) {
-        member_ids.push_back(static_cast<spv::Id>(m));
-    }
-    spv::Id id = builder.makeStructType(member_ids, "");
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpTypeStruct, 0, id, members);
+    return id;
 }
 
 u32 SpirvBuilder::type_pointer(u32 storage_class, u32 type) {
-    auto& builder = get_impl().get();
-    spv::StorageClass sc = static_cast<spv::StorageClass>(storage_class);
-    spv::Id id = builder.makePointer(sc, static_cast<spv::Id>(type));
-    return static_cast<u32>(id);
+    u64 key = 0x7000000000000000ULL | (static_cast<u64>(storage_class) << 32) | type;
+    auto it = type_cache_.find(key);
+    if (it != type_cache_.end()) return it->second;
+    
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpTypePointer, 0, id, {storage_class, type});
+    type_cache_[key] = id;
+    return id;
 }
 
 u32 SpirvBuilder::type_function(u32 return_type, const std::vector<u32>& params) {
-    auto& builder = get_impl().get();
-    std::vector<spv::Id> param_ids;
-    for (u32 p : params) {
-        param_ids.push_back(static_cast<spv::Id>(p));
-    }
-    spv::Id id = builder.makeFunctionType(static_cast<spv::Id>(return_type), param_ids);
-    return static_cast<u32>(id);
+    std::vector<u32> ops = {return_type};
+    ops.insert(ops.end(), params.begin(), params.end());
+    
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpTypeFunction, 0, id, ops);
+    return id;
 }
 
 u32 SpirvBuilder::type_image(u32 sampled_type, u32 dim, bool depth, bool arrayed, bool ms, u32 sampled) {
-    auto& builder = get_impl().get();
-    spv::Dim spv_dim = static_cast<spv::Dim>(dim);
-    spv::Id id = builder.makeImageType(
-        static_cast<spv::Id>(sampled_type),
-        spv_dim,
-        depth,
-        arrayed,
-        ms,
-        sampled,
-        spv::ImageFormatUnknown
-    );
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpTypeImage, 0, id, 
+            {sampled_type, dim, depth ? 1u : 0u, arrayed ? 1u : 0u, ms ? 1u : 0u, sampled, 0});
+    return id;
 }
 
 u32 SpirvBuilder::type_sampled_image(u32 image_type) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.makeSampledImageType(static_cast<spv::Id>(image_type));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpTypeSampledImage, 0, id, {image_type});
+    return id;
+}
+
+u32 SpirvBuilder::type_runtime_array(u32 element_type) {
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpTypeRuntimeArray, 0, id, {element_type});
+    return id;
 }
 
 u32 SpirvBuilder::type_sampler() {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.makeSamplerType();
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpTypeSampler, 0, id, {});
+    return id;
 }
 
 // Constants
 u32 SpirvBuilder::const_bool(bool value) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.makeBoolConstant(value);
-    return static_cast<u32>(id);
+    u32 type = type_bool();
+    u32 id = allocate_id();
+    emit_op(types_constants_, value ? spv::OpConstantTrue : spv::OpConstantFalse, type, id, {});
+    return id;
 }
 
 u32 SpirvBuilder::const_int(s32 value) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.makeIntConstant(value);
-    return static_cast<u32>(id);
+    u32 type = type_int(32, true);
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpConstant, type, id, {static_cast<u32>(value)});
+    return id;
 }
 
 u32 SpirvBuilder::const_uint(u32 value) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.makeUintConstant(value);
-    return static_cast<u32>(id);
+    u32 type = type_int(32, false);
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpConstant, type, id, {value});
+    return id;
 }
 
 u32 SpirvBuilder::const_float(f32 value) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.makeFloatConstant(value);
-    return static_cast<u32>(id);
+    u32 type = type_float(32);
+    u32 id = allocate_id();
+    u32 bits;
+    memcpy(&bits, &value, 4);
+    emit_op(types_constants_, spv::OpConstant, type, id, {bits});
+    return id;
 }
 
 u32 SpirvBuilder::const_composite(u32 type, const std::vector<u32>& constituents) {
-    auto& builder = get_impl().get();
-    std::vector<spv::Id> ids;
-    for (u32 c : constituents) {
-        ids.push_back(static_cast<spv::Id>(c));
-    }
-    spv::Id id = builder.makeCompositeConstant(static_cast<spv::Id>(type), ids);
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(types_constants_, spv::OpConstantComposite, type, id, constituents);
+    return id;
 }
 
 // Variables
 u32 SpirvBuilder::variable(u32 pointer_type, u32 storage_class, u32 initializer) {
-    auto& builder = get_impl().get();
-    spv::StorageClass sc = static_cast<spv::StorageClass>(storage_class);
-    spv::Id init_id = initializer ? static_cast<spv::Id>(initializer) : spv::NoResult;
-    spv::Id id = builder.createVariable(sc, static_cast<spv::Id>(pointer_type), "", init_id);
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    std::vector<u32> ops = {storage_class};
+    if (initializer != 0) {
+        ops.push_back(initializer);
+    }
+    
+    if (storage_class == spv::StorageClassFunction) {
+        emit_op(current_function_, spv::OpVariable, pointer_type, id, ops);
+    } else {
+        emit_op(globals_, spv::OpVariable, pointer_type, id, ops);
+    }
+    return id;
 }
 
 // Function control
 void SpirvBuilder::function_begin(u32 return_type, u32 function_type) {
-    auto& builder = get_impl().get();
-    builder.makeFunctionEntry(
-        spv::NoPrecision,
-        static_cast<spv::Id>(return_type),
-        "main",
-        {},
-        {},
-        nullptr
-    );
+    current_function_.clear();
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpFunction, return_type, id, {0, function_type});
 }
 
 void SpirvBuilder::function_end() {
-    auto& builder = get_impl().get();
-    builder.leaveFunction();
+    emit_op(current_function_, spv::OpFunctionEnd, 0, 0, {});
+    functions_.insert(functions_.end(), current_function_.begin(), current_function_.end());
+    current_function_.clear();
 }
 
 void SpirvBuilder::label(u32 id) {
-    auto& builder = get_impl().get();
-    spv::Block* block = new spv::Block(static_cast<spv::Id>(id), *builder.getBuildPoint()->getParent());
-    builder.setBuildPoint(block);
+    emit_op(current_function_, spv::OpLabel, 0, id, {});
 }
 
 void SpirvBuilder::return_void() {
-    auto& builder = get_impl().get();
-    builder.makeReturn(false);
+    emit_op(current_function_, spv::OpReturn, 0, 0, {});
 }
 
 void SpirvBuilder::return_value(u32 value) {
-    auto& builder = get_impl().get();
-    builder.makeReturn(false, static_cast<spv::Id>(value));
+    emit_op(current_function_, spv::OpReturnValue, 0, 0, {value});
 }
 
-// Memory operations
+// Memory
 u32 SpirvBuilder::load(u32 result_type, u32 pointer) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createLoad(static_cast<spv::Id>(pointer), spv::NoPrecision);
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpLoad, result_type, id, {pointer});
+    return id;
 }
 
 void SpirvBuilder::store(u32 pointer, u32 value) {
-    auto& builder = get_impl().get();
-    builder.createStore(static_cast<spv::Id>(value), static_cast<spv::Id>(pointer));
+    emit_op(current_function_, spv::OpStore, 0, 0, {pointer, value});
 }
 
 u32 SpirvBuilder::access_chain(u32 result_type, u32 base, const std::vector<u32>& indices) {
-    auto& builder = get_impl().get();
-    std::vector<spv::Id> idx_ids;
-    for (u32 i : indices) {
-        idx_ids.push_back(static_cast<spv::Id>(i));
-    }
-    spv::Id id = builder.createAccessChain(
-        spv::StorageClassFunction,
-        static_cast<spv::Id>(base),
-        idx_ids
-    );
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    std::vector<u32> ops = {base};
+    ops.insert(ops.end(), indices.begin(), indices.end());
+    emit_op(current_function_, spv::OpAccessChain, result_type, id, ops);
+    return id;
 }
 
 // Arithmetic
 u32 SpirvBuilder::f_add(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpFAdd, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpFAdd, type, id, {a, b});
+    return id;
 }
 
 u32 SpirvBuilder::f_sub(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpFSub, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpFSub, type, id, {a, b});
+    return id;
 }
 
 u32 SpirvBuilder::f_mul(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpFMul, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpFMul, type, id, {a, b});
+    return id;
 }
 
 u32 SpirvBuilder::f_div(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpFDiv, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpFDiv, type, id, {a, b});
+    return id;
 }
 
 u32 SpirvBuilder::f_negate(u32 type, u32 a) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createUnaryOp(spv::OpFNegate, static_cast<spv::Id>(type),
-                                        static_cast<spv::Id>(a));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpFNegate, type, id, {a});
+    return id;
 }
 
 u32 SpirvBuilder::f_mod(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpFMod, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpFMod, type, id, {a, b});
+    return id;
 }
 
 u32 SpirvBuilder::i_add(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpIAdd, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpIAdd, type, id, {a, b});
+    return id;
 }
 
 u32 SpirvBuilder::i_sub(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpISub, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpISub, type, id, {a, b});
+    return id;
 }
 
 u32 SpirvBuilder::i_mul(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpIMul, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpIMul, type, id, {a, b});
+    return id;
 }
 
 // Conversions
 u32 SpirvBuilder::convert_f_to_s(u32 type, u32 value) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createUnaryOp(spv::OpConvertFToS, static_cast<spv::Id>(type),
-                                        static_cast<spv::Id>(value));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, 110, type, id, {value}); // OpConvertFToS
+    return id;
 }
 
 u32 SpirvBuilder::convert_s_to_f(u32 type, u32 value) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createUnaryOp(spv::OpConvertSToF, static_cast<spv::Id>(type),
-                                        static_cast<spv::Id>(value));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, 111, type, id, {value}); // OpConvertSToF
+    return id;
 }
 
 u32 SpirvBuilder::convert_f_to_u(u32 type, u32 value) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createUnaryOp(spv::OpConvertFToU, static_cast<spv::Id>(type),
-                                        static_cast<spv::Id>(value));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, 109, type, id, {value}); // OpConvertFToU
+    return id;
 }
 
 u32 SpirvBuilder::convert_u_to_f(u32 type, u32 value) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createUnaryOp(spv::OpConvertUToF, static_cast<spv::Id>(type),
-                                        static_cast<spv::Id>(value));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, 112, type, id, {value}); // OpConvertUToF
+    return id;
 }
 
 u32 SpirvBuilder::bitcast(u32 type, u32 value) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createUnaryOp(spv::OpBitcast, static_cast<spv::Id>(type),
-                                        static_cast<spv::Id>(value));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, 124, type, id, {value}); // OpBitcast
+    return id;
 }
 
 // Extended instructions
 u32 SpirvBuilder::ext_inst(u32 type, u32 set, u32 instruction, const std::vector<u32>& operands) {
-    auto& builder = get_impl().get();
-    std::vector<spv::Id> ops;
-    for (u32 o : operands) {
-        ops.push_back(static_cast<spv::Id>(o));
-    }
-    spv::Id id = builder.createBuiltinCall(
-        static_cast<spv::Id>(type),
-        static_cast<spv::Id>(set),
-        instruction,
-        ops
-    );
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    std::vector<u32> ops = {set, instruction};
+    ops.insert(ops.end(), operands.begin(), operands.end());
+    emit_op(current_function_, spv::OpExtInst, type, id, ops);
+    return id;
 }
 
 // Vector operations
 u32 SpirvBuilder::vector_shuffle(u32 type, u32 v1, u32 v2, const std::vector<u32>& components) {
-    auto& builder = get_impl().get();
-    std::vector<int> comps;
-    for (u32 c : components) {
-        comps.push_back(static_cast<int>(c));
-    }
-    spv::Id id = builder.createRvalueSwizzle(
-        spv::NoPrecision,
-        static_cast<spv::Id>(type),
-        static_cast<spv::Id>(v1),
-        comps
-    );
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    std::vector<u32> ops = {v1, v2};
+    ops.insert(ops.end(), components.begin(), components.end());
+    emit_op(current_function_, spv::OpVectorShuffle, type, id, ops);
+    return id;
 }
 
 u32 SpirvBuilder::composite_extract(u32 type, u32 composite, const std::vector<u32>& indices) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createCompositeExtract(
-        static_cast<spv::Id>(composite),
-        static_cast<spv::Id>(type),
-        indices[0]
-    );
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    std::vector<u32> ops = {composite};
+    ops.insert(ops.end(), indices.begin(), indices.end());
+    emit_op(current_function_, spv::OpCompositeExtract, type, id, ops);
+    return id;
 }
 
 u32 SpirvBuilder::composite_insert(u32 type, u32 object, u32 composite, const std::vector<u32>& indices) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createCompositeInsert(
-        static_cast<spv::Id>(object),
-        static_cast<spv::Id>(composite),
-        static_cast<spv::Id>(type),
-        indices[0]
-    );
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    std::vector<u32> ops = {object, composite};
+    ops.insert(ops.end(), indices.begin(), indices.end());
+    emit_op(current_function_, spv::OpCompositeInsert, type, id, ops);
+    return id;
 }
 
 u32 SpirvBuilder::composite_construct(u32 type, const std::vector<u32>& constituents) {
-    auto& builder = get_impl().get();
-    std::vector<spv::Id> ids;
-    for (u32 c : constituents) {
-        ids.push_back(static_cast<spv::Id>(c));
-    }
-    spv::Id id = builder.createCompositeConstruct(static_cast<spv::Id>(type), ids);
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpCompositeConstruct, type, id, constituents);
+    return id;
 }
 
 u32 SpirvBuilder::vector_extract_dynamic(u32 type, u32 vector, u32 index) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createVectorExtractDynamic(
-        static_cast<spv::Id>(vector),
-        static_cast<spv::Id>(type),
-        static_cast<spv::Id>(index)
-    );
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, 78, type, id, {vector, index}); // OpVectorExtractDynamic
+    return id;
 }
 
 u32 SpirvBuilder::vector_insert_dynamic(u32 type, u32 vector, u32 component, u32 index) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createVectorInsertDynamic(
-        static_cast<spv::Id>(vector),
-        static_cast<spv::Id>(type),
-        static_cast<spv::Id>(component),
-        static_cast<spv::Id>(index)
-    );
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, 79, type, id, {vector, component, index}); // OpVectorInsertDynamic
+    return id;
 }
 
 u32 SpirvBuilder::dot(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpDot, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, 148, type, id, {a, b}); // OpDot
+    return id;
 }
 
-// Comparison operations
+// Comparison
 u32 SpirvBuilder::f_ord_equal(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpFOrdEqual, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpFOrdEqual, type, id, {a, b});
+    return id;
 }
 
 u32 SpirvBuilder::f_ord_not_equal(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpFOrdNotEqual, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpFOrdNotEqual, type, id, {a, b});
+    return id;
 }
 
 u32 SpirvBuilder::f_ord_less_than(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpFOrdLessThan, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpFOrdLessThan, type, id, {a, b});
+    return id;
 }
 
 u32 SpirvBuilder::f_ord_greater_than(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpFOrdGreaterThan, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpFOrdGreaterThan, type, id, {a, b});
+    return id;
 }
 
 u32 SpirvBuilder::f_ord_less_than_equal(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpFOrdLessThanEqual, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpFOrdLessThanEqual, type, id, {a, b});
+    return id;
 }
 
 u32 SpirvBuilder::f_ord_greater_than_equal(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpFOrdGreaterThanEqual, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpFOrdGreaterThanEqual, type, id, {a, b});
+    return id;
 }
 
 u32 SpirvBuilder::i_equal(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpIEqual, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, 170, type, id, {a, b}); // OpIEqual
+    return id;
 }
 
 u32 SpirvBuilder::i_not_equal(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpINotEqual, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, 171, type, id, {a, b}); // OpINotEqual
+    return id;
 }
 
 // Logical operations
 u32 SpirvBuilder::logical_and(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpLogicalAnd, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, 167, type, id, {a, b}); // OpLogicalAnd
+    return id;
 }
 
 u32 SpirvBuilder::logical_or(u32 type, u32 a, u32 b) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpLogicalOr, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(a), static_cast<spv::Id>(b));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, 166, type, id, {a, b}); // OpLogicalOr
+    return id;
 }
 
 u32 SpirvBuilder::logical_not(u32 type, u32 a) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createUnaryOp(spv::OpLogicalNot, static_cast<spv::Id>(type),
-                                        static_cast<spv::Id>(a));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, 168, type, id, {a}); // OpLogicalNot
+    return id;
 }
 
 u32 SpirvBuilder::any(u32 type, u32 vector) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createUnaryOp(spv::OpAny, static_cast<spv::Id>(type),
-                                        static_cast<spv::Id>(vector));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, 154, type, id, {vector}); // OpAny
+    return id;
 }
 
 u32 SpirvBuilder::all(u32 type, u32 vector) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createUnaryOp(spv::OpAll, static_cast<spv::Id>(type),
-                                        static_cast<spv::Id>(vector));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, 155, type, id, {vector}); // OpAll
+    return id;
 }
 
 // Control flow
 u32 SpirvBuilder::select(u32 type, u32 condition, u32 true_val, u32 false_val) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createTriOp(spv::OpSelect, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(condition),
-                                      static_cast<spv::Id>(true_val),
-                                      static_cast<spv::Id>(false_val));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpSelect, type, id, {condition, true_val, false_val});
+    return id;
 }
 
 void SpirvBuilder::branch(u32 target) {
-    auto& builder = get_impl().get();
-    spv::Block* block = builder.getBuildPoint();
-    if (block) {
-        builder.createBranch(reinterpret_cast<spv::Block*>(target));
-    }
+    emit_op(current_function_, spv::OpBranch, 0, 0, {target});
 }
 
 void SpirvBuilder::branch_conditional(u32 condition, u32 true_label, u32 false_label) {
-    auto& builder = get_impl().get();
-    builder.createConditionalBranch(
-        static_cast<spv::Id>(condition),
-        reinterpret_cast<spv::Block*>(true_label),
-        reinterpret_cast<spv::Block*>(false_label)
-    );
+    emit_op(current_function_, spv::OpBranchConditional, 0, 0, {condition, true_label, false_label});
 }
 
 void SpirvBuilder::loop_merge(u32 merge_block, u32 continue_target, u32 control) {
-    auto& builder = get_impl().get();
-    builder.createLoopMerge(
-        reinterpret_cast<spv::Block*>(merge_block),
-        reinterpret_cast<spv::Block*>(continue_target),
-        static_cast<spv::LoopControlMask>(control),
-        {}
-    );
+    emit_op(current_function_, spv::OpLoopMerge, 0, 0, {merge_block, continue_target, control});
 }
 
 void SpirvBuilder::selection_merge(u32 merge_block, u32 control) {
-    auto& builder = get_impl().get();
-    builder.createSelectionMerge(
-        reinterpret_cast<spv::Block*>(merge_block),
-        static_cast<spv::SelectionControlMask>(control)
-    );
+    emit_op(current_function_, spv::OpSelectionMerge, 0, 0, {merge_block, control});
 }
 
 void SpirvBuilder::kill() {
-    auto& builder = get_impl().get();
-    builder.makeStatementTerminator(spv::OpKill, "kill");
+    emit_op(current_function_, spv::OpKill, 0, 0, {});
 }
 
 u32 SpirvBuilder::phi(u32 type, const std::vector<std::pair<u32, u32>>& incoming) {
-    auto& builder = get_impl().get();
-    std::vector<spv::Id> ops;
+    u32 id = allocate_id();
+    std::vector<u32> ops;
     for (const auto& [value, block] : incoming) {
-        ops.push_back(static_cast<spv::Id>(value));
-        ops.push_back(static_cast<spv::Id>(block));
+        ops.push_back(value);
+        ops.push_back(block);
     }
-    spv::Id id = builder.createOp(spv::OpPhi, static_cast<spv::Id>(type), ops);
-    return static_cast<u32>(id);
+    emit_op(current_function_, 245, type, id, ops); // OpPhi
+    return id;
 }
 
-// Texture operations
+// Texture
 u32 SpirvBuilder::sampled_image(u32 type, u32 image, u32 sampler) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createBinOp(spv::OpSampledImage, static_cast<spv::Id>(type),
-                                      static_cast<spv::Id>(image), static_cast<spv::Id>(sampler));
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, 86, type, id, {image, sampler}); // OpSampledImage
+    return id;
 }
 
-u32 SpirvBuilder::image_sample(u32 type, u32 sampled_img, u32 coord, u32 bias) {
-    auto& builder = get_impl().get();
-    spv::Builder::TextureParameters params = {};
-    params.sampler = static_cast<spv::Id>(sampled_img);
-    params.coords = static_cast<spv::Id>(coord);
+u32 SpirvBuilder::image_sample(u32 type, u32 sampled_image, u32 coord, u32 bias) {
+    u32 id = allocate_id();
     if (bias != 0) {
-        params.bias = static_cast<spv::Id>(bias);
+        emit_op(current_function_, spv::OpImageSampleImplicitLod, type, id, 
+                {sampled_image, coord, 0x1, bias});  // Bias operand mask
+    } else {
+        emit_op(current_function_, spv::OpImageSampleImplicitLod, type, id, 
+                {sampled_image, coord});
     }
-    spv::Id id = builder.createTextureCall(spv::NoPrecision, static_cast<spv::Id>(type), false, false, false, false, false, params, spv::ImageOperandsMaskNone);
-    return static_cast<u32>(id);
+    return id;
 }
 
-u32 SpirvBuilder::image_sample_lod(u32 type, u32 sampled_img, u32 coord, u32 lod) {
-    auto& builder = get_impl().get();
-    spv::Builder::TextureParameters params = {};
-    params.sampler = static_cast<spv::Id>(sampled_img);
-    params.coords = static_cast<spv::Id>(coord);
-    params.lod = static_cast<spv::Id>(lod);
-    spv::Id id = builder.createTextureCall(spv::NoPrecision, static_cast<spv::Id>(type), false, false, false, false, false, params, spv::ImageOperandsMaskNone);
-    return static_cast<u32>(id);
+u32 SpirvBuilder::image_sample_lod(u32 type, u32 sampled_image, u32 coord, u32 lod) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpImageSampleExplicitLod, type, id, 
+            {sampled_image, coord, 0x2, lod}); // Lod operand mask
+    return id;
 }
 
-u32 SpirvBuilder::image_sample_grad(u32 type, u32 sampled_img, u32 coord, u32 ddx, u32 ddy) {
-    auto& builder = get_impl().get();
-    spv::Builder::TextureParameters params = {};
-    params.sampler = static_cast<spv::Id>(sampled_img);
-    params.coords = static_cast<spv::Id>(coord);
-    params.gradX = static_cast<spv::Id>(ddx);
-    params.gradY = static_cast<spv::Id>(ddy);
-    spv::Id id = builder.createTextureCall(spv::NoPrecision, static_cast<spv::Id>(type), false, false, false, false, false, params, spv::ImageOperandsMaskNone);
-    return static_cast<u32>(id);
+u32 SpirvBuilder::image_sample_grad(u32 type, u32 sampled_image, u32 coord, u32 ddx, u32 ddy) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpImageSampleExplicitLod, type, id, 
+            {sampled_image, coord, 0x4, ddx, ddy}); // Grad operand mask
+    return id;
 }
 
 u32 SpirvBuilder::image_fetch(u32 type, u32 image, u32 coord, u32 lod) {
-    auto& builder = get_impl().get();
-    spv::Builder::TextureParameters params = {};
-    params.sampler = static_cast<spv::Id>(image);
-    params.coords = static_cast<spv::Id>(coord);
+    u32 id = allocate_id();
     if (lod != 0) {
-        params.lod = static_cast<spv::Id>(lod);
+        emit_op(current_function_, 98, type, id, {image, coord, 0x2, lod}); // OpImageFetch
+    } else {
+        emit_op(current_function_, 98, type, id, {image, coord}); // OpImageFetch
     }
-    spv::Id id = builder.createTextureCall(spv::NoPrecision, static_cast<spv::Id>(type), false, false, false, true, false, params, spv::ImageOperandsMaskNone);
-    return static_cast<u32>(id);
+    return id;
 }
 
 u32 SpirvBuilder::image_query_size_lod(u32 type, u32 image, u32 lod) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.createTextureQueryCall(spv::OpImageQuerySizeLod,
-                                                 spv::Builder::TextureParameters{},
-                                                 false);
-    return static_cast<u32>(id);
+    u32 id = allocate_id();
+    emit_op(current_function_, 103, type, id, {image, lod}); // OpImageQuerySizeLod
+    return id;
 }
 
 // Decorations
 void SpirvBuilder::decorate(u32 target, u32 decoration, const std::vector<u32>& operands) {
-    auto& builder = get_impl().get();
-    if (operands.empty()) {
-        builder.addDecoration(static_cast<spv::Id>(target), static_cast<spv::Decoration>(decoration));
-    } else {
-        builder.addDecoration(static_cast<spv::Id>(target), static_cast<spv::Decoration>(decoration), operands[0]);
-    }
+    std::vector<u32> ops = {target, decoration};
+    ops.insert(ops.end(), operands.begin(), operands.end());
+    emit_op(decorations_, spv::OpDecorate, 0, 0, ops);
 }
 
 void SpirvBuilder::member_decorate(u32 type, u32 member, u32 decoration, const std::vector<u32>& operands) {
-    auto& builder = get_impl().get();
-    if (operands.empty()) {
-        builder.addMemberDecoration(static_cast<spv::Id>(type), member, static_cast<spv::Decoration>(decoration));
-    } else {
-        builder.addMemberDecoration(static_cast<spv::Id>(type), member, static_cast<spv::Decoration>(decoration), operands[0]);
-    }
+    std::vector<u32> ops = {type, member, decoration};
+    ops.insert(ops.end(), operands.begin(), operands.end());
+    emit_op(decorations_, spv::OpMemberDecorate, 0, 0, ops);
 }
 
 void SpirvBuilder::decorate_array_stride(u32 type, u32 stride) {
-    decorate(type, Decoration::ArrayStride, {stride});
+    decorate(type, 6, {stride}); // DecorationArrayStride = 6
 }
 
 // Debug
-void SpirvBuilder::name(u32 target, const std::string& n) {
-    auto& builder = get_impl().get();
-    builder.addName(static_cast<spv::Id>(target), n.c_str());
+void SpirvBuilder::name(u32 target, const std::string& name) {
+    std::vector<u32> ops = {target};
+    
+    // Pack string into words
+    size_t len = name.size() + 1;  // Include null terminator
+    size_t word_count = (len + 3) / 4;
+    
+    for (size_t i = 0; i < word_count; i++) {
+        u32 word = 0;
+        for (size_t j = 0; j < 4 && (i * 4 + j) < len; j++) {
+            size_t idx = i * 4 + j;
+            u8 c = idx < name.size() ? name[idx] : 0;
+            word |= c << (j * 8);
+        }
+        ops.push_back(word);
+    }
+    
+    emit_op(debug_names_, spv::OpName, 0, 0, ops);
 }
 
-void SpirvBuilder::member_name(u32 type, u32 member, const std::string& n) {
-    auto& builder = get_impl().get();
-    builder.addMemberName(static_cast<spv::Id>(type), member, n.c_str());
+void SpirvBuilder::member_name(u32 type, u32 member, const std::string& name) {
+    // Similar to name() but with member index
+    std::vector<u32> ops = {type, member};
+    
+    size_t len = name.size() + 1;
+    size_t word_count = (len + 3) / 4;
+    
+    for (size_t i = 0; i < word_count; i++) {
+        u32 word = 0;
+        for (size_t j = 0; j < 4 && (i * 4 + j) < len; j++) {
+            size_t idx = i * 4 + j;
+            u8 c = idx < name.size() ? name[idx] : 0;
+            word |= c << (j * 8);
+        }
+        ops.push_back(word);
+    }
+    
+    emit_op(debug_names_, spv::OpMemberName, 0, 0, ops);
 }
 
 // Entry point
-void SpirvBuilder::entry_point(u32 execution_model, u32 entry_point_id, const std::string& n,
+void SpirvBuilder::entry_point(u32 execution_model, u32 entry_point_id, const std::string& name_str,
                                const std::vector<u32>& interface_ids) {
-    auto& builder = get_impl().get();
-    std::vector<spv::Id> ids;
-    for (u32 i : interface_ids) {
-        ids.push_back(static_cast<spv::Id>(i));
+    std::vector<u32> ops = {execution_model, entry_point_id};
+    
+    // Pack name
+    size_t len = name_str.size() + 1;
+    size_t word_count = (len + 3) / 4;
+    
+    for (size_t i = 0; i < word_count; i++) {
+        u32 word = 0;
+        for (size_t j = 0; j < 4 && (i * 4 + j) < len; j++) {
+            size_t idx = i * 4 + j;
+            u8 c = idx < name_str.size() ? name_str[idx] : 0;
+            word |= c << (j * 8);
+        }
+        ops.push_back(word);
     }
-    builder.addEntryPoint(static_cast<spv::ExecutionModel>(execution_model),
-                          builder.getMainFunction(),
-                          n.c_str());
+    
+    ops.insert(ops.end(), interface_ids.begin(), interface_ids.end());
+    emit_op(entry_points_, spv::OpEntryPoint, 0, 0, ops);
 }
 
 void SpirvBuilder::execution_mode(u32 entry_point_id, u32 mode, const std::vector<u32>& operands) {
-    auto& builder = get_impl().get();
-    builder.addExecutionMode(builder.getMainFunction(), static_cast<spv::ExecutionMode>(mode));
+    std::vector<u32> ops = {entry_point_id, mode};
+    ops.insert(ops.end(), operands.begin(), operands.end());
+    emit_op(execution_modes_, spv::OpExecutionMode, 0, 0, ops);
 }
 
 // Extensions
-u32 SpirvBuilder::import_extension(const std::string& n) {
-    auto& builder = get_impl().get();
-    spv::Id id = builder.import(n.c_str());
-    return static_cast<u32>(id);
+u32 SpirvBuilder::import_extension(const std::string& name) {
+    u32 id = allocate_id();
+    
+    std::vector<u32> ops;
+    size_t len = name.size() + 1;
+    size_t word_count = (len + 3) / 4;
+    
+    for (size_t i = 0; i < word_count; i++) {
+        u32 word = 0;
+        for (size_t j = 0; j < 4 && (i * 4 + j) < len; j++) {
+            size_t idx = i * 4 + j;
+            u8 c = idx < name.size() ? name[idx] : 0;
+            word |= c << (j * 8);
+        }
+        ops.push_back(word);
+    }
+    
+    u32 word_count_total = 2 + ops.size();
+    ext_inst_imports_.push_back((word_count_total << 16) | spv::OpExtInstImport);
+    ext_inst_imports_.push_back(id);
+    ext_inst_imports_.insert(ext_inst_imports_.end(), ops.begin(), ops.end());
+    
+    return id;
 }
 
 void SpirvBuilder::capability(u32 cap) {
-    auto& builder = get_impl().get();
-    builder.addCapability(static_cast<spv::Capability>(cap));
+    emit_op(capabilities_, spv::OpCapability, 0, 0, {cap});
 }
 
 void SpirvBuilder::memory_model(u32 addressing, u32 memory) {
-    auto& builder = get_impl().get();
-    builder.setMemoryModel(static_cast<spv::AddressingModel>(addressing),
-                           static_cast<spv::MemoryModel>(memory));
+    emit_op(memory_model_, spv::OpMemoryModel, 0, 0, {addressing, memory});
 }
 
 } // namespace x360mu
+

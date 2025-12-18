@@ -58,6 +58,10 @@ node_modules/
 third_party/ffmpeg/android/
 third_party/ffmpeg/include/
 
+# mbedTLS (built from source via third_party/build_mbedtls.sh)
+native/third_party/mbedtls/
+native/third_party/mbedtls-*/
+
 # Shader cache
 *.spv
 shaders/cache/

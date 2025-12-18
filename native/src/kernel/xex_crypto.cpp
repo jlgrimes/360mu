@@ -3,7 +3,8 @@
  * 
  * XEX Cryptography Implementation
  * 
- * Uses OpenSSL for AES-128 and SHA-1 operations.
+ * Uses mbedTLS for AES-128 and SHA-1 operations.
+ * mbedTLS is lightweight and works well on Android.
  */
 
 #include "xex_crypto.h"
@@ -12,9 +13,8 @@
 #include <memory>
 #include <cstdlib>
 
-#include <openssl/evp.h>
-#include <openssl/aes.h>
-#include <openssl/sha.h>
+#include <mbedtls/aes.h>
+#include <mbedtls/sha1.h>
 
 // libmspack for LZX decompression
 extern "C" {
@@ -37,64 +37,46 @@ extern "C" {
 namespace x360mu {
 
 //=============================================================================
-// AES-128 Implementation using OpenSSL
+// AES-128 Implementation using mbedTLS
 //=============================================================================
 
 // Internal implementation class (not exposed in header)
 class Aes128Impl {
 public:
     Aes128Impl() {
-        ctx_ = EVP_CIPHER_CTX_new();
-        if (!ctx_) {
-            LOGE("Failed to create EVP_CIPHER_CTX");
-        }
+        mbedtls_aes_init(&ctx_);
     }
     
     ~Aes128Impl() {
-        if (ctx_) {
-            EVP_CIPHER_CTX_free(ctx_);
-        }
+        mbedtls_aes_free(&ctx_);
     }
     
     void set_key(const u8* key) {
         memcpy(key_, key, 16);
+        // Set decryption key
+        mbedtls_aes_setkey_dec(&ctx_, key_, 128);
     }
     
     void decrypt_block(u8* data) {
-        if (!ctx_) return;
-        
-        EVP_CIPHER_CTX_reset(ctx_);
-        EVP_DecryptInit_ex(ctx_, EVP_aes_128_ecb(), nullptr, key_, nullptr);
-        EVP_CIPHER_CTX_set_padding(ctx_, 0);
-        
-        int outlen = 0;
-        EVP_DecryptUpdate(ctx_, data, &outlen, data, 16);
+        mbedtls_aes_crypt_ecb(&ctx_, MBEDTLS_AES_DECRYPT, data, data);
     }
     
     void decrypt_ecb(u8* data, u32 size) {
-        if (!ctx_) return;
-        
-        EVP_CIPHER_CTX_reset(ctx_);
-        EVP_DecryptInit_ex(ctx_, EVP_aes_128_ecb(), nullptr, key_, nullptr);
-        EVP_CIPHER_CTX_set_padding(ctx_, 0);
-        
-        int outlen = 0;
-        EVP_DecryptUpdate(ctx_, data, &outlen, data, size);
+        // ECB mode decrypts each 16-byte block independently
+        for (u32 i = 0; i < size; i += 16) {
+            mbedtls_aes_crypt_ecb(&ctx_, MBEDTLS_AES_DECRYPT, data + i, data + i);
+        }
     }
     
     void decrypt_cbc(u8* data, u32 size, const u8* iv) {
-        if (!ctx_) return;
-        
-        EVP_CIPHER_CTX_reset(ctx_);
-        EVP_DecryptInit_ex(ctx_, EVP_aes_128_cbc(), nullptr, key_, iv);
-        EVP_CIPHER_CTX_set_padding(ctx_, 0);
-        
-        int outlen = 0;
-        EVP_DecryptUpdate(ctx_, data, &outlen, data, size);
+        // Need a mutable copy of IV (mbedTLS modifies it during operation)
+        u8 iv_copy[16];
+        memcpy(iv_copy, iv, 16);
+        mbedtls_aes_crypt_cbc(&ctx_, MBEDTLS_AES_DECRYPT, size, iv_copy, data, data);
     }
     
 private:
-    EVP_CIPHER_CTX* ctx_ = nullptr;
+    mbedtls_aes_context ctx_;
     u8 key_[16] = {0};
 };
 
@@ -127,46 +109,35 @@ void Aes128::decrypt_ecb(u8* data, u32 size) {
 }
 
 //=============================================================================
-// SHA-1 Implementation using OpenSSL
+// SHA-1 Implementation using mbedTLS
 //=============================================================================
 
 // Internal implementation class (not exposed in header)
 class Sha1Impl {
 public:
     Sha1Impl() {
-        ctx_ = EVP_MD_CTX_new();
-        if (ctx_) {
-            EVP_DigestInit_ex(ctx_, EVP_sha1(), nullptr);
-        }
+        mbedtls_sha1_init(&ctx_);
+        mbedtls_sha1_starts(&ctx_);
     }
     
     ~Sha1Impl() {
-        if (ctx_) {
-            EVP_MD_CTX_free(ctx_);
-        }
+        mbedtls_sha1_free(&ctx_);
     }
     
     void reset() {
-        if (ctx_) {
-            EVP_DigestInit_ex(ctx_, EVP_sha1(), nullptr);
-        }
+        mbedtls_sha1_starts(&ctx_);
     }
     
     void update(const u8* data, u32 size) {
-        if (ctx_) {
-            EVP_DigestUpdate(ctx_, data, size);
-        }
+        mbedtls_sha1_update(&ctx_, data, size);
     }
     
     void finalize(u8* hash) {
-        if (ctx_) {
-            unsigned int len = 0;
-            EVP_DigestFinal_ex(ctx_, hash, &len);
-        }
+        mbedtls_sha1_finish(&ctx_, hash);
     }
     
 private:
-    EVP_MD_CTX* ctx_ = nullptr;
+    mbedtls_sha1_context ctx_;
 };
 
 // Thread-local storage for SHA-1 implementation
@@ -197,8 +168,8 @@ void Sha1::finalize(u8* hash) {
 }
 
 void Sha1::hash(const u8* data, u32 size, u8* hash) {
-    // Use OpenSSL's one-shot SHA1 function
-    SHA1(data, size, hash);
+    // Use mbedTLS one-shot SHA-1 function
+    mbedtls_sha1(data, size, hash);
 }
 
 //=============================================================================

@@ -16,7 +16,7 @@
 namespace x360mu {
 
 /**
- * AES-128 implementation using OpenSSL
+ * AES-128 implementation using mbedTLS
  * Used for XEX decryption
  */
 class Aes128 {
@@ -173,7 +173,7 @@ private:
 };
 
 /**
- * SHA-1 implementation using OpenSSL
+ * SHA-1 implementation using mbedTLS
  * Used for XEX hash verification
  */
 class Sha1 {
