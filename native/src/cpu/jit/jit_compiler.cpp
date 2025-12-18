@@ -1884,41 +1884,13 @@ void JitCompiler::calc_ea_indexed(ARM64Emitter& emit, int dest_reg, int ra, int 
 }
 
 void JitCompiler::emit_translate_address(ARM64Emitter& emit, int addr_reg) {
-    // Translate PowerPC virtual address to physical for fastmem
-    // Xbox 360: addresses 0x80000000-0x9FFFFFFF map to 0x00000000-0x1FFFFFFF
+    // Translate Xbox 360 address to host fastmem address
+    // Simple approach: ALWAYS mask with 0x1FFFFFFF to get physical offset (512MB)
+    // This works for both virtual (0x8XXXXXXX) and physical (0x0XXXXXXX) addresses
     if (!fastmem_enabled_) return;
     
-    // if (addr >= 0x80000000 && addr < 0xA0000000) addr &= 0x1FFFFFFF
-    emit.MOV_imm(arm64::X16, 0x80000000ULL);
-    emit.CMP(addr_reg, arm64::X16);
-    u8* skip_translate = emit.current();
-    emit.B_cond(arm64_cond::CC, 0);  // Skip if addr < 0x80000000
-    
-    emit.MOV_imm(arm64::X16, 0xA0000000ULL);
-    emit.CMP(addr_reg, arm64::X16);
-    u8* skip_translate2 = emit.current();
-    emit.B_cond(arm64_cond::CS, 0);  // Skip if addr >= 0xA0000000
-    
-    // In range: mask off top bits using explicit AND with temp register
-    // Don't use AND_imm - it may use X16 as fallback which we need later
-    emit.MOV_imm(arm64::X17, 0x1FFFFFFFULL);
-    emit.AND(addr_reg, addr_reg, arm64::X17);
-    
-    u8* done_translate = emit.current();
-    // Patch the skip branches to jump here
-    emit.patch_branch(reinterpret_cast<u32*>(skip_translate), done_translate);
-    emit.patch_branch(reinterpret_cast<u32*>(skip_translate2), done_translate);
-    
-    // BOUNDS CHECK: Ensure translated address is within valid physical memory range
-    // Physical addresses should be 0x00000000-0x1FFFFFFF (512MB)
-    // If address is out of bounds, clamp it to prevent crash
-    emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);  // Max valid physical address
-    emit.CMP(addr_reg, arm64::X16);
-    u8* bounds_ok = emit.current();
-    emit.B_cond(arm64_cond::LS, 0);  // Skip clamp if addr <= 0x1FFFFFFF (unsigned)
-    // Address out of bounds - clamp to 0 to prevent crash (will read garbage but not crash)
-    emit.MOV_imm(addr_reg, 0);
-    emit.patch_branch(reinterpret_cast<u32*>(bounds_ok), emit.current());
+    // addr = addr & 0x1FFFFFFF (get physical offset within 512MB)
+    emit.AND_imm(addr_reg, addr_reg, 0x1FFFFFFFULL);
     
     // Add fastmem base
     u64 base_addr = reinterpret_cast<u64>(fastmem_base_);
