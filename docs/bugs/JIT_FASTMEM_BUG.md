@@ -3,10 +3,12 @@
 ## Status: FIXED ✅
 
 **Root Cause**: Two issues combined:
+
 1. `main_memory_` and `fastmem_base_` were separate memory regions - interpreter wrote to one, JIT read from the other
 2. Address translation was overly complex with conditional branches that could skip the mask
 
 **Fix Applied** (December 2024):
+
 1. **Memory Unification**: Modified `setup_fastmem()` to copy `main_memory_` content into `fastmem_base_`, then redirect `main_memory_` to point to `fastmem_base_`. Both now reference the same memory.
 2. **Simplified Address Translation**: Changed `emit_translate_address()` to ALWAYS mask addresses with `0x1FFFFFFF`. This matches how most Xbox 360 emulators handle it:
    ```cpp
@@ -274,6 +276,7 @@ The ~2GB offset crash was caused by two issues:
 ### Fixes Applied
 
 **1. Memory Unification** (`memory.cpp:setup_fastmem`):
+
 ```cpp
 // Copy main_memory_ content to fastmem_base_
 memcpy(fastmem_base_, main_memory_, main_memory_size_);
@@ -285,6 +288,7 @@ munmap(old_main_memory, main_memory_size_);
 ```
 
 **2. Simplified Address Translation** (`jit_compiler.cpp:emit_translate_address`):
+
 ```cpp
 // Simple approach: ALWAYS mask to get physical offset within 512MB
 // Works for both virtual (0x8XXXXXXX) and physical (0x0XXXXXXX) addresses
@@ -296,6 +300,7 @@ emit.ADD(addr_reg, addr_reg, arm64::X16);
 ### Verification
 
 After fixes:
+
 - ✅ No SIGSEGV crashes
 - ✅ CPU running at ~22 FPS
 - ✅ 522 import thunks installed correctly
