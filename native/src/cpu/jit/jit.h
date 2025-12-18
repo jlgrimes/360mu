@@ -490,6 +490,9 @@ private:
     // Register allocator
     RegisterAllocator reg_alloc_;
     
+    // Current instruction count during block compilation (for time_base tracking)
+    u32 current_block_inst_count_ = 0;
+    
     // Compile a single block
     CompiledBlock* compile_block(GuestAddr addr);
     
@@ -585,7 +588,7 @@ private:
     
     // Block prologue/epilogue
     void emit_block_prologue(ARM64Emitter& emit);
-    void emit_block_epilogue(ARM64Emitter& emit);
+    void emit_block_epilogue(ARM64Emitter& emit, u32 inst_count);
     
     // Block linking
     void try_link_block(CompiledBlock* block);
@@ -635,6 +638,9 @@ private:
     }
     static constexpr size_t ctx_offset_xer() {
         return offsetof(ThreadContext, xer);
+    }
+    static constexpr size_t ctx_offset_time_base() {
+        return offsetof(ThreadContext, time_base);
     }
 };
 

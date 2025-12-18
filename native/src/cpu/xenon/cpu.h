@@ -122,6 +122,10 @@ struct ThreadContext {
     // MSR (Machine State Register)
     u64 msr;
     
+    // Time Base Register - increments with executed instructions
+    // Xbox 360 time base runs at ~50MHz (bus clock / 8)
+    u64 time_base = 0;
+    
     // Thread ID (0-5)
     u32 thread_id;
     
@@ -148,6 +152,7 @@ struct ThreadContext {
         vscr = 0;
         pc = 0;
         msr = 0;
+        time_base = 0;
         running = false;
         interrupted = false;
     }

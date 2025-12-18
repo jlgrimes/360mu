@@ -43,6 +43,11 @@ if(ANDROID_ABI STREQUAL "arm64-v8a" OR CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8-a+simd")
 endif()
 
+# Third-party: libmspack for LZX decompression (BSD licensed)
+set(MSPACK_SOURCES
+    third_party/mspack/lzxd.c
+)
+
 # Source files organized by module
 set(CORE_SOURCES
     src/core/emulator.cpp
@@ -131,6 +136,7 @@ set(ALL_SOURCES
     ${APU_SOURCES}
     ${KERNEL_SOURCES}
     ${MEMORY_SOURCES}
+    ${MSPACK_SOURCES}
 )
 
 # Include directories
@@ -183,9 +189,9 @@ if(X360MU_USE_FFMPEG)
     add_definitions(-DX360MU_USE_FFMPEG)
 endif()
 
-# Find OpenSSL (required for AES/SHA1)
+# Find OpenSSL (REQUIRED for AES/SHA1 - no fallback)
 if(ANDROID)
-    # For Android, expect prebuilt OpenSSL or use BoringSSL from NDK
+    # For Android, expect prebuilt OpenSSL
     find_package(OpenSSL QUIET)
     if(NOT OpenSSL_FOUND)
         # Try to find in third_party
@@ -196,64 +202,70 @@ if(ANDROID)
             link_directories(${OPENSSL_LIB_DIR})
             set(OPENSSL_LIBS ssl crypto)
             set(OpenSSL_FOUND TRUE)
+        else()
+            message(FATAL_ERROR "OpenSSL is required but not found. Please install OpenSSL or provide prebuilt libraries in third_party/openssl/")
         endif()
+    else()
+        set(OPENSSL_LIBS OpenSSL::SSL OpenSSL::Crypto)
     endif()
 else()
     find_package(OpenSSL REQUIRED)
     set(OPENSSL_LIBS OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
-if(OpenSSL_FOUND)
-    add_definitions(-DX360MU_USE_OPENSSL)
-    message(STATUS "OpenSSL found: ${OPENSSL_INCLUDE_DIR}")
-else()
-    message(WARNING "OpenSSL not found - using fallback crypto (not recommended)")
-endif()
+message(STATUS "OpenSSL found: using for AES-128 and SHA-1")
 
-# Find SPIRV-Tools and glslang (for SPIR-V generation)
-option(X360MU_USE_SPIRV_TOOLS "Use SPIRV-Tools/glslang for shader translation" ON)
-if(X360MU_USE_SPIRV_TOOLS AND X360MU_USE_VULKAN)
+# Find SPIRV-Tools and glslang (REQUIRED for SPIR-V generation when Vulkan is enabled)
+if(X360MU_USE_VULKAN)
     if(ANDROID)
-        # For Android, expect prebuilt in third_party or use shaderc from NDK
-        find_library(SHADERC_LIB shaderc HINTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/shaderc/android/${ANDROID_ABI})
-        if(SHADERC_LIB)
-            set(SPIRV_LIBS ${SHADERC_LIB})
-            add_definitions(-DX360MU_USE_SPIRV_TOOLS)
-            message(STATUS "Shaderc found for Android")
+        # For Android, expect prebuilt glslang or use from NDK
+        find_package(glslang CONFIG QUIET)
+        if(NOT glslang_FOUND)
+            # Try to find in third_party
+            set(GLSLANG_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/glslang/include)
+            set(GLSLANG_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/glslang/android/${ANDROID_ABI})
+            if(EXISTS ${GLSLANG_INCLUDE_DIR})
+                include_directories(${GLSLANG_INCLUDE_DIR})
+                link_directories(${GLSLANG_LIB_DIR})
+                set(SPIRV_LIBS glslang SPIRV)
+            else()
+                message(FATAL_ERROR "glslang is required for Vulkan builds but not found. Please install glslang or provide prebuilt libraries in third_party/glslang/")
+            endif()
+        else()
+            set(SPIRV_LIBS glslang::glslang glslang::SPIRV glslang::glslang-default-resource-limits)
         endif()
     else()
-        # Try to find glslang and SPIRV-Tools
+        # Try to find glslang
         find_package(glslang CONFIG QUIET)
-        find_package(SPIRV-Tools CONFIG QUIET)
         
         if(glslang_FOUND)
             set(SPIRV_LIBS glslang::glslang glslang::SPIRV glslang::glslang-default-resource-limits)
+            find_package(SPIRV-Tools CONFIG QUIET)
             if(SPIRV-Tools_FOUND)
                 list(APPEND SPIRV_LIBS SPIRV-Tools-opt SPIRV-Tools)
             endif()
-            add_definitions(-DX360MU_USE_SPIRV_TOOLS)
-            message(STATUS "glslang found")
         else()
             # Try pkg-config
             find_package(PkgConfig QUIET)
             if(PkgConfig_FOUND)
                 pkg_check_modules(GLSLANG QUIET glslang)
-                pkg_check_modules(SPIRV_TOOLS QUIET SPIRV-Tools)
                 if(GLSLANG_FOUND)
                     include_directories(${GLSLANG_INCLUDE_DIRS})
                     set(SPIRV_LIBS ${GLSLANG_LIBRARIES})
+                    pkg_check_modules(SPIRV_TOOLS QUIET SPIRV-Tools)
                     if(SPIRV_TOOLS_FOUND)
                         list(APPEND SPIRV_LIBS ${SPIRV_TOOLS_LIBRARIES})
                     endif()
-                    add_definitions(-DX360MU_USE_SPIRV_TOOLS)
                 endif()
             endif()
         endif()
+        
+        if(NOT SPIRV_LIBS)
+            message(FATAL_ERROR "glslang is required for Vulkan builds but not found. Please install glslang-dev or glslang package.")
+        endif()
     endif()
     
-    if(NOT SPIRV_LIBS)
-        message(WARNING "SPIRV-Tools/glslang not found - using custom SPIR-V builder")
-    endif()
+    message(STATUS "glslang found: using for SPIR-V generation")
 endif()
 
 # Main library
@@ -267,10 +279,8 @@ if(X360MU_USE_VULKAN AND VULKAN_LIB)
     target_link_libraries(x360mu_core ${VULKAN_LIB})
 endif()
 
-# Link OpenSSL
-if(OpenSSL_FOUND AND OPENSSL_LIBS)
-    target_link_libraries(x360mu_core ${OPENSSL_LIBS})
-endif()
+# Link OpenSSL (required)
+target_link_libraries(x360mu_core ${OPENSSL_LIBS})
 
 # Link SPIRV-Tools/glslang
 if(SPIRV_LIBS)
@@ -431,8 +441,8 @@ message(STATUS "Build type:     ${CMAKE_BUILD_TYPE}")
 message(STATUS "JIT enabled:    ${X360MU_ENABLE_JIT}")
 message(STATUS "Vulkan:         ${X360MU_USE_VULKAN}")
 message(STATUS "FFmpeg:         ${X360MU_USE_FFMPEG}")
-message(STATUS "OpenSSL:        ${OpenSSL_FOUND}")
-message(STATUS "SPIRV-Tools:    ${SPIRV_LIBS}")
+message(STATUS "OpenSSL:        YES (required)")
+message(STATUS "glslang:        ${SPIRV_LIBS}")
 message(STATUS "Tests:          ${X360MU_BUILD_TESTS}")
 message(STATUS "ASAN:           ${X360MU_ENABLE_ASAN}")
 message(STATUS "================================")

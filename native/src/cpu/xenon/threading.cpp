@@ -432,11 +432,15 @@ u32 ThreadScheduler::wait_for_object(GuestThread* thread, GuestAddr object, u64 
 }
 
 void ThreadScheduler::signal_object(GuestAddr object) {
-    // Set signal state
-    memory_->write_u32(object + 4, 1);
-    
     DispatcherHeader header;
     header.type = memory_->read_u8(object);
+    
+    // For semaphores (type 5), the signal state IS the count - don't overwrite it
+    // Only set signal state to 1 for events
+    constexpr u8 SEMAPHORE_TYPE = 5;
+    if (header.type != SEMAPHORE_TYPE) {
+        memory_->write_u32(object + 4, 1);
+    }
     
     // Wake waiting threads
     std::lock_guard<std::mutex> lock(threads_mutex_);
@@ -449,10 +453,21 @@ void ThreadScheduler::signal_object(GuestAddr object) {
             enqueue_thread(thread.get());
             stats_.waiting_thread_count--;
             
-            // For synchronization events, only wake one thread
+            // For synchronization events, only wake one thread and auto-reset
             if (header.type == static_cast<u8>(KernelObjectType::SynchronizationEvent)) {
                 memory_->write_u32(object + 4, 0);  // Auto-reset
                 break;
+            }
+            
+            // For semaphores, decrement count for each thread woken
+            if (header.type == SEMAPHORE_TYPE) {
+                s32 count = static_cast<s32>(memory_->read_u32(object + 4));
+                if (count > 0) {
+                    memory_->write_u32(object + 4, static_cast<u32>(count - 1));
+                }
+                if (count <= 1) {
+                    break;  // No more resources available
+                }
             }
         }
     }
@@ -579,6 +594,109 @@ void ThreadScheduler::execute_thread(u32 hw_thread_id) {
     // Wake up the hardware thread to execute
     if (hw_thread_id < num_host_threads_) {
         hw_threads_[hw_thread_id].wake_cv.notify_one();
+    }
+}
+
+//=============================================================================
+// APC (Asynchronous Procedure Call) Support
+//=============================================================================
+
+void ThreadScheduler::queue_apc(GuestThread* thread, GuestAddr routine, GuestAddr context,
+                                 GuestAddr arg1, GuestAddr arg2, bool kernel_mode) {
+    if (!thread) return;
+    
+    thread->queue_apc(routine, context, arg1, arg2, kernel_mode);
+    
+    LOGD("Queued APC to thread %u: routine=0x%08X, context=0x%08X, kernel=%d",
+         thread->thread_id, routine, context, kernel_mode);
+    
+    // If kernel-mode APC, alert the thread
+    if (kernel_mode) {
+        alert_thread(thread);
+    }
+}
+
+u32 ThreadScheduler::process_pending_apcs(GuestThread* thread) {
+    if (!thread || !cpu_) {
+        LOGW("Cannot process APCs: invalid thread or no CPU");
+        return 0;
+    }
+    
+    u32 count = 0;
+    
+    while (true) {
+        ApcEntry apc;
+        
+        // Get next APC from queue
+        {
+            std::lock_guard<std::mutex> lock(thread->apc_mutex);
+            if (thread->apc_queue.empty()) {
+                break;
+            }
+            apc = thread->apc_queue.front();
+            thread->apc_queue.pop_front();
+        }
+        
+        LOGI("Executing APC for thread %u: routine=0x%08X, context=0x%08X",
+             thread->thread_id, apc.routine, apc.context);
+        
+        // Call the APC routine by setting up the thread's context
+        // APC signature: void ApcRoutine(PVOID context, PVOID arg1, PVOID arg2)
+        
+        // Save current PC/LR
+        GuestAddr saved_pc = thread->context.pc;
+        GuestAddr saved_lr = thread->context.lr;
+        u64 saved_r3 = thread->context.gpr[3];
+        u64 saved_r4 = thread->context.gpr[4];
+        u64 saved_r5 = thread->context.gpr[5];
+        
+        // Set up APC call
+        thread->context.gpr[3] = apc.context;       // First argument (context)
+        thread->context.gpr[4] = apc.system_arg1;   // Second argument
+        thread->context.gpr[5] = apc.system_arg2;   // Third argument
+        thread->context.lr = saved_pc;              // Return to where we were
+        thread->context.pc = apc.routine;           // Jump to APC routine
+        
+        // Execute the APC routine
+        // We execute for a limited number of cycles to prevent infinite loops
+        // The APC should return via blr which will restore PC to saved_pc
+        u32 cpu_thread_id = thread->context.thread_id % 6;
+        cpu_->execute_thread(cpu_thread_id, 100000);  // Execute up to 100K cycles
+        
+        // If the APC didn't return properly, restore state
+        // (In practice, the APC should have executed blr to return)
+        if (thread->context.pc != saved_pc) {
+            LOGW("APC routine didn't return properly, forcing return");
+            thread->context.pc = saved_pc;
+            thread->context.lr = saved_lr;
+            thread->context.gpr[3] = saved_r3;
+            thread->context.gpr[4] = saved_r4;
+            thread->context.gpr[5] = saved_r5;
+        }
+        
+        count++;
+    }
+    
+    // Clear alerted flag after processing APCs
+    thread->alerted = false;
+    thread->in_alertable_wait = false;
+    
+    return count;
+}
+
+void ThreadScheduler::alert_thread(GuestThread* thread) {
+    if (!thread) return;
+    
+    thread->alert();
+    
+    // If thread is in an alertable wait, wake it up
+    if (thread->in_alertable_wait && thread->state == ThreadState::Waiting) {
+        thread->state = ThreadState::Ready;
+        thread->wait_object = 0;
+        enqueue_thread(thread);
+        stats_.waiting_thread_count--;
+        
+        LOGD("Alerted thread %u from wait", thread->thread_id);
     }
 }
 

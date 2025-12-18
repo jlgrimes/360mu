@@ -266,6 +266,7 @@ private:
 // Helper functions for HLE modules
 void init_hle_state(VirtualFileSystem* vfs);
 void set_thread_scheduler(class ThreadScheduler* scheduler);
+class ThreadScheduler* get_thread_scheduler();
 void xam_set_title_id(u32 title_id);
 void xam_set_input_state(u32 user_index, u16 buttons, u8 lt, u8 rt,
                          s16 lx, s16 ly, s16 rx, s16 ry);

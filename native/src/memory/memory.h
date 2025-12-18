@@ -207,10 +207,17 @@ public:
     /**
      * Handle fastmem fault (called from signal handler)
      * Returns true if fault was handled
+     * @param fault_addr The address that caused the fault
+     * @param context Platform-specific context (ucontext_t*) for register access
      */
-    bool handle_fault(void* fault_addr, bool is_write);
+    bool handle_fault(void* fault_addr, void* context);
     
 private:
+    /**
+     * Handle MMIO fault by emulating the memory access
+     * Decodes the faulting instruction, performs MMIO, updates registers
+     */
+    bool handle_mmio_fault(GuestAddr guest_addr, void* context);
     // Main RAM backing (512MB)
     void* main_memory_ = nullptr;
     u64 main_memory_size_ = 0;

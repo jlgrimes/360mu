@@ -131,6 +131,10 @@ u32 Interpreter::execute_one(ThreadContext& ctx) {
             break;
     }
     
+    // Increment time base register
+    // Xbox 360 time base runs at ~50MHz, we approximate with ~4 cycles per instruction
+    ctx.time_base += 4;
+    
     return 1; // Cycles consumed
 }
 
@@ -848,10 +852,15 @@ void Interpreter::exec_system(ThreadContext& ctx, const DecodedInst& d) {
                     case 1: // XER
                         ctx.gpr[d.rd] = ctx.xer.to_u32();
                         break;
-                    case 268: // TBL
-                    case 269: // TBU
-                        // Return cycle count / time
-                        ctx.gpr[d.rd] = 0; // TODO: implement time base
+                    case 268: // TBL (Time Base Lower)
+                    case 284: // TBL alternate encoding
+                        // Return lower 32 bits of time base
+                        ctx.gpr[d.rd] = static_cast<u32>(ctx.time_base);
+                        break;
+                    case 269: // TBU (Time Base Upper)
+                    case 285: // TBU alternate encoding
+                        // Return upper 32 bits of time base
+                        ctx.gpr[d.rd] = static_cast<u32>(ctx.time_base >> 32);
                         break;
                     default:
                         LOGD("mfspr r%d = SPR%d", d.rd, spr);

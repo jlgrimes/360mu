@@ -69,6 +69,8 @@ enum ObjectAttributes : u32 {
 enum WaitResult : u32 {
     WAIT_OBJECT_0 = 0x00000000,
     WAIT_ABANDONED = 0x00000080,
+    WAIT_IO_COMPLETION = 0x000000C0,  // STATUS_USER_APC - wait completed due to APC
+    WAIT_ALERTED = 0x00000101,         // STATUS_ALERTED - thread was alerted
     WAIT_TIMEOUT = 0x00000102,
     WAIT_FAILED = 0xFFFFFFFF,
 };

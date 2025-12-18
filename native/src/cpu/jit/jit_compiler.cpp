@@ -1511,7 +1511,7 @@ void JitCompiler::compile_branch(ARM64Emitter& emit, const DecodedInst& inst,
     emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_pc());
     
     // Return from block (will continue in dispatcher)
-    emit_block_epilogue(emit);
+    emit_block_epilogue(emit, current_block_inst_count_);
 }
 
 void JitCompiler::compile_branch_conditional(ARM64Emitter& emit, const DecodedInst& inst,
@@ -1599,7 +1599,7 @@ void JitCompiler::compile_branch_conditional(ARM64Emitter& emit, const DecodedIn
     }
     
     emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_pc());
-    emit_block_epilogue(emit);
+    emit_block_epilogue(emit, current_block_inst_count_);
     
     // ---- Not-taken path ----
     u8* not_taken_start = emit.current();
@@ -1615,7 +1615,7 @@ void JitCompiler::compile_branch_conditional(ARM64Emitter& emit, const DecodedIn
     // Not-taken: continue to next instruction
     emit.MOV_imm(arm64::X0, target_not_taken);
     emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_pc());
-    emit_block_epilogue(emit);
+    emit_block_epilogue(emit, current_block_inst_count_);
 }
 
 void JitCompiler::compile_branch_to_lr(ARM64Emitter& emit, const DecodedInst& inst, 
@@ -1709,7 +1709,7 @@ void JitCompiler::compile_syscall(ARM64Emitter& emit, const DecodedInst& inst) {
     
     // Return from block to handle syscall
     // Note: PC is NOT updated here - the dispatcher will handle PC advancement
-    emit_block_epilogue(emit);
+    emit_block_epilogue(emit, current_block_inst_count_);
 }
 
 void JitCompiler::compile_mtspr(ARM64Emitter& emit, const DecodedInst& inst) {
@@ -1747,12 +1747,16 @@ void JitCompiler::compile_mfspr(ARM64Emitter& emit, const DecodedInst& inst) {
             emit.LDR(arm64::X0, arm64::CTX_REG, ctx_offset_xer());
             break;
         case 268: // TBL (time base lower)
+        case 284: // TBL alternate encoding
+            // Load time base and return lower 32 bits
+            emit.LDR(arm64::X0, arm64::CTX_REG, ctx_offset_time_base());
+            // Mask to 32 bits (upper bits will be zero-extended by store_gpr)
+            break;
         case 269: // TBU (time base upper)
-            // Read ARM64 cycle counter
-            emit.MRS(arm64::X0, 0x5F01);  // CNTVCT_EL0
-            if (spr == 269) {
-                emit.LSR_imm(arm64::X0, arm64::X0, 32);
-            }
+        case 285: // TBU alternate encoding
+            // Load time base and return upper 32 bits
+            emit.LDR(arm64::X0, arm64::CTX_REG, ctx_offset_time_base());
+            emit.LSR_imm(arm64::X0, arm64::X0, 32);
             break;
         default:
             emit.MOV_imm(arm64::X0, 0);
@@ -2022,7 +2026,14 @@ void JitCompiler::emit_block_prologue(ARM64Emitter& emit) {
     // This avoids potential register corruption issues and simplifies debugging.
 }
 
-void JitCompiler::emit_block_epilogue(ARM64Emitter& emit) {
+void JitCompiler::emit_block_epilogue(ARM64Emitter& emit, u32 inst_count) {
+    // Increment time base register by actual cycles executed
+    // ~4 cycles per instruction to approximate Xbox 360's ~50MHz time base
+    u32 cycles = inst_count * 4;
+    emit.LDR(arm64::X0, arm64::CTX_REG, ctx_offset_time_base());
+    emit.ADD_imm(arm64::X0, arm64::X0, cycles);
+    emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_time_base());
+    
     // Restore callee-saved registers and return
     emit.ADD_imm(arm64::SP, arm64::SP, 48);
     emit.LDP(arm64::X21, arm64::X22, arm64::SP, -48);
@@ -2149,6 +2160,9 @@ CompiledBlock* JitCompiler::compile_block_unlocked(GuestAddr addr) {
     u32 inst_count = 0;
     bool block_ended = false;
     
+    // Reset instruction count for time_base tracking
+    current_block_inst_count_ = 0;
+    
     // Emit block prologue
     // The block is called with: X0 = ThreadContext*, X1 = memory_base
     // We need to set up CTX_REG (X19) and MEM_BASE (X20)
@@ -2166,6 +2180,9 @@ CompiledBlock* JitCompiler::compile_block_unlocked(GuestAddr addr) {
         LOGD("JIT compiling PC=0x%08llX inst=0x%08X type=%d opcode=%d", 
              (unsigned long long)pc, ppc_inst, (int)decoded.type, decoded.opcode);
         
+        // Track instruction count for time_base (including this instruction)
+        current_block_inst_count_ = inst_count + 1;
+        
         // Compile instruction
         compile_instruction(emit, ctx_template, decoded, pc);
         
@@ -2182,7 +2199,7 @@ CompiledBlock* JitCompiler::compile_block_unlocked(GuestAddr addr) {
     if (!block_ended) {
         emit.MOV_imm(arm64::X0, pc);
         emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_pc());
-        emit_block_epilogue(emit);
+        emit_block_epilogue(emit, inst_count);
     }
     
     block->size = inst_count;

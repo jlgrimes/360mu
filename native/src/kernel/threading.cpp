@@ -483,6 +483,24 @@ u32 KernelThreadManager::wait_for_multiple_objects(u32 count, const u32* handles
 
 u32 KernelThreadManager::perform_wait(const std::vector<KernelWaitable*>& objects,
                                        WaitType wait_type, bool alertable, s64* timeout_100ns) {
+    GuestThread* current = scheduler_ ? scheduler_->get_current_thread(0) : nullptr;
+    
+    // Check for pending APCs if alertable
+    if (alertable && current && current->has_pending_apcs()) {
+        // Process APCs and return STATUS_USER_APC
+        current->in_alertable_wait = true;
+        scheduler_->process_pending_apcs(current);
+        return nt::STATUS_USER_APC;
+    }
+    
+    // Check if already alerted
+    if (alertable && current && current->alerted) {
+        current->alerted = false;
+        current->in_alertable_wait = true;
+        scheduler_->process_pending_apcs(current);
+        return nt::STATUS_ALERTED;
+    }
+    
     // Calculate deadline
     bool infinite_wait = (timeout_100ns == nullptr);
     u64 deadline = 0;
@@ -498,7 +516,7 @@ u32 KernelThreadManager::perform_wait(const std::vector<KernelWaitable*>& object
                 // Satisfy the wait
                 for (auto* obj : objects) {
                     if (obj->is_signaled()) {
-                        obj->on_wait_satisfied(scheduler_ ? scheduler_->get_current_thread(0) : nullptr);
+                        obj->on_wait_satisfied(current);
                         if (wait_type == WaitType::WaitAny) break;
                     }
                 }
@@ -512,11 +530,31 @@ u32 KernelThreadManager::perform_wait(const std::vector<KernelWaitable*>& object
         }
     }
     
+    // Mark thread as in alertable wait if requested
+    if (alertable && current) {
+        current->in_alertable_wait = true;
+    }
+    
     // Wait loop
     while (true) {
+        // Check for pending APCs if alertable (APCs may have been queued during wait)
+        if (alertable && current) {
+            if (current->has_pending_apcs()) {
+                scheduler_->process_pending_apcs(current);
+                return nt::STATUS_USER_APC;
+            }
+            if (current->alerted) {
+                current->alerted = false;
+                scheduler_->process_pending_apcs(current);
+                return nt::STATUS_ALERTED;
+            }
+        }
+        
         // Check if wait is satisfied
         if (check_wait_satisfied(objects, wait_type)) {
-            GuestThread* current = scheduler_ ? scheduler_->get_current_thread(0) : nullptr;
+            if (alertable && current) {
+                current->in_alertable_wait = false;
+            }
             
             u32 result = nt::STATUS_WAIT_0;
             for (size_t i = 0; i < objects.size(); i++) {
@@ -541,16 +579,16 @@ u32 KernelThreadManager::perform_wait(const std::vector<KernelWaitable*>& object
         
         // Check timeout
         if (!infinite_wait && get_current_time_100ns() >= deadline) {
+            if (alertable && current) {
+                current->in_alertable_wait = false;
+            }
             stats_.wait_timeouts++;
             return nt::STATUS_TIMEOUT;
         }
         
         // Yield to allow other threads to run
-        if (scheduler_) {
-            GuestThread* current = scheduler_->get_current_thread(0);
-            if (current) {
-                scheduler_->yield(current);
-            }
+        if (scheduler_ && current) {
+            scheduler_->yield(current);
         }
         
         // Small sleep to prevent busy waiting
@@ -771,6 +809,23 @@ void KernelThreadManager::yield() {
 }
 
 u32 KernelThreadManager::delay_execution(bool alertable, s64* interval_100ns) {
+    GuestThread* current = scheduler_ ? scheduler_->get_current_thread(0) : nullptr;
+    
+    // Check for pending APCs if alertable
+    if (alertable && current && current->has_pending_apcs()) {
+        current->in_alertable_wait = true;
+        scheduler_->process_pending_apcs(current);
+        return nt::STATUS_USER_APC;
+    }
+    
+    // Check if already alerted
+    if (alertable && current && current->alerted) {
+        current->alerted = false;
+        current->in_alertable_wait = true;
+        scheduler_->process_pending_apcs(current);
+        return nt::STATUS_ALERTED;
+    }
+    
     if (!interval_100ns) {
         yield();
         return nt::STATUS_SUCCESS;
@@ -778,11 +833,40 @@ u32 KernelThreadManager::delay_execution(bool alertable, s64* interval_100ns) {
     
     s64 interval = *interval_100ns;
     
+    // Mark thread as in alertable wait if requested
+    if (alertable && current) {
+        current->in_alertable_wait = true;
+    }
+    
     if (interval < 0) {
         // Relative time in 100ns units (negative)
         u64 microseconds = static_cast<u64>(-interval) / 10;
         if (microseconds > 0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(microseconds));
+            // For alertable waits, we need to check for APCs periodically
+            if (alertable && current) {
+                u64 remaining_us = microseconds;
+                constexpr u64 check_interval_us = 1000;  // Check every 1ms
+                
+                while (remaining_us > 0) {
+                    // Check for APCs
+                    if (current->has_pending_apcs()) {
+                        scheduler_->process_pending_apcs(current);
+                        return nt::STATUS_USER_APC;
+                    }
+                    if (current->alerted) {
+                        current->alerted = false;
+                        scheduler_->process_pending_apcs(current);
+                        return nt::STATUS_ALERTED;
+                    }
+                    
+                    u64 sleep_us = std::min(remaining_us, check_interval_us);
+                    std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+                    remaining_us -= sleep_us;
+                }
+                current->in_alertable_wait = false;
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(microseconds));
+            }
         } else {
             yield();
         }
@@ -792,9 +876,38 @@ u32 KernelThreadManager::delay_execution(bool alertable, s64* interval_100ns) {
         // Absolute time - calculate delay from current time
         u64 now = get_current_time_100ns();
         if (static_cast<u64>(interval) > now) {
-            u64 delay = static_cast<u64>(interval) - now;
-            std::this_thread::sleep_for(std::chrono::nanoseconds(delay * 100));
+            u64 delay_100ns = static_cast<u64>(interval) - now;
+            u64 delay_us = delay_100ns / 10;
+            
+            // For alertable waits, check for APCs periodically
+            if (alertable && current && delay_us > 0) {
+                constexpr u64 check_interval_us = 1000;  // Check every 1ms
+                
+                while (delay_us > 0) {
+                    // Check for APCs
+                    if (current->has_pending_apcs()) {
+                        scheduler_->process_pending_apcs(current);
+                        return nt::STATUS_USER_APC;
+                    }
+                    if (current->alerted) {
+                        current->alerted = false;
+                        scheduler_->process_pending_apcs(current);
+                        return nt::STATUS_ALERTED;
+                    }
+                    
+                    u64 sleep_us = std::min(delay_us, check_interval_us);
+                    std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+                    delay_us -= sleep_us;
+                }
+                current->in_alertable_wait = false;
+            } else {
+                std::this_thread::sleep_for(std::chrono::nanoseconds(delay_100ns * 100));
+            }
         }
+    }
+    
+    if (alertable && current) {
+        current->in_alertable_wait = false;
     }
     
     return nt::STATUS_SUCCESS;

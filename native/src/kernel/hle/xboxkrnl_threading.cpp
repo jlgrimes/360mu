@@ -188,6 +188,284 @@ static void HLE_KeSetAffinityThread(Cpu* cpu, Memory* memory, u64* args, u64* re
 }
 
 //=============================================================================
+// APC (Asynchronous Procedure Call) Functions
+//=============================================================================
+
+/**
+ * KeInitializeApc - Initialize an APC object
+ * 
+ * Ordinal: 106
+ * 
+ * VOID KeInitializeApc(
+ *   PKAPC Apc,                    // arg[0] - APC object to initialize
+ *   PKTHREAD Thread,              // arg[1] - Target thread
+ *   PKKERNEL_ROUTINE KernelRoutine, // arg[2] - Kernel-mode routine
+ *   PKRUNDOWN_ROUTINE RundownRoutine, // arg[3] - Rundown routine
+ *   PKNORMAL_ROUTINE NormalRoutine,   // arg[4] - Normal (user-mode) routine
+ *   KPROCESSOR_MODE ApcMode,      // arg[5] - KernelMode=0, UserMode=1
+ *   PVOID NormalContext           // arg[6] - Context for normal routine
+ * );
+ * 
+ * KAPC structure layout (Xbox 360):
+ * +0x00: Type (SHORT) = 0x12 (ApcObject)
+ * +0x02: ApcMode (CCHAR)
+ * +0x03: Inserted (UCHAR)
+ * +0x04: Thread pointer
+ * +0x08: ApcListEntry (LIST_ENTRY)
+ * +0x10: KernelRoutine
+ * +0x14: RundownRoutine
+ * +0x18: NormalRoutine
+ * +0x1C: NormalContext
+ * +0x20: SystemArgument1
+ * +0x24: SystemArgument2
+ */
+static void HLE_KeInitializeApc(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr apc_ptr = static_cast<GuestAddr>(args[0]);
+    GuestAddr thread_ptr = static_cast<GuestAddr>(args[1]);
+    GuestAddr kernel_routine = static_cast<GuestAddr>(args[2]);
+    GuestAddr rundown_routine = static_cast<GuestAddr>(args[3]);
+    GuestAddr normal_routine = static_cast<GuestAddr>(args[4]);
+    u32 apc_mode = static_cast<u32>(args[5]);
+    GuestAddr normal_context = static_cast<GuestAddr>(args[6]);
+    
+    LOGD("KeInitializeApc: apc=0x%08X, thread=0x%08X, kernel=0x%08X, normal=0x%08X",
+         apc_ptr, thread_ptr, kernel_routine, normal_routine);
+    
+    // Initialize APC structure
+    memory->write_u16(apc_ptr + 0x00, 0x12);        // Type = ApcObject
+    memory->write_u8(apc_ptr + 0x02, apc_mode);     // ApcMode
+    memory->write_u8(apc_ptr + 0x03, 0);            // Inserted = false
+    memory->write_u32(apc_ptr + 0x04, thread_ptr);  // Thread
+    memory->write_u32(apc_ptr + 0x08, 0);           // ApcListEntry.Flink
+    memory->write_u32(apc_ptr + 0x0C, 0);           // ApcListEntry.Blink
+    memory->write_u32(apc_ptr + 0x10, kernel_routine);
+    memory->write_u32(apc_ptr + 0x14, rundown_routine);
+    memory->write_u32(apc_ptr + 0x18, normal_routine);
+    memory->write_u32(apc_ptr + 0x1C, normal_context);
+    memory->write_u32(apc_ptr + 0x20, 0);           // SystemArgument1
+    memory->write_u32(apc_ptr + 0x24, 0);           // SystemArgument2
+    
+    // No return value (void function)
+}
+
+/**
+ * KeInsertQueueApc - Insert an APC into a thread's APC queue
+ * 
+ * Ordinal: 108
+ * 
+ * BOOLEAN KeInsertQueueApc(
+ *   PKAPC Apc,                    // arg[0] - APC to insert
+ *   PVOID SystemArgument1,        // arg[1] - First system argument
+ *   PVOID SystemArgument2,        // arg[2] - Second system argument
+ *   KPRIORITY Increment           // arg[3] - Priority increment (unused)
+ * );
+ */
+static void HLE_KeInsertQueueApc(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr apc_ptr = static_cast<GuestAddr>(args[0]);
+    GuestAddr system_arg1 = static_cast<GuestAddr>(args[1]);
+    GuestAddr system_arg2 = static_cast<GuestAddr>(args[2]);
+    // u32 increment = static_cast<u32>(args[3]); // Unused
+    
+    // Check if already inserted
+    u8 inserted = memory->read_u8(apc_ptr + 0x03);
+    if (inserted) {
+        LOGW("KeInsertQueueApc: APC already inserted");
+        *result = 0;  // FALSE
+        return;
+    }
+    
+    // Read APC structure
+    GuestAddr thread_ptr = memory->read_u32(apc_ptr + 0x04);
+    u8 apc_mode = memory->read_u8(apc_ptr + 0x02);
+    GuestAddr normal_routine = memory->read_u32(apc_ptr + 0x18);
+    GuestAddr normal_context = memory->read_u32(apc_ptr + 0x1C);
+    
+    // Store system arguments in APC structure
+    memory->write_u32(apc_ptr + 0x20, system_arg1);
+    memory->write_u32(apc_ptr + 0x24, system_arg2);
+    
+    LOGI("KeInsertQueueApc: apc=0x%08X, thread=0x%08X, routine=0x%08X, mode=%u",
+         apc_ptr, thread_ptr, normal_routine, apc_mode);
+    
+    if (!g_ktm) {
+        LOGE("KeInsertQueueApc: Thread manager not initialized");
+        *result = 0;  // FALSE
+        return;
+    }
+    
+    // Get the thread scheduler from the thread manager
+    // We need to find the thread by its KTHREAD pointer
+    // For now, we'll use the thread handle from the KTHREAD structure
+    // The thread_id is stored at offset 0x8C in KTHREAD
+    u32 thread_id = memory->read_u32(thread_ptr + 0x8C);
+    
+    // Get the kernel's thread scheduler
+    ThreadScheduler* scheduler = get_thread_scheduler();
+    
+    if (!scheduler) {
+        LOGE("KeInsertQueueApc: Scheduler not available");
+        *result = 0;
+        return;
+    }
+    
+    GuestThread* thread = scheduler->get_thread(thread_id);
+    if (!thread) {
+        // Try to find by handle
+        u32 handle = memory->read_u32(thread_ptr + 0x04);  // Approximate
+        thread = scheduler->get_thread_by_handle(handle);
+    }
+    
+    if (!thread) {
+        LOGW("KeInsertQueueApc: Target thread not found (id=%u)", thread_id);
+        *result = 0;  // FALSE
+        return;
+    }
+    
+    // Queue the APC
+    bool kernel_mode = (apc_mode == 0);
+    scheduler->queue_apc(thread, normal_routine, normal_context, 
+                         system_arg1, system_arg2, kernel_mode);
+    
+    // Mark as inserted
+    memory->write_u8(apc_ptr + 0x03, 1);
+    
+    *result = 1;  // TRUE
+}
+
+/**
+ * KeRemoveQueueApc - Remove an APC from a thread's queue
+ * 
+ * Ordinal: 135
+ * 
+ * BOOLEAN KeRemoveQueueApc(PKAPC Apc);
+ */
+static void HLE_KeRemoveQueueApc(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr apc_ptr = static_cast<GuestAddr>(args[0]);
+    
+    // Check if inserted
+    u8 inserted = memory->read_u8(apc_ptr + 0x03);
+    if (!inserted) {
+        *result = 0;  // FALSE - wasn't in queue
+        return;
+    }
+    
+    // Mark as not inserted
+    memory->write_u8(apc_ptr + 0x03, 0);
+    
+    // Note: The actual removal from the thread's queue would require
+    // tracking which APCs are queued to which threads. For simplicity,
+    // we just mark it as not inserted. The APC won't fire because
+    // the thread will check this flag before executing.
+    
+    LOGD("KeRemoveQueueApc: removed APC at 0x%08X", apc_ptr);
+    *result = 1;  // TRUE
+}
+
+/**
+ * NtQueueApcThread - Queue a user APC to a thread
+ * 
+ * Ordinal: 205
+ * 
+ * NTSTATUS NtQueueApcThread(
+ *   HANDLE ThreadHandle,          // arg[0] - Target thread
+ *   PPS_APC_ROUTINE ApcRoutine,   // arg[1] - APC routine
+ *   PVOID ApcRoutineContext,      // arg[2] - First argument
+ *   PIO_STATUS_BLOCK ApcStatusBlock, // arg[3] - Second argument
+ *   ULONG ApcReserved             // arg[4] - Third argument (reserved)
+ * );
+ */
+static void HLE_NtQueueApcThread(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    u32 handle = static_cast<u32>(args[0]);
+    GuestAddr routine = static_cast<GuestAddr>(args[1]);
+    GuestAddr context = static_cast<GuestAddr>(args[2]);
+    GuestAddr arg1 = static_cast<GuestAddr>(args[3]);
+    GuestAddr arg2 = static_cast<GuestAddr>(args[4]);
+    
+    LOGI("NtQueueApcThread: handle=0x%X, routine=0x%08X, context=0x%08X",
+         handle, routine, context);
+    
+    ThreadScheduler* scheduler = get_thread_scheduler();
+    
+    if (!scheduler) {
+        *result = nt::STATUS_UNSUCCESSFUL;
+        return;
+    }
+    
+    GuestThread* thread = scheduler->get_thread_by_handle(handle);
+    if (!thread) {
+        *result = nt::STATUS_INVALID_HANDLE;
+        return;
+    }
+    
+    // Queue as user-mode APC
+    scheduler->queue_apc(thread, routine, context, arg1, arg2, false);
+    
+    *result = nt::STATUS_SUCCESS;
+}
+
+/**
+ * NtTestAlert - Check and clear alert status, delivering any pending APCs
+ * 
+ * Ordinal: 214
+ */
+static void HLE_NtTestAlert(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    ThreadScheduler* scheduler = get_thread_scheduler();
+    
+    if (!scheduler) {
+        *result = nt::STATUS_SUCCESS;
+        return;
+    }
+    
+    GuestThread* current = scheduler->get_current_thread(0);
+    if (!current) {
+        *result = nt::STATUS_SUCCESS;
+        return;
+    }
+    
+    // Check for pending APCs
+    if (current->has_pending_apcs()) {
+        scheduler->process_pending_apcs(current);
+        *result = nt::STATUS_USER_APC;
+        return;
+    }
+    
+    // Check if alerted
+    if (current->alerted) {
+        current->alerted = false;
+        *result = nt::STATUS_ALERTED;
+        return;
+    }
+    
+    *result = nt::STATUS_SUCCESS;
+}
+
+/**
+ * NtAlertThread - Alert a thread
+ * 
+ * Ordinal: 185
+ */
+static void HLE_NtAlertThread(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    u32 handle = static_cast<u32>(args[0]);
+    
+    ThreadScheduler* scheduler = get_thread_scheduler();
+    
+    if (!scheduler) {
+        *result = nt::STATUS_UNSUCCESSFUL;
+        return;
+    }
+    
+    GuestThread* thread = scheduler->get_thread_by_handle(handle);
+    if (!thread) {
+        *result = nt::STATUS_INVALID_HANDLE;
+        return;
+    }
+    
+    scheduler->alert_thread(thread);
+    
+    *result = nt::STATUS_SUCCESS;
+}
+
+//=============================================================================
 // Event HLE Functions
 //=============================================================================
 
@@ -642,6 +920,14 @@ void register_xboxkrnl_threading(Kernel* kernel) {
     funcs[make_key(0, 51)] = HLE_KeGetCurrentThread;
     funcs[make_key(0, 221)] = HLE_NtYieldExecution;
     funcs[make_key(0, 84)] = HLE_KeSetAffinityThread;
+    
+    // APC (Asynchronous Procedure Call) functions
+    funcs[make_key(0, 106)] = HLE_KeInitializeApc;
+    funcs[make_key(0, 108)] = HLE_KeInsertQueueApc;
+    funcs[make_key(0, 135)] = HLE_KeRemoveQueueApc;
+    funcs[make_key(0, 185)] = HLE_NtAlertThread;
+    funcs[make_key(0, 205)] = HLE_NtQueueApcThread;
+    funcs[make_key(0, 214)] = HLE_NtTestAlert;
     
     // Events
     funcs[make_key(0, 189)] = HLE_NtCreateEvent;

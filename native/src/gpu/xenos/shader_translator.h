@@ -318,6 +318,8 @@ public:
     u32 f_ord_greater_than_equal(u32 type, u32 a, u32 b);
     u32 i_equal(u32 type, u32 a, u32 b);
     u32 i_not_equal(u32 type, u32 a, u32 b);
+    u32 s_less_than(u32 type, u32 a, u32 b);
+    u32 s_greater_than_equal(u32 type, u32 a, u32 b);
     
     // === Logical ===
     u32 logical_and(u32 type, u32 a, u32 b);
@@ -755,8 +757,13 @@ private:
             u32 continue_label;
             u32 merge_label;
             u32 counter_var;
+            u32 loop_const_idx;  // Which loop constant this uses
         };
         std::vector<LoopInfo> loop_stack;
+        
+        // Predication tracking
+        bool in_predicated_block = false;
+        u32 predicate_merge_label = 0;
         
         // Constant values (cached for reuse)
         u32 const_zero;
@@ -838,6 +845,9 @@ private:
     u32 get_constant(TranslationContext& ctx, u32 index);
     u32 get_bool_constant(TranslationContext& ctx, u32 index);
     u32 get_loop_constant(TranslationContext& ctx, u32 index);
+    
+    // Helper to get loop constant as packed u32 value for control flow setup
+    u32 get_loop_constant_value(TranslationContext& ctx, u32 index);
 };
 
 } // namespace x360mu

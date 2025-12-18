@@ -1769,4 +1769,9 @@ void set_thread_scheduler(ThreadScheduler* scheduler) {
     g_scheduler = scheduler;
 }
 
+// Get scheduler pointer for thread management (used by APC functions)
+ThreadScheduler* get_thread_scheduler() {
+    return g_scheduler;
+}
+
 } // namespace x360mu

@@ -295,12 +295,45 @@ void XThread::wake_from_wait(u32 result) {
 }
 
 void XThread::delay(u64 interval_100ns, bool alertable) {
-    (void)alertable;  // TODO: Handle alertable waits
+    // Check for pending APCs if alertable
+    if (alertable && has_pending_apcs()) {
+        process_pending_apcs();
+        return;  // Return immediately with APCs processed
+    }
+    
+    // Check if already alerted
+    if (alertable && alerted_) {
+        alerted_ = false;
+        process_pending_apcs();
+        return;
+    }
     
     state_ = XThreadState::Waiting;
     
-    auto duration = std::chrono::nanoseconds(interval_100ns * 100);
-    std::this_thread::sleep_for(duration);
+    u64 remaining_100ns = interval_100ns;
+    constexpr u64 check_interval_100ns = 10000;  // Check every 1ms (10000 * 100ns)
+    
+    while (remaining_100ns > 0) {
+        // For alertable waits, check for APCs periodically
+        if (alertable) {
+            if (has_pending_apcs()) {
+                state_ = XThreadState::Ready;
+                process_pending_apcs();
+                return;
+            }
+            if (alerted_) {
+                alerted_ = false;
+                state_ = XThreadState::Ready;
+                process_pending_apcs();
+                return;
+            }
+        }
+        
+        u64 sleep_100ns = std::min(remaining_100ns, check_interval_100ns);
+        auto duration = std::chrono::nanoseconds(sleep_100ns * 100);
+        std::this_thread::sleep_for(duration);
+        remaining_100ns -= sleep_100ns;
+    }
     
     state_ = XThreadState::Ready;
 }
@@ -321,23 +354,109 @@ void XThread::set_affinity(u32 mask) {
     }
 }
 
-void XThread::queue_apc(GuestAddr routine, GuestAddr context) {
+void XThread::queue_apc(GuestAddr routine, GuestAddr context,
+                        GuestAddr arg1, GuestAddr arg2, bool kernel_mode) {
     std::lock_guard<std::mutex> lock(apc_mutex_);
-    apc_queue_.push_back({routine, context});
+    
+    Apc apc;
+    apc.routine = routine;
+    apc.context = context;
+    apc.system_arg1 = arg1;
+    apc.system_arg2 = arg2;
+    apc.kernel_mode = kernel_mode;
+    
+    if (kernel_mode) {
+        // Kernel APCs go to front
+        apc_queue_.insert(apc_queue_.begin(), apc);
+    } else {
+        // User APCs go to back
+        apc_queue_.push_back(apc);
+    }
+    
+    LOGD("Queued APC to thread %u: routine=0x%08X, context=0x%08X, kernel=%d",
+         thread_id_, routine, context, kernel_mode);
+    
+    // If kernel-mode APC, alert the thread
+    if (kernel_mode) {
+        alert();
+    }
+}
+
+bool XThread::has_pending_apcs() const {
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(apc_mutex_));
+    return !apc_queue_.empty();
+}
+
+u32 XThread::process_pending_apcs() {
+    if (!cpu_) {
+        LOGW("Cannot process APCs: no CPU reference");
+        return 0;
+    }
+    
+    u32 count = 0;
+    
+    while (true) {
+        Apc apc;
+        {
+            std::lock_guard<std::mutex> lock(apc_mutex_);
+            if (apc_queue_.empty()) {
+                break;
+            }
+            apc = apc_queue_.front();
+            apc_queue_.erase(apc_queue_.begin());
+        }
+        
+        LOGI("Executing APC: routine=0x%08X, context=0x%08X",
+             apc.routine, apc.context);
+        
+        // Call the APC routine
+        // APC signature: void ApcRoutine(PVOID context, PVOID arg1, PVOID arg2)
+        auto& ctx = cpu_->get_context(cpu_thread_id_);
+        
+        // Save current state
+        GuestAddr saved_pc = ctx.pc;
+        GuestAddr saved_lr = ctx.lr;
+        u64 saved_r3 = ctx.gpr[3];
+        u64 saved_r4 = ctx.gpr[4];
+        u64 saved_r5 = ctx.gpr[5];
+        
+        // Set up APC call
+        ctx.gpr[3] = apc.context;       // First argument
+        ctx.gpr[4] = apc.system_arg1;   // Second argument
+        ctx.gpr[5] = apc.system_arg2;   // Third argument
+        ctx.lr = saved_pc;              // Return to current PC
+        ctx.pc = apc.routine;           // Jump to APC routine
+        
+        // Execute until return
+        // Execute for a limited number of cycles
+        cpu_->execute_thread(cpu_thread_id_, 100000);
+        
+        // If the APC didn't return properly, restore state
+        if (ctx.pc != saved_pc) {
+            LOGW("APC routine didn't return properly, forcing return");
+            ctx.pc = saved_pc;
+            ctx.lr = saved_lr;
+            ctx.gpr[3] = saved_r3;
+            ctx.gpr[4] = saved_r4;
+            ctx.gpr[5] = saved_r5;
+        }
+        
+        count++;
+    }
+    
+    alerted_ = false;
+    return count;
+}
+
+void XThread::alert() {
+    alerted_ = true;
+    // Wake up the thread if it's waiting
+    wake_from_wait(WAIT_IO_COMPLETION);  // 0x000000C0 = STATUS_USER_APC
 }
 
 void XThread::deliver_apcs() {
-    std::vector<Apc> apcs;
-    {
-        std::lock_guard<std::mutex> lock(apc_mutex_);
-        apcs.swap(apc_queue_);
-    }
-    
-    // TODO: Actually execute APCs
-    for (const auto& apc : apcs) {
-        LOGD("Delivering APC: routine=0x%08X, context=0x%08X",
-             apc.routine, apc.context);
-    }
+    // Legacy method - just process pending APCs
+    process_pending_apcs();
 }
 
 //=============================================================================

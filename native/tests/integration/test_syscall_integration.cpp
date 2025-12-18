@@ -140,8 +140,8 @@ TEST_F(SyscallIntegrationTest, NtAllocateVirtualMemory_SpecificAddress) {
     GuestAddr base_addr_ptr = 0x10000;
     GuestAddr region_size_ptr = 0x10010;
     
-    // Request specific address
-    GuestAddr requested_addr = 0x20000000;
+    // Request specific address - use a valid address within 512MB physical memory
+    GuestAddr requested_addr = 0x10000000;  // 256MB - well within limits
     memory_->write_u32(base_addr_ptr, requested_addr);
     memory_->write_u32(region_size_ptr, 0x10000);
     
@@ -295,7 +295,10 @@ TEST_F(SyscallIntegrationTest, SemaphoreInitAndRelease) {
     u64 result = 0;
     call_hle_function(60, nullptr, &result);
     
-    // Verify structure
+    // Verify structure - semaphore type is 5
+    u8 type = memory_->read_u8(sem_addr);
+    EXPECT_EQ(type, 5u);
+    
     u32 signal_state = memory_->read_u32(sem_addr + 4);
     EXPECT_EQ(signal_state, 2u);  // Initial count
     
@@ -305,6 +308,9 @@ TEST_F(SyscallIntegrationTest, SemaphoreInitAndRelease) {
     // arg2 = Wait
     setup_syscall_args(sem_addr, 3, 0);  // Release 3
     call_hle_function(108, nullptr, &result);
+    
+    // Result should be previous count (2)
+    EXPECT_EQ(result, 2u);
     
     // New count should be 5 (was 2, released 3)
     signal_state = memory_->read_u32(sem_addr + 4);

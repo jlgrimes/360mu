@@ -53,45 +53,45 @@ protected:
                                         u32 image_size = 0x10000) {
         std::vector<u8> xex(1024, 0);
         
-        // File header (24 bytes)
+        // File header (24 bytes) - all fields are big-endian
         // Magic: 'XEX2'
         xex[0] = 'X'; xex[1] = 'E'; xex[2] = 'X'; xex[3] = '2';
         
-        // Module flags (title flag)
-        xex[4] = 0x01; xex[5] = 0x00; xex[6] = 0x00; xex[7] = 0x00;
+        // Module flags (title flag = 0x00000001) - big endian
+        xex[4] = 0x00; xex[5] = 0x00; xex[6] = 0x00; xex[7] = 0x01;
         
-        // PE data offset (256)
-        xex[8] = 0x00; xex[9] = 0x01; xex[10] = 0x00; xex[11] = 0x00;
+        // PE data offset (256 = 0x100) - big endian
+        xex[8] = 0x00; xex[9] = 0x00; xex[10] = 0x01; xex[11] = 0x00;
         
         // Reserved
         xex[12] = 0x00; xex[13] = 0x00; xex[14] = 0x00; xex[15] = 0x00;
         
-        // Security offset (128)
-        xex[16] = 0x80; xex[17] = 0x00; xex[18] = 0x00; xex[19] = 0x00;
+        // Security offset (128 = 0x80) - big endian
+        xex[16] = 0x00; xex[17] = 0x00; xex[18] = 0x00; xex[19] = 0x80;
         
-        // Header count (2)
-        xex[20] = 0x02; xex[21] = 0x00; xex[22] = 0x00; xex[23] = 0x00;
+        // Header count (2) - big endian
+        xex[20] = 0x00; xex[21] = 0x00; xex[22] = 0x00; xex[23] = 0x02;
         
-        // Optional header 1: ImageBaseAddress (key=0x00010201)
-        xex[24] = 0x01; xex[25] = 0x02; xex[26] = 0x01; xex[27] = 0x00;
-        // Value = base_address
+        // Optional header 1: ImageBaseAddress (key=0x00010201) - big endian
+        xex[24] = 0x00; xex[25] = 0x01; xex[26] = 0x02; xex[27] = 0x01;
+        // Value = base_address (big endian)
         xex[28] = (base_address >> 24) & 0xFF;
         xex[29] = (base_address >> 16) & 0xFF;
         xex[30] = (base_address >> 8) & 0xFF;
         xex[31] = base_address & 0xFF;
         
-        // Optional header 2: EntryPoint (key=0x00010100)
+        // Optional header 2: EntryPoint (key=0x00010100) - big endian
         xex[32] = 0x00; xex[33] = 0x01; xex[34] = 0x01; xex[35] = 0x00;
-        // Value = entry_point
+        // Value = entry_point (big endian)
         xex[36] = (entry_point >> 24) & 0xFF;
         xex[37] = (entry_point >> 16) & 0xFF;
         xex[38] = (entry_point >> 8) & 0xFF;
         xex[39] = entry_point & 0xFF;
         
-        // Security info (at offset 128)
-        // Header size
-        xex[128] = 0x00; xex[129] = 0x01; xex[130] = 0x00; xex[131] = 0x00;
-        // Image size
+        // Security info (at offset 128) - big endian
+        // Header size (0x100 = 256)
+        xex[128] = 0x00; xex[129] = 0x00; xex[130] = 0x01; xex[131] = 0x00;
+        // Image size (big endian)
         xex[132] = (image_size >> 24) & 0xFF;
         xex[133] = (image_size >> 16) & 0xFF;
         xex[134] = (image_size >> 8) & 0xFF;

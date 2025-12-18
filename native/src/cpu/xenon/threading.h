@@ -13,6 +13,7 @@
 #include "x360mu/types.h"
 #include "cpu.h"
 #include <vector>
+#include <deque>
 #include <queue>
 #include <mutex>
 #include <condition_variable>
@@ -64,6 +65,20 @@ enum CpuAffinity : u32 {
 };
 
 /**
+ * APC (Asynchronous Procedure Call) Entry
+ * 
+ * APCs are callbacks queued to a specific thread. User-mode APCs
+ * are only delivered when the thread enters an alertable wait state.
+ */
+struct ApcEntry {
+    GuestAddr routine;       // Function to call
+    GuestAddr context;       // First argument (context pointer)
+    GuestAddr system_arg1;   // Second argument
+    GuestAddr system_arg2;   // Third argument
+    bool kernel_mode;        // Kernel-mode APCs execute immediately
+};
+
+/**
  * Represents a guest thread
  */
 struct GuestThread {
@@ -108,6 +123,12 @@ struct GuestThread {
     GuestThread* next;
     GuestThread* prev;
     
+    // APC (Asynchronous Procedure Call) support
+    std::deque<ApcEntry> apc_queue;
+    std::mutex apc_mutex;
+    bool alerted;               // Thread has been alerted
+    bool in_alertable_wait;     // Currently in an alertable wait
+    
     void reset() {
         context.reset();
         state = ThreadState::Created;
@@ -121,6 +142,52 @@ struct GuestThread {
         host_thread = nullptr;
         next = prev = nullptr;
         tls_slots.fill(0);
+        apc_queue.clear();
+        alerted = false;
+        in_alertable_wait = false;
+    }
+    
+    /**
+     * Queue an APC to this thread
+     * @param routine Guest address of APC routine
+     * @param context Context pointer passed to routine
+     * @param arg1 First system argument
+     * @param arg2 Second system argument
+     * @param kernel_mode If true, executes immediately
+     */
+    void queue_apc(GuestAddr routine, GuestAddr ctx, GuestAddr arg1, 
+                   GuestAddr arg2, bool kernel_mode = false) {
+        std::lock_guard<std::mutex> lock(apc_mutex);
+        
+        ApcEntry apc;
+        apc.routine = routine;
+        apc.context = ctx;
+        apc.system_arg1 = arg1;
+        apc.system_arg2 = arg2;
+        apc.kernel_mode = kernel_mode;
+        
+        if (kernel_mode) {
+            // Kernel APCs go to front of queue
+            apc_queue.push_front(apc);
+        } else {
+            // User APCs go to back
+            apc_queue.push_back(apc);
+        }
+    }
+    
+    /**
+     * Check if there are pending user-mode APCs
+     */
+    bool has_pending_apcs() const {
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(apc_mutex));
+        return !apc_queue.empty();
+    }
+    
+    /**
+     * Alert this thread (causes alertable waits to return)
+     */
+    void alert() {
+        alerted = true;
     }
 };
 
@@ -232,6 +299,31 @@ public:
      * Signal a synchronization object
      */
     void signal_object(GuestAddr object);
+    
+    /**
+     * Queue an APC to a thread
+     * @param thread Target thread
+     * @param routine Guest address of APC routine
+     * @param context Context pointer
+     * @param arg1 System argument 1
+     * @param arg2 System argument 2
+     * @param kernel_mode If true, this is a kernel-mode APC
+     */
+    void queue_apc(GuestThread* thread, GuestAddr routine, GuestAddr context,
+                   GuestAddr arg1, GuestAddr arg2, bool kernel_mode);
+    
+    /**
+     * Process pending APCs for a thread
+     * Called when thread enters alertable wait or is alerted
+     * @param thread Thread to process APCs for
+     * @return Number of APCs processed
+     */
+    u32 process_pending_apcs(GuestThread* thread);
+    
+    /**
+     * Alert a thread (causes alertable waits to return with STATUS_ALERTED)
+     */
+    void alert_thread(GuestThread* thread);
     
     /**
      * Get thread by ID

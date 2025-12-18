@@ -129,8 +129,13 @@ public:
     bool is_terminated() const { return state_ == XThreadState::Terminated; }
     
     // APC (Asynchronous Procedure Call) support
-    void queue_apc(GuestAddr routine, GuestAddr context);
+    void queue_apc(GuestAddr routine, GuestAddr context,
+                   GuestAddr arg1 = 0, GuestAddr arg2 = 0, bool kernel_mode = false);
     void deliver_apcs();
+    bool has_pending_apcs() const;
+    u32 process_pending_apcs();
+    void alert();
+    bool is_alerted() const { return alerted_; }
     
     // System thread flag
     bool is_system_thread() const { return is_system_thread_; }
@@ -182,8 +187,12 @@ private:
     struct Apc {
         GuestAddr routine;
         GuestAddr context;
+        GuestAddr system_arg1;
+        GuestAddr system_arg2;
+        bool kernel_mode;
     };
     std::vector<Apc> apc_queue_;
+    std::atomic<bool> alerted_{false};
     
     // Internal
     void thread_main();

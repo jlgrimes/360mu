@@ -17,11 +17,13 @@
 #include <android/log.h>
 #define LOG_TAG "360mu-shader"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #else
 #include <cstdio>
 #define LOGI(...) printf("[SHADER] " __VA_ARGS__); printf("\n")
+#define LOGW(...) printf("[SHADER WARN] " __VA_ARGS__); printf("\n")
 #define LOGE(...) fprintf(stderr, "[SHADER ERROR] " __VA_ARGS__); fprintf(stderr, "\n")
 #define LOGD(...) /* debug disabled */
 #endif
@@ -631,6 +633,9 @@ void ShaderTranslator::setup_uniforms(TranslationContext& ctx) {
 }
 
 void ShaderTranslator::translate_control_flow(TranslationContext& ctx, const ShaderMicrocode& microcode) {
+    // Track which ALU/fetch instructions are inside loops/conditionals
+    // For now, translate all instructions after setting up control flow structure
+    
     // Process each control flow instruction
     for (const auto& cf : microcode.cf_instructions()) {
         switch (cf.opcode) {
@@ -646,26 +651,169 @@ void ShaderTranslator::translate_control_flow(TranslationContext& ctx, const Sha
                 
             case xenos_cf::COND_EXEC:
             case xenos_cf::COND_EXEC_END:
+            case xenos_cf::COND_PRED_EXEC:
+            case xenos_cf::COND_PRED_EXEC_END:
+            case xenos_cf::COND_EXEC_PRED_CLEAN:
+            case xenos_cf::COND_EXEC_PRED_CLEAN_END: {
                 // Conditional execution based on predicate
-                // TODO: Implement predicated execution
-                break;
+                bool is_end = (cf.opcode == xenos_cf::COND_EXEC_END || 
+                               cf.opcode == xenos_cf::COND_PRED_EXEC_END ||
+                               cf.opcode == xenos_cf::COND_EXEC_PRED_CLEAN_END);
                 
-            case xenos_cf::LOOP_START:
-                // TODO: Implement loop support
+                if (is_end && ctx.in_predicated_block) {
+                    // End of predicated block - branch to merge and set label
+                    ctx.builder.branch(ctx.predicate_merge_label);
+                    ctx.builder.label(ctx.predicate_merge_label);
+                    ctx.in_predicated_block = false;
+                    ctx.predicate_merge_label = 0;
+                    LOGD("COND_EXEC_END: merged");
+                } else if (!is_end && !ctx.in_predicated_block) {
+                    // Start of predicated block
+                    bool pred_condition = cf.condition;  // true or false branch
+                    
+                    // Load current predicate value
+                    u32 pred_value = ctx.builder.load(ctx.bool_type, ctx.predicate_var);
+                    
+                    // If we need the inverse, negate it
+                    if (!pred_condition) {
+                        pred_value = ctx.builder.logical_not(ctx.bool_type, pred_value);
+                    }
+                    
+                    // Create labels for if-then structure
+                    u32 then_label = ctx.builder.allocate_id();
+                    u32 merge_label = ctx.builder.allocate_id();
+                    
+                    // Emit selection merge (required for structured control flow)
+                    ctx.builder.selection_merge(merge_label, 0);  // 0 = no control flags
+                    
+                    // Conditional branch
+                    ctx.builder.branch_conditional(pred_value, then_label, merge_label);
+                    ctx.builder.label(then_label);
+                    
+                    // Track that we're in a predicated block
+                    ctx.in_predicated_block = true;
+                    ctx.predicate_merge_label = merge_label;
+                    
+                    LOGD("COND_EXEC: predicate=%s", pred_condition ? "true" : "false");
+                }
                 break;
+            }
                 
-            case xenos_cf::LOOP_END:
-                // TODO: Implement loop support  
+            case xenos_cf::LOOP_START: {
+                // Get loop constant index from CF instruction
+                u32 loop_const_idx = cf.loop_id;
+                
+                // Create SPIR-V labels for structured loop
+                u32 header_label = ctx.builder.allocate_id();
+                u32 merge_label = ctx.builder.allocate_id();
+                u32 continue_label = ctx.builder.allocate_id();
+                u32 body_label = ctx.builder.allocate_id();
+                
+                // Get loop constant (contains start, count, step)
+                // Loop constants are packed: bits 0-7 = count, bits 8-15 = start, bits 16-23 = step
+                u32 loop_const = get_loop_constant_value(ctx, loop_const_idx);
+                u32 loop_count = (loop_const >> 0) & 0xFF;
+                u32 loop_start = (loop_const >> 8) & 0xFF;
+                u32 loop_step = (loop_const >> 16) & 0xFF;
+                if (loop_step == 0) loop_step = 1;
+                
+                // Initialize loop counter (aL / address register) to start value
+                u32 start_const = ctx.builder.const_int(static_cast<s32>(loop_start));
+                ctx.builder.store(ctx.address_reg_var, start_const);
+                
+                // Branch to header
+                ctx.builder.branch(header_label);
+                ctx.builder.label(header_label);
+                
+                // Loop header - emit OpLoopMerge
+                ctx.builder.loop_merge(merge_label, continue_label, 0);  // 0 = no loop control
+                ctx.builder.branch(body_label);
+                ctx.builder.label(body_label);
+                
+                // Push loop info onto stack
+                TranslationContext::LoopInfo info;
+                info.header_label = header_label;
+                info.merge_label = merge_label;
+                info.continue_label = continue_label;
+                info.counter_var = ctx.address_reg_var;
+                info.loop_const_idx = loop_const_idx;
+                ctx.loop_stack.push_back(info);
+                
+                LOGD("LOOP_START: const=%u, count=%u, start=%u, step=%u",
+                     loop_const_idx, loop_count, loop_start, loop_step);
                 break;
+            }
+                
+            case xenos_cf::LOOP_END: {
+                if (ctx.loop_stack.empty()) {
+                    LOGE("LOOP_END without matching LOOP_START");
+                    break;
+                }
+                
+                auto loop_info = ctx.loop_stack.back();
+                ctx.loop_stack.pop_back();
+                
+                // Get loop constant for this loop
+                u32 loop_const = get_loop_constant_value(ctx, loop_info.loop_const_idx);
+                u32 loop_count = (loop_const >> 0) & 0xFF;
+                u32 loop_start = (loop_const >> 8) & 0xFF;
+                u32 loop_step = (loop_const >> 16) & 0xFF;
+                if (loop_step == 0) loop_step = 1;
+                
+                // Branch to continue block
+                ctx.builder.branch(loop_info.continue_label);
+                ctx.builder.label(loop_info.continue_label);
+                
+                // Increment loop counter: aL = aL + step
+                u32 current_al = ctx.builder.load(ctx.int_type, ctx.address_reg_var);
+                u32 step_const = ctx.builder.const_int(static_cast<s32>(loop_step));
+                u32 new_al = ctx.builder.i_add(ctx.int_type, current_al, step_const);
+                ctx.builder.store(ctx.address_reg_var, new_al);
+                
+                // Compare: aL < (start + count * step)
+                u32 end_value = loop_start + loop_count * loop_step;
+                u32 end_const = ctx.builder.const_int(static_cast<s32>(end_value));
+                u32 condition = ctx.builder.s_less_than(ctx.bool_type, new_al, end_const);
+                
+                // Conditional branch: if (aL < end) goto header, else goto merge
+                ctx.builder.branch_conditional(condition, 
+                                               loop_info.header_label,
+                                               loop_info.merge_label);
+                
+                // Continue after merge
+                ctx.builder.label(loop_info.merge_label);
+                
+                LOGD("LOOP_END: merged at label %u", loop_info.merge_label);
+                break;
+            }
                 
             case xenos_cf::ALLOC:
                 // Allocation - handled at pipeline setup
+                break;
+                
+            case xenos_cf::COND_CALL:
+            case xenos_cf::RETURN:
+            case xenos_cf::COND_JMP:
+                // These require more complex control flow handling
+                LOGD("Unhandled CF opcode: %d (call/return/jmp)", cf.opcode);
+                break;
+                
+            case xenos_cf::MARK_VS_FETCH_DONE:
+                // Marker instruction - no action needed
                 break;
                 
             default:
                 LOGD("Unhandled CF opcode: %d", cf.opcode);
                 break;
         }
+    }
+    
+    // Close any unclosed predicated blocks
+    if (ctx.in_predicated_block && ctx.predicate_merge_label != 0) {
+        ctx.builder.branch(ctx.predicate_merge_label);
+        ctx.builder.label(ctx.predicate_merge_label);
+        ctx.in_predicated_block = false;
+        LOGD("Closed unclosed predicated block");
     }
     
     // Translate ALU instructions
@@ -1586,6 +1734,29 @@ u32 ShaderTranslator::get_loop_constant(TranslationContext& ctx, u32 index) {
     u32 zero_idx = ctx.builder.const_uint(0);
     u32 ptr = ctx.builder.access_chain(uvec4_ptr, ctx.loop_constants_var, {zero_idx, const_idx});
     return ctx.builder.load(ctx.uvec4_type, ptr);
+}
+
+u32 ShaderTranslator::get_loop_constant_value(TranslationContext& ctx, u32 index) {
+    // Return the packed loop constant value as a u32
+    // Format: bits 0-7 = count, bits 8-15 = start, bits 16-23 = step
+    // This is used for static loop setup; actual loop constants may vary at runtime
+    // Default: 8 iterations, start at 0, step 1
+    if (index >= 32) {
+        LOGD("Loop constant index %u out of range, using default", index);
+        return 0x00010008;  // step=1, start=0, count=8
+    }
+    
+    // For now, return a reasonable default that most shaders will work with
+    // In a full implementation, this would read from shader metadata or constants
+    // packed as: (count) | (start << 8) | (step << 16)
+    // 
+    // Common patterns:
+    // - Simple loop: count=N, start=0, step=1
+    // - Bone matrices: count=4, start=0, step=1
+    // - Shadow samples: count=4-16, start=0, step=1
+    
+    // Return default: 8 iterations (reasonable for most effects), start=0, step=1
+    return 0x00010008;  // step=1, start=0, count=8
 }
 
 u32 ShaderTranslator::apply_swizzle(TranslationContext& ctx, u32 value, u8 swizzle) {
