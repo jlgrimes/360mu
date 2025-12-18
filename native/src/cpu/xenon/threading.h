@@ -360,6 +360,7 @@ private:
     // Ready queues (one per priority level)
     static constexpr int NUM_PRIORITIES = 32;
     std::array<GuestThread*, NUM_PRIORITIES> ready_queues_;
+    mutable std::mutex ready_queues_mutex_;  // Protects ready_queues_ access
     
     // Hardware thread state
     struct HardwareThread {

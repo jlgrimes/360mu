@@ -258,6 +258,8 @@ GuestThread* ThreadScheduler::get_current_thread(u32 hw_thread) {
 void ThreadScheduler::enqueue_thread(GuestThread* thread) {
     if (!thread || thread->state != ThreadState::Ready) return;
     
+    std::lock_guard<std::mutex> lock(ready_queues_mutex_);
+    
     int queue_idx = priority_to_queue_index(thread->priority);
     
     // Add to tail of queue
@@ -277,6 +279,8 @@ void ThreadScheduler::enqueue_thread(GuestThread* thread) {
 }
 
 GuestThread* ThreadScheduler::dequeue_thread(u32 affinity_mask) {
+    std::lock_guard<std::mutex> lock(ready_queues_mutex_);
+    
     // Find highest priority thread that matches affinity
     for (int i = NUM_PRIORITIES - 1; i >= 0; i--) {
         GuestThread* thread = ready_queues_[i];
@@ -306,6 +310,8 @@ GuestThread* ThreadScheduler::dequeue_thread(u32 affinity_mask) {
 }
 
 bool ThreadScheduler::has_ready_threads(u32 affinity_mask) {
+    std::lock_guard<std::mutex> lock(ready_queues_mutex_);
+    
     // Check if there are any ready threads matching the affinity
     for (int i = NUM_PRIORITIES - 1; i >= 0; i--) {
         GuestThread* thread = ready_queues_[i];
