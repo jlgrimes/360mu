@@ -20,6 +20,7 @@ class Apu;
 class Memory;
 class Kernel;
 class VirtualFileSystem;
+class ThreadScheduler;
 
 /**
  * Emulator configuration
@@ -192,6 +193,7 @@ private:
     std::unique_ptr<Apu> apu_;
     std::unique_ptr<Kernel> kernel_;
     std::unique_ptr<VirtualFileSystem> vfs_;
+    std::unique_ptr<ThreadScheduler> scheduler_;
     
     // Threading
     struct EmulationThread;

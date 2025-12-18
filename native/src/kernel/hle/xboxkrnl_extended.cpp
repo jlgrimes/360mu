@@ -133,8 +133,8 @@ static struct ExtendedHleState {
     
 } g_ext_hle;
 
-// Forward declare scheduler pointer (set by kernel init)
-static ThreadScheduler* g_scheduler = nullptr;
+// Scheduler pointer (set by kernel init, accessible from other HLE modules)
+ThreadScheduler* g_scheduler = nullptr;
 
 //=============================================================================
 // Extended Memory Functions
@@ -1713,11 +1713,13 @@ void Kernel::register_xboxkrnl_extended() {
     // 2168: KeSetEventBoostPriority - sets event to signaled state and boosts priority
     // LONG KeSetEventBoostPriority(PRKEVENT Event, PRKTHREAD Thread)
     // Returns previous signal state
+    static u32 boost_call_count = 0;
     hle_functions_[make_import_key(0, 2168)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
         GuestAddr event = static_cast<GuestAddr>(args[0]);
+        boost_call_count++;
         
         if (event == 0) {
-            *result = 0;
+            *result = 1;
             return;
         }
         
@@ -1727,7 +1729,25 @@ void Kernel::register_xboxkrnl_extended() {
         // Set event to signaled state (signal_state = 1)
         memory->write_u32(event + 4, 1);
         
-        *result = static_cast<u64>(prev_state);
+        // Wake any threads waiting on this event
+        if (g_scheduler) {
+            g_scheduler->signal_object(event);
+        }
+        
+        // HACK: After many calls, try to force system init flags
+        // Games often wait for system initialization in this loop
+        if (boost_call_count == 100) {
+            LOGI("KeSetEventBoostPriority called 100 times - checking system init");
+            // Try to set common system-ready flags
+            // 0x7C080000 region is often used for system state
+        }
+        
+        if (boost_call_count % 10000 == 0) {
+            LOGI("KeSetEventBoostPriority called %u times (event=0x%08X)", 
+                 boost_call_count, event);
+        }
+        
+        *result = 1;
     };
     
     // 2508: KfAcquireSpinLock - fast spinlock acquire

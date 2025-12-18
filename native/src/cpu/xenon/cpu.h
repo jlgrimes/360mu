@@ -337,6 +337,11 @@ public:
      */
     void dispatch_syscall(ThreadContext& ctx);
     
+    /**
+     * Execute a specific thread for given cycles (used by scheduler)
+     */
+    void execute_thread(u32 thread_id, u64 cycles);
+    
 private:
     Memory* memory_ = nullptr;
     Kernel* kernel_ = nullptr;
@@ -351,9 +356,6 @@ private:
 #ifdef X360MU_JIT_ENABLED
     std::unique_ptr<JitCompiler> jit_;
 #endif
-    
-    // Execute single thread for given cycles
-    void execute_thread(u32 thread_id, u64 cycles);
 };
 
 } // namespace x360mu

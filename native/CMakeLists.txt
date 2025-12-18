@@ -99,6 +99,10 @@ set(APU_SOURCES
 set(KERNEL_SOURCES
     src/kernel/kernel.cpp
     src/kernel/threading.cpp
+    src/kernel/xobject.cpp
+    src/kernel/xthread.cpp
+    src/kernel/xevent.cpp
+    src/kernel/xkernel.cpp
     src/kernel/hle/xboxkrnl.cpp
     src/kernel/hle/xboxkrnl_extended.cpp
     src/kernel/hle/xboxkrnl_io.cpp

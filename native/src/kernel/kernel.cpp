@@ -7,6 +7,7 @@
 #include "kernel.h"
 #include "memory/memory.h"
 #include "cpu/xenon/cpu.h"
+#include "cpu/xenon/threading.h"
 #include "xex_loader.h"
 #include "filesystem/vfs.h"
 #include <unordered_set>
@@ -175,6 +176,20 @@ void Kernel::prepare_entry() {
     // Stack at 0x9FFF0000 (virtual) = 0x1FFF0000 (physical) - near top of 512MB
     cpu_->start_thread(0, main_module.entry_point, 0x9FFF0000);
     
+    // Also create a guest thread in the scheduler for thread tracking
+    // This allows proper blocking wait behavior
+    if (scheduler_) {
+        GuestThread* main_thread = scheduler_->create_thread(
+            main_module.entry_point,
+            0,           // param
+            256 * 1024,  // 256KB stack
+            0            // flags
+        );
+        if (main_thread) {
+            LOGI("Created main guest thread %u in scheduler", main_thread->thread_id);
+        }
+    }
+    
     LOGI("Prepared entry at 0x%08X", main_module.entry_point);
 }
 
@@ -275,6 +290,13 @@ void* Kernel::get_object(u32 handle, ObjectType expected_type) {
 
 void Kernel::close_handle(u32 handle) {
     objects_.erase(handle);
+}
+
+void Kernel::set_scheduler(ThreadScheduler* scheduler) {
+    scheduler_ = scheduler;
+    // Also set the global scheduler pointer for HLE functions
+    set_thread_scheduler(scheduler);
+    LOGI("Kernel scheduler set");
 }
 
 u32 Kernel::create_thread(GuestAddr entry, GuestAddr stack, u64 stack_size, u32 priority) {

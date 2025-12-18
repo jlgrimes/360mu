@@ -19,6 +19,7 @@ namespace x360mu {
 class Memory;
 class Cpu;
 class VirtualFileSystem;
+class ThreadScheduler;
 
 /**
  * XEX2 file header structure
@@ -200,10 +201,21 @@ public:
     void suspend_thread(u32 handle);
     void resume_thread(u32 handle);
     
+    /**
+     * Set thread scheduler for multi-threaded execution
+     */
+    void set_scheduler(ThreadScheduler* scheduler);
+    
+    /**
+     * Get thread scheduler
+     */
+    ThreadScheduler* get_scheduler() { return scheduler_; }
+    
 private:
     Memory* memory_ = nullptr;
     Cpu* cpu_ = nullptr;
     VirtualFileSystem* vfs_ = nullptr;
+    ThreadScheduler* scheduler_ = nullptr;
     
     // Loaded modules
     std::vector<LoadedModule> modules_;

@@ -6,10 +6,12 @@
 
 #include "x360mu/emulator.h"
 #include "cpu/xenon/cpu.h"
+#include "cpu/xenon/threading.h"
 #include "gpu/xenos/gpu.h"
 #include "apu/audio.h"
 #include "memory/memory.h"
 #include "kernel/kernel.h"
+#include "kernel/xkernel.h"
 #include "kernel/filesystem/vfs.h"
 
 #include <atomic>
@@ -151,6 +153,26 @@ Status Emulator::initialize(const EmulatorConfig& config) {
     cpu_->set_kernel(kernel_.get());
     LOGI("Connected kernel to CPU for syscall dispatch");
     
+    // Initialize thread scheduler for multi-threaded guest execution
+    LOGI("Initializing thread scheduler");
+    scheduler_ = std::make_unique<ThreadScheduler>();
+    // Use 4 host threads on Android (good balance for big.LITTLE)
+    u32 num_threads = std::min(4u, std::thread::hardware_concurrency());
+    status = scheduler_->initialize(memory_.get(), kernel_.get(), cpu_.get(), num_threads);
+    if (status != Status::Ok) {
+        LOGE("Failed to initialize thread scheduler: %s", status_to_string(status));
+        return status;
+    }
+    
+    // Connect scheduler to kernel for thread management
+    kernel_->set_scheduler(scheduler_.get());
+    LOGI("Thread scheduler initialized with %u host threads", num_threads);
+    
+    // Initialize the Xbox kernel subsystem
+    LOGI("Initializing Xbox kernel subsystem");
+    XKernel::instance().initialize(cpu_.get(), memory_.get(), kernel_.get());
+    LOGI("Xbox kernel initialized - system ready");
+    
     // Create emulation thread controller
     emu_thread_ = std::make_unique<EmulationThread>();
     
@@ -173,6 +195,8 @@ void Emulator::shutdown() {
     }
     
     // Shutdown subsystems in reverse order
+    XKernel::instance().shutdown();
+    scheduler_.reset();
     kernel_.reset();
     vfs_.reset();
     apu_.reset();
@@ -393,14 +417,13 @@ void Emulator::emulation_thread_main() {
         // Start new frame - reset frame_complete flag
         gpu_->begin_new_frame();
         
-        // Run CPU until GPU signals frame complete
-        // This is a simplified version - real implementation needs proper synchronization
+        // Run CPU via the scheduler for multi-threaded execution
         bool frame_complete = false;
         u32 cpu_batches = 0;
         
         while (!frame_complete && !emu_thread_->paused && !emu_thread_->should_stop) {
-            // Execute a batch of CPU cycles
-            cpu_->execute(cpu::CLOCK_SPEED / 60 / 100); // ~1/100th of a frame
+            // Execute via scheduler - this wakes host threads that run guest threads
+            scheduler_->run(cpu::CLOCK_SPEED / 60 / 100); // ~1/100th of a frame
             cpu_batches++;
             
             // Process GPU command buffer

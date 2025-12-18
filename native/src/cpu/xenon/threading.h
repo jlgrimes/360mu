@@ -158,7 +158,7 @@ public:
     /**
      * Initialize the scheduler
      */
-    Status initialize(Memory* memory, Kernel* kernel, u32 num_host_threads = 0);
+    Status initialize(Memory* memory, Kernel* kernel, class Cpu* cpu, u32 num_host_threads = 0);
     
     /**
      * Shutdown
@@ -259,6 +259,7 @@ public:
 private:
     Memory* memory_;
     Kernel* kernel_;
+    class Cpu* cpu_;
     
     // Thread storage
     std::vector<std::unique_ptr<GuestThread>> threads_;
@@ -290,6 +291,10 @@ private:
     
     // Statistics
     mutable Stats stats_;
+    
+    // Multi-threading control
+    u32 num_host_threads_ = 0;
+    std::atomic<bool> running_{false};
     
     // Internal methods
     void enqueue_thread(GuestThread* thread);

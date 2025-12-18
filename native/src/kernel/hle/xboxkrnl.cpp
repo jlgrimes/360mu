@@ -16,6 +16,7 @@
 #include "../kernel.h"
 #include "../filesystem/vfs.h"
 #include "../../cpu/xenon/cpu.h"
+#include "../../cpu/xenon/threading.h"
 #include "../../memory/memory.h"
 #include <cstring>
 #include <algorithm>
@@ -41,6 +42,9 @@
 #endif
 
 namespace x360mu {
+
+// External scheduler pointer (set via set_thread_scheduler)
+extern ThreadScheduler* g_scheduler;
 
 //=============================================================================
 // NTSTATUS codes
@@ -581,13 +585,19 @@ static void HLE_KeSetEvent(Cpu* cpu, Memory* memory, u64* args, u64* result) {
     s32 increment = static_cast<s32>(args[1]);
     u32 wait = static_cast<u32>(args[2]);
     
+    (void)increment;
+    (void)wait;
+    
     u32 prev_state = memory->read_u32(event + 4);
     memory->write_u32(event + 4, 1);  // Set signaled
     
-    // TODO: Wake waiting threads
+    // Wake any threads waiting on this event
+    if (g_scheduler) {
+        g_scheduler->signal_object(event);
+    }
     
     *result = prev_state;
-    LOGD("KeSetEvent: 0x%08X, prev=%u", event, prev_state);
+    LOGD("KeSetEvent: 0x%08X, prev=%u, woke waiters", event, prev_state);
 }
 
 static void HLE_KeResetEvent(Cpu* cpu, Memory* memory, u64* args, u64* result) {
@@ -603,12 +613,20 @@ static void HLE_KePulseEvent(Cpu* cpu, Memory* memory, u64* args, u64* result) {
     GuestAddr event = static_cast<GuestAddr>(args[0]);
     
     u32 prev_state = memory->read_u32(event + 4);
-    // Pulse: set then immediately reset
+    
+    // Pulse: set signaled temporarily to wake waiters, then reset
+    memory->write_u32(event + 4, 1);
+    
+    // Wake threads waiting on this event
+    if (g_scheduler) {
+        g_scheduler->signal_object(event);
+    }
+    
+    // Reset after waking (pulse behavior)
     memory->write_u32(event + 4, 0);
     
-    // TODO: Wake one waiting thread
-    
     *result = prev_state;
+    LOGD("KePulseEvent: 0x%08X, prev=%u", event, prev_state);
 }
 
 static void HLE_KeWaitForSingleObject(Cpu* cpu, Memory* memory, u64* args, u64* result) {
@@ -639,7 +657,9 @@ static void HLE_KeWaitForSingleObject(Cpu* cpu, Memory* memory, u64* args, u64* 
         return;
     }
     
-    // Not signaled - check timeout
+    // Calculate timeout in nanoseconds
+    u64 timeout_ns = UINT64_MAX;  // Infinite by default
+    
     if (timeout_ptr) {
         s64 timeout = static_cast<s64>(memory->read_u64(timeout_ptr));
         if (timeout == 0) {
@@ -647,12 +667,42 @@ static void HLE_KeWaitForSingleObject(Cpu* cpu, Memory* memory, u64* args, u64* 
             *result = STATUS_TIMEOUT;
             return;
         }
-        // TODO: Implement actual waiting with timeout
+        if (timeout < 0) {
+            // Relative timeout (negative = relative in 100ns units)
+            timeout_ns = static_cast<u64>(-timeout) * 100;
+        } else {
+            // Absolute timeout - calculate relative from "now"
+            // For simplicity, treat as relative for large values
+            timeout_ns = static_cast<u64>(timeout) * 100;
+        }
     }
     
-    // TODO: Block thread and wait
-    // For now, just return success (busy wait behavior)
-    *result = STATUS_SUCCESS;
+    // Use scheduler for proper thread blocking
+    if (g_scheduler) {
+        // Get current thread from scheduler
+        u32 hw_thread_id = cpu->get_context(0).thread_id % 6;
+        GuestThread* thread = g_scheduler->get_current_thread(hw_thread_id);
+        
+        if (thread) {
+            // Block the thread properly
+            u32 wait_result = g_scheduler->wait_for_object(thread, object, timeout_ns);
+            
+            // If we're waiting, yield to other threads
+            if (thread->state == ThreadState::Waiting) {
+                // Thread is now blocked - will be woken when signaled
+                // For now, yield and let scheduler handle it
+                g_scheduler->yield(thread);
+            }
+            
+            *result = wait_result;
+            return;
+        }
+    }
+    
+    // Fallback: non-blocking check with small yield
+    // This allows other threads a chance to run
+    std::this_thread::yield();
+    *result = STATUS_TIMEOUT;
 }
 
 static void HLE_KeWaitForMultipleObjects(Cpu* cpu, Memory* memory, u64* args, u64* result) {
@@ -665,6 +715,8 @@ static void HLE_KeReleaseSemaphore(Cpu* cpu, Memory* memory, u64* args, u64* res
     s32 increment = static_cast<s32>(args[1]);
     u32 wait = static_cast<u32>(args[2]);
     
+    (void)wait;
+    
     s32 prev_count = static_cast<s32>(memory->read_u32(semaphore + 4));
     s32 limit = static_cast<s32>(memory->read_u32(semaphore + 16));
     
@@ -675,7 +727,10 @@ static void HLE_KeReleaseSemaphore(Cpu* cpu, Memory* memory, u64* args, u64* res
     
     memory->write_u32(semaphore + 4, static_cast<u32>(new_count));
     
-    // TODO: Wake waiting threads
+    // Wake threads waiting on this semaphore
+    if (g_scheduler && new_count > 0) {
+        g_scheduler->signal_object(semaphore);
+    }
     
     *result = prev_count;
 }
@@ -1373,15 +1428,23 @@ static void HLE_KeReleaseMutant(Cpu* cpu, Memory* memory, u64* args, u64* result
     u32 abandoned = static_cast<u32>(args[2]);
     u32 wait = static_cast<u32>(args[3]);
     
+    (void)increment;
+    (void)abandoned;
+    (void)wait;
+    
     s32 prev_state = static_cast<s32>(memory->read_u32(mutant + 4));
     
     // Release - increment signal state
     memory->write_u32(mutant + 4, static_cast<u32>(prev_state + 1));
     memory->write_u32(mutant + 16, 0);  // Clear owner
     
-    // TODO: Wake waiting threads
+    // Wake any threads waiting on this mutant
+    if (g_scheduler) {
+        g_scheduler->signal_object(mutant);
+    }
     
     *result = prev_state;
+    LOGD("KeReleaseMutant: 0x%08X, prev=%d", mutant, prev_state);
 }
 
 //=============================================================================

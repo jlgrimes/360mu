@@ -5,6 +5,7 @@
  */
 
 #include "threading.h"
+#include "cpu.h"
 #include "../../memory/memory.h"
 #include "../../kernel/kernel.h"
 #include <algorithm>
@@ -34,19 +35,21 @@ ThreadScheduler::~ThreadScheduler() {
     shutdown();
 }
 
-Status ThreadScheduler::initialize(Memory* memory, Kernel* kernel, u32 num_host_threads) {
+Status ThreadScheduler::initialize(Memory* memory, Kernel* kernel, Cpu* cpu, u32 num_host_threads) {
     memory_ = memory;
     kernel_ = kernel;
+    cpu_ = cpu;
     current_time_ = 0;
     
     // Determine number of host threads to use
     if (num_host_threads == 0) {
         // Auto-detect based on hardware
-        num_host_threads = std::min(6u, std::thread::hardware_concurrency());
+        num_host_threads = std::min(4u, std::thread::hardware_concurrency());
     }
-    num_host_threads = std::min(num_host_threads, 6u);
+    num_host_threads_ = std::min(num_host_threads, 6u);
     
-    LOGI("ThreadScheduler: using %u host threads", num_host_threads);
+    LOGI("ThreadScheduler: using %u host threads for %u guest hardware threads", 
+         num_host_threads_, 6u);
     
     // Initialize hardware thread state
     for (u32 i = 0; i < 6; i++) {
@@ -56,31 +59,50 @@ Status ThreadScheduler::initialize(Memory* memory, Kernel* kernel, u32 num_host_
         hw_threads_[i].time_slice_remaining = 0;
     }
     
-    // Start host threads (for multi-threaded execution mode)
-    // For single-threaded mode, we just use run() directly
-    // TODO: Implement true multi-threaded execution
+    // Start host threads for multi-threaded execution
+    running_ = true;
+    for (u32 i = 0; i < num_host_threads_; i++) {
+        hw_threads_[i].running = true;
+        hw_threads_[i].stop_flag = false;
+        hw_threads_[i].host_thread = std::thread(
+            &ThreadScheduler::hw_thread_main, this, i
+        );
+        
+        LOGI("Started host thread %u", i);
+    }
     
+    LOGI("ThreadScheduler initialized with %u active host threads", num_host_threads_);
     return Status::Ok;
 }
 
 void ThreadScheduler::shutdown() {
+    LOGI("ThreadScheduler shutting down...");
+    
+    // Signal all threads to stop
+    running_ = false;
+    
     // Stop all hardware threads
     for (auto& hw : hw_threads_) {
         hw.stop_flag = true;
         hw.running = false;
+        hw.wake_cv.notify_all();
     }
     
     // Wait for host threads to finish
-    for (auto& hw : hw_threads_) {
+    for (u32 i = 0; i < num_host_threads_; i++) {
+        auto& hw = hw_threads_[i];
         if (hw.host_thread.joinable()) {
-            hw.wake_cv.notify_all();
+            LOGI("Waiting for host thread %u to finish...", i);
             hw.host_thread.join();
+            LOGI("Host thread %u finished", i);
         }
     }
     
     // Clean up all threads
     std::lock_guard<std::mutex> lock(threads_mutex_);
     threads_.clear();
+    
+    LOGI("ThreadScheduler shutdown complete");
 }
 
 GuestThread* ThreadScheduler::create_thread(GuestAddr entry_point, GuestAddr param,
@@ -291,47 +313,18 @@ int ThreadScheduler::priority_to_queue_index(ThreadPriority priority) const {
 u64 ThreadScheduler::run(u64 cycles) {
     u64 total_executed = 0;
     
-    // For each hardware thread
-    for (u32 hw = 0; hw < 6; hw++) {
-        auto& hwt = hw_threads_[hw];
-        u32 affinity_bit = 1u << hw;
-        
-        // If no current thread or time slice expired, reschedule
-        if (hwt.current_thread == nullptr || hwt.time_slice_remaining == 0) {
-            // Put current thread back in ready queue if still runnable
-            if (hwt.current_thread && hwt.current_thread->state == ThreadState::Running) {
-                hwt.current_thread->state = ThreadState::Ready;
-                enqueue_thread(hwt.current_thread);
-            }
-            
-            // Get next thread
-            hwt.current_thread = dequeue_thread(affinity_bit);
-            
-            if (hwt.current_thread) {
-                hwt.current_thread->state = ThreadState::Running;
-                hwt.time_slice_remaining = TIME_SLICE;
-                stats_.context_switches++;
-            }
-        }
-        
-        // Execute current thread
-        if (hwt.current_thread) {
-            u64 to_execute = std::min(cycles / 6, hwt.time_slice_remaining);
-            
-            // Execute instructions
-            // For now, use the interpreter directly
-            hwt.current_thread->context.running = true;
-            // cpu_->execute_thread(hw, to_execute);
-            hwt.current_thread->context.running = false;
-            
-            hwt.time_slice_remaining -= to_execute;
-            hwt.current_thread->execution_time += to_execute;
-            total_executed += to_execute;
-            
-            // Check if thread terminated
-            if (hwt.current_thread->state == ThreadState::Terminated) {
-                hwt.current_thread = nullptr;
-            }
+    // Always execute CPU thread 0 (the main game thread)
+    // This is set up via cpu_->start_thread() during prepare_entry
+    if (cpu_) {
+        cpu_->execute_thread(0, cycles);
+        total_executed = cycles;
+    }
+    
+    // If we have scheduler guest threads (from game creating threads),
+    // wake host threads to execute them in parallel
+    if (num_host_threads_ > 0 && running_ && !threads_.empty()) {
+        for (u32 hw = 1; hw < num_host_threads_; hw++) {
+            hw_threads_[hw].wake_cv.notify_one();
         }
     }
     
@@ -466,6 +459,99 @@ ThreadScheduler::Stats ThreadScheduler::get_stats() const {
         }
     }
     return stats_;
+}
+
+void ThreadScheduler::hw_thread_main(u32 hw_thread_id) {
+    auto& hwt = hw_threads_[hw_thread_id];
+    u32 affinity_bit = 1u << hw_thread_id;
+    
+    LOGI("Hardware thread %u started (affinity=0x%X)", hw_thread_id, affinity_bit);
+    
+    while (!hwt.stop_flag && running_) {
+        GuestThread* thread = nullptr;
+        
+        // Try to get a thread to execute
+        {
+            std::unique_lock<std::mutex> lock(hwt.mutex);
+            
+            // Wait for work or stop signal
+            hwt.wake_cv.wait_for(lock, std::chrono::milliseconds(1), [&]() {
+                return hwt.stop_flag || hwt.current_thread != nullptr || 
+                       dequeue_thread(affinity_bit) != nullptr;
+            });
+            
+            if (hwt.stop_flag) break;
+            
+            // Check if we have a current thread or can get one
+            if (hwt.current_thread == nullptr) {
+                hwt.current_thread = dequeue_thread(affinity_bit);
+            }
+            thread = hwt.current_thread;
+        }
+        
+        if (!thread) continue;
+        
+        // Execute guest thread on the actual CPU
+        thread->state = ThreadState::Running;
+        thread->context.running = true;
+        
+        // Map guest thread to CPU hardware thread context
+        // Use the thread's context.thread_id for CPU execution
+        u32 cpu_thread_id = thread->context.thread_id % 6;
+        
+        // Execute for a time slice using the real CPU
+        if (cpu_) {
+            cpu_->execute_thread(cpu_thread_id, TIME_SLICE);
+            thread->execution_time += TIME_SLICE;
+        }
+        
+        thread->context.running = false;
+        
+        // Put thread back in ready queue if it's still runnable
+        {
+            std::lock_guard<std::mutex> lock(hwt.mutex);
+            if (thread->state == ThreadState::Running) {
+                thread->state = ThreadState::Ready;
+                hwt.current_thread = nullptr;
+                hwt.time_slice_remaining = 0;
+                enqueue_thread(thread);
+            } else if (thread->state == ThreadState::Waiting ||
+                       thread->state == ThreadState::Terminated) {
+                hwt.current_thread = nullptr;
+            }
+        }
+        
+        stats_.context_switches++;
+    }
+    
+    LOGI("Hardware thread %u stopped", hw_thread_id);
+}
+
+void ThreadScheduler::schedule_thread(u32 hw_thread_id) {
+    if (hw_thread_id >= 6) return;
+    
+    auto& hwt = hw_threads_[hw_thread_id];
+    u32 affinity_bit = 1u << hw_thread_id;
+    
+    // Put current thread back if still running
+    if (hwt.current_thread && hwt.current_thread->state == ThreadState::Running) {
+        hwt.current_thread->state = ThreadState::Ready;
+        enqueue_thread(hwt.current_thread);
+    }
+    
+    // Get next thread
+    hwt.current_thread = dequeue_thread(affinity_bit);
+    if (hwt.current_thread) {
+        hwt.current_thread->state = ThreadState::Running;
+        hwt.time_slice_remaining = TIME_SLICE;
+    }
+}
+
+void ThreadScheduler::execute_thread(u32 hw_thread_id) {
+    // Wake up the hardware thread to execute
+    if (hw_thread_id < num_host_threads_) {
+        hw_threads_[hw_thread_id].wake_cv.notify_one();
+    }
 }
 
 } // namespace x360mu
