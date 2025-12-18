@@ -1340,9 +1340,9 @@ static void HLE_RtlGetStackLimits(Cpu* cpu, Memory* memory, u64* args, u64* resu
     GuestAddr low_limit_ptr = static_cast<GuestAddr>(args[0]);
     GuestAddr high_limit_ptr = static_cast<GuestAddr>(args[1]);
     
-    // Return approximate stack limits
-    memory->write_u32(low_limit_ptr, 0x70000000);
-    memory->write_u32(high_limit_ptr, 0x70100000);
+    // Return approximate stack limits (in virtual address range 0x8E000000+)
+    memory->write_u32(low_limit_ptr, 0x8E000000);
+    memory->write_u32(high_limit_ptr, 0x8F000000);
     
     *result = 0;
 }

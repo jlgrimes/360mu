@@ -171,8 +171,8 @@ void Kernel::prepare_entry() {
     const auto& main_module = modules_[0];
     
     // Start main thread at entry point
-    cpu_->start_thread(0, main_module.entry_point, 
-                       memory::MAIN_MEMORY_BASE + 512 * MB - 0x10000);
+    // Stack at 0x9FFF0000 (virtual) = 0x1FFF0000 (physical) - near top of 512MB
+    cpu_->start_thread(0, main_module.entry_point, 0x9FFF0000);
     
     LOGI("Prepared entry at 0x%08X", main_module.entry_point);
 }

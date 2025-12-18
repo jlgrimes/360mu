@@ -575,6 +575,9 @@ private:
     void calc_ea(ARM64Emitter& emit, int dest_reg, int ra, s16 offset);
     void calc_ea_indexed(ARM64Emitter& emit, int dest_reg, int ra, int rb);
     
+    // Helper: Translate virtual address to physical and add fastmem base
+    void emit_translate_address(ARM64Emitter& emit, int addr_reg);
+    
     // Helper: Memory byte swap (big-endian to little-endian)
     void byteswap32(ARM64Emitter& emit, int reg);
     void byteswap16(ARM64Emitter& emit, int reg);

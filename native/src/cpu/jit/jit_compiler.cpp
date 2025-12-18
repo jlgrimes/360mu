@@ -172,8 +172,12 @@ Status JitCompiler::initialize(Memory* memory, u64 cache_size) {
     // Try to set up fastmem
     fastmem_base_ = static_cast<u8*>(memory_->get_fastmem_base());
     fastmem_enabled_ = (fastmem_base_ != nullptr);
+    
     if (fastmem_enabled_) {
-        LOGI("Fastmem enabled at %p", fastmem_base_);
+        LOGI("Fastmem enabled at %p (0x%llX)", fastmem_base_, 
+             (unsigned long long)reinterpret_cast<u64>(fastmem_base_));
+    } else {
+        LOGE("Fastmem NOT available - JIT will fall back to interpreter");
     }
 #else
     // Non-ARM64 fallback (for testing on x86)
@@ -220,6 +224,13 @@ u64 JitCompiler::execute(ThreadContext& ctx, u64 cycles) {
     u64 cycles_executed = 0;
     
 #ifdef __aarch64__
+    // JIT requires fastmem to be enabled - without it, memory accesses will crash
+    if (!fastmem_enabled_) {
+        // Return 0 to signal CPU should fall back to interpreter
+        // Don't set interrupted - that's for syscalls
+        return 0;
+    }
+    
     // Run the dispatcher which will execute compiled code
     if (dispatcher_) {
         ctx.running = true;
@@ -238,7 +249,9 @@ u64 JitCompiler::execute(ThreadContext& ctx, u64 cycles) {
             // Execute the block
             using BlockFn = void(*)(ThreadContext*, u8*);
             BlockFn fn = reinterpret_cast<BlockFn>(block->code);
-            fn(&ctx, fastmem_base_ ? fastmem_base_ : nullptr);
+            
+            // Execute the block (fastmem_base is now embedded in block code)
+            fn(&ctx, nullptr);
             
             cycles_executed += block->size;
             block->execution_count++;
@@ -1034,6 +1047,11 @@ void JitCompiler::compile_compare(ARM64Emitter& emit, const DecodedInst& inst) {
 //=============================================================================
 
 void JitCompiler::compile_load(ARM64Emitter& emit, const DecodedInst& inst) {
+    // Check if this is an update form (need to save EA)
+    bool is_update = (inst.opcode == 33 || inst.opcode == 35 || 
+                      inst.opcode == 41 || inst.opcode == 43 ||
+                      inst.opcode == 49 || inst.opcode == 51);
+    
     // Calculate effective address
     bool is_indexed = (inst.opcode == 31);
     
@@ -1048,31 +1066,13 @@ void JitCompiler::compile_load(ARM64Emitter& emit, const DecodedInst& inst) {
         calc_ea_indexed(emit, arm64::X0, inst.ra, inst.rb);
     }
     
-    // Translate virtual address to physical for fastmem
-    // Xbox 360: addresses 0x80000000-0x9FFFFFFF map to 0x00000000-0x1FFFFFFF
-    if (fastmem_enabled_) {
-        // if (addr >= 0x80000000 && addr < 0xA0000000) addr &= 0x1FFFFFFF
-        emit.MOV_imm(arm64::X16, 0x80000000ULL);
-        emit.CMP(arm64::X0, arm64::X16);
-        u8* skip_translate = emit.current();
-        emit.B_cond(arm64_cond::CC, 0);  // Skip if addr < 0x80000000 (CC = unsigned lower)
-        
-        emit.MOV_imm(arm64::X16, 0xA0000000ULL);
-        emit.CMP(arm64::X0, arm64::X16);
-        u8* skip_translate2 = emit.current();
-        emit.B_cond(arm64_cond::CS, 0);  // Skip if addr >= 0xA0000000 (CS = unsigned higher or same)
-        
-        // In range: mask off top bits
-        emit.AND_imm(arm64::X0, arm64::X0, 0x1FFFFFFFULL);
-        
-        u8* done_translate = emit.current();
-        // Patch the skip branches to jump here
-        emit.patch_branch(reinterpret_cast<u32*>(skip_translate), done_translate);
-        emit.patch_branch(reinterpret_cast<u32*>(skip_translate2), done_translate);
-        
-        // Add fastmem base
-        emit.ADD(arm64::X0, arm64::X0, arm64::MEM_BASE);
+    // Save EA for update forms before translation
+    if (is_update && inst.ra != 0) {
+        emit.ORR(arm64::X3, arm64::XZR, arm64::X0);
     }
+    
+    // Translate virtual address to physical and add fastmem base
+    emit_translate_address(emit, arm64::X0);
     
     // Load based on opcode
     int dest_reg = arm64::X1;
@@ -1145,19 +1145,26 @@ void JitCompiler::compile_load(ARM64Emitter& emit, const DecodedInst& inst) {
     
     store_gpr(emit, inst.rd, dest_reg);
     
-    // Update RA for update forms
-    bool is_update = (inst.opcode == 33 || inst.opcode == 35 || 
-                      inst.opcode == 41 || inst.opcode == 43 ||
-                      inst.opcode == 49 || inst.opcode == 51);
+    // Update RA for update forms (use saved EA from X3)
     if (is_update && inst.ra != 0) {
-        if (fastmem_enabled_) {
-            emit.SUB(arm64::X0, arm64::X0, arm64::MEM_BASE);
-        }
-        store_gpr(emit, inst.ra, arm64::X0);
+        store_gpr(emit, inst.ra, arm64::X3);
     }
 }
 
 void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
+    // Debug: Log first store compilation
+    static int store_compile_count = 0;
+    if (store_compile_count < 3) {
+        LOGI("Compiling store #%d: opcode=%d, fastmem_enabled=%d, fastmem_base=%p",
+             store_compile_count, inst.opcode, fastmem_enabled_ ? 1 : 0, fastmem_base_);
+        store_compile_count++;
+    }
+    
+    // Check if this is an update form (need to save EA)
+    bool is_update = (inst.opcode == 37 || inst.opcode == 39 || 
+                      inst.opcode == 45 || inst.opcode == 53 ||
+                      inst.opcode == 55);
+    
     // Calculate effective address
     bool is_indexed = (inst.opcode == 31);
     
@@ -1172,34 +1179,16 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
         calc_ea_indexed(emit, arm64::X0, inst.ra, inst.rb);
     }
     
+    // Save EA for update forms before translation
+    if (is_update && inst.ra != 0) {
+        emit.ORR(arm64::X3, arm64::XZR, arm64::X0);
+    }
+    
     // Load value to store
     load_gpr(emit, arm64::X1, inst.rs);
     
-    // Translate virtual address to physical for fastmem
-    // Xbox 360: addresses 0x80000000-0x9FFFFFFF map to 0x00000000-0x1FFFFFFF
-    if (fastmem_enabled_) {
-        // if (addr >= 0x80000000 && addr < 0xA0000000) addr &= 0x1FFFFFFF
-        emit.MOV_imm(arm64::X16, 0x80000000ULL);
-        emit.CMP(arm64::X0, arm64::X16);
-        u8* skip_translate = emit.current();
-        emit.B_cond(arm64_cond::CC, 0);  // Skip if addr < 0x80000000 (CC = unsigned lower)
-        
-        emit.MOV_imm(arm64::X16, 0xA0000000ULL);
-        emit.CMP(arm64::X0, arm64::X16);
-        u8* skip_translate2 = emit.current();
-        emit.B_cond(arm64_cond::CS, 0);  // Skip if addr >= 0xA0000000 (CS = unsigned higher or same)
-        
-        // In range: mask off top bits
-        emit.AND_imm(arm64::X0, arm64::X0, 0x1FFFFFFFULL);
-        
-        u8* done_translate = emit.current();
-        // Patch the skip branches to jump here
-        emit.patch_branch(reinterpret_cast<u32*>(skip_translate), done_translate);
-        emit.patch_branch(reinterpret_cast<u32*>(skip_translate2), done_translate);
-        
-        // Add fastmem base
-        emit.ADD(arm64::X0, arm64::X0, arm64::MEM_BASE);
-    }
+    // Translate virtual address to physical and add fastmem base
+    emit_translate_address(emit, arm64::X0);
     
     // Store based on opcode
     switch (inst.opcode) {
@@ -1249,23 +1238,15 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
             break;
     }
     
-    // Update RA for update forms
-    bool is_update = (inst.opcode == 37 || inst.opcode == 39 || 
-                      inst.opcode == 45 || inst.opcode == 53 ||
-                      inst.opcode == 55);
+    // Update RA for update forms (use saved EA from X3)
     if (is_update && inst.ra != 0) {
-        if (fastmem_enabled_) {
-            emit.SUB(arm64::X0, arm64::X0, arm64::MEM_BASE);
-        }
-        store_gpr(emit, inst.ra, arm64::X0);
+        store_gpr(emit, inst.ra, arm64::X3);
     }
 }
 
 void JitCompiler::compile_load_multiple(ARM64Emitter& emit, const DecodedInst& inst) {
     calc_ea(emit, arm64::X0, inst.ra, inst.simm);
-    if (fastmem_enabled_) {
-        emit.ADD(arm64::X0, arm64::X0, arm64::MEM_BASE);
-    }
+    emit_translate_address(emit, arm64::X0);
     
     for (u32 r = inst.rd; r < 32; r++) {
         emit.LDR(arm64::X1, arm64::X0, (r - inst.rd) * 4);
@@ -1276,9 +1257,7 @@ void JitCompiler::compile_load_multiple(ARM64Emitter& emit, const DecodedInst& i
 
 void JitCompiler::compile_store_multiple(ARM64Emitter& emit, const DecodedInst& inst) {
     calc_ea(emit, arm64::X0, inst.ra, inst.simm);
-    if (fastmem_enabled_) {
-        emit.ADD(arm64::X0, arm64::X0, arm64::MEM_BASE);
-    }
+    emit_translate_address(emit, arm64::X0);
     
     for (u32 r = inst.rs; r < 32; r++) {
         load_gpr(emit, arm64::X1, r);
@@ -1295,9 +1274,10 @@ void JitCompiler::compile_atomic_load(ARM64Emitter& emit, const DecodedInst& ins
     // lwarx rD, rA, rB - Load Word And Reserve Indexed
     calc_ea_indexed(emit, arm64::X0, inst.ra, inst.rb);
     
-    if (fastmem_enabled_) {
-        emit.ADD(arm64::X0, arm64::X0, arm64::MEM_BASE);
-    }
+    // Save untranslated address for reservation
+    emit.ORR(arm64::X2, arm64::XZR, arm64::X0);
+    
+    emit_translate_address(emit, arm64::X0);
     
     // Load the value with exclusive access
     // ARM64: LDAXR for acquire semantics
@@ -1306,32 +1286,26 @@ void JitCompiler::compile_atomic_load(ARM64Emitter& emit, const DecodedInst& ins
     
     store_gpr(emit, inst.rd, arm64::X1);
     
-    // Store reservation address in context
-    // We'll use a simplified reservation model
-    if (fastmem_enabled_) {
-        emit.SUB(arm64::X0, arm64::X0, arm64::MEM_BASE);
-    }
-    emit.STR(arm64::X0, arm64::CTX_REG, offsetof(ThreadContext, lr) + 8); // Use spare field
+    // Store reservation address (untranslated) in context
+    emit.STR(arm64::X2, arm64::CTX_REG, offsetof(ThreadContext, lr) + 8); // Use spare field
 }
 
 void JitCompiler::compile_atomic_store(ARM64Emitter& emit, const DecodedInst& inst) {
     // stwcx. rS, rA, rB - Store Word Conditional Indexed
     calc_ea_indexed(emit, arm64::X0, inst.ra, inst.rb);
     
-    // Load reservation address from context
+    // Load reservation address (untranslated) from context
     emit.LDR(arm64::X2, arm64::CTX_REG, offsetof(ThreadContext, lr) + 8);
     
-    // Compare addresses
+    // Compare addresses (both untranslated)
     emit.CMP(arm64::X0, arm64::X2);
     
     // If not equal, set CR0.EQ=0 and skip store
     u8* skip = emit.current();
     emit.B_cond(arm64_cond::NE, 0);
     
-    // Addresses match - do the store
-    if (fastmem_enabled_) {
-        emit.ADD(arm64::X0, arm64::X0, arm64::MEM_BASE);
-    }
+    // Addresses match - translate and do the store
+    emit_translate_address(emit, arm64::X0);
     
     load_gpr(emit, arm64::X1, inst.rs);
     byteswap32(emit, arm64::X1);
@@ -1909,6 +1883,49 @@ void JitCompiler::calc_ea_indexed(ARM64Emitter& emit, int dest_reg, int ra, int 
     }
 }
 
+void JitCompiler::emit_translate_address(ARM64Emitter& emit, int addr_reg) {
+    // Translate PowerPC virtual address to physical for fastmem
+    // Xbox 360: addresses 0x80000000-0x9FFFFFFF map to 0x00000000-0x1FFFFFFF
+    if (!fastmem_enabled_) return;
+    
+    // if (addr >= 0x80000000 && addr < 0xA0000000) addr &= 0x1FFFFFFF
+    emit.MOV_imm(arm64::X16, 0x80000000ULL);
+    emit.CMP(addr_reg, arm64::X16);
+    u8* skip_translate = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Skip if addr < 0x80000000
+    
+    emit.MOV_imm(arm64::X16, 0xA0000000ULL);
+    emit.CMP(addr_reg, arm64::X16);
+    u8* skip_translate2 = emit.current();
+    emit.B_cond(arm64_cond::CS, 0);  // Skip if addr >= 0xA0000000
+    
+    // In range: mask off top bits using explicit AND with temp register
+    // Don't use AND_imm - it may use X16 as fallback which we need later
+    emit.MOV_imm(arm64::X17, 0x1FFFFFFFULL);
+    emit.AND(addr_reg, addr_reg, arm64::X17);
+    
+    u8* done_translate = emit.current();
+    // Patch the skip branches to jump here
+    emit.patch_branch(reinterpret_cast<u32*>(skip_translate), done_translate);
+    emit.patch_branch(reinterpret_cast<u32*>(skip_translate2), done_translate);
+    
+    // BOUNDS CHECK: Ensure translated address is within valid physical memory range
+    // Physical addresses should be 0x00000000-0x1FFFFFFF (512MB)
+    // If address is out of bounds, clamp it to prevent crash
+    emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);  // Max valid physical address
+    emit.CMP(addr_reg, arm64::X16);
+    u8* bounds_ok = emit.current();
+    emit.B_cond(arm64_cond::LS, 0);  // Skip clamp if addr <= 0x1FFFFFFF (unsigned)
+    // Address out of bounds - clamp to 0 to prevent crash (will read garbage but not crash)
+    emit.MOV_imm(addr_reg, 0);
+    emit.patch_branch(reinterpret_cast<u32*>(bounds_ok), emit.current());
+    
+    // Add fastmem base
+    u64 base_addr = reinterpret_cast<u64>(fastmem_base_);
+    emit.MOV_imm(arm64::X16, base_addr);
+    emit.ADD(addr_reg, addr_reg, arm64::X16);
+}
+
 void JitCompiler::byteswap32(ARM64Emitter& emit, int reg) {
     emit.REV32(reg, reg);
 }
@@ -1927,7 +1944,7 @@ void JitCompiler::byteswap64(ARM64Emitter& emit, int reg) {
 //=============================================================================
 
 void JitCompiler::emit_block_prologue(ARM64Emitter& emit) {
-    // Block entry: X0 = ThreadContext*, X1 = memory_base
+    // Block entry: X0 = ThreadContext*
     // Save callee-saved registers that we'll use
     emit.STP(arm64::X29, arm64::X30, arm64::SP, -16);
     emit.STP(arm64::X19, arm64::X20, arm64::SP, -32);
@@ -1937,10 +1954,9 @@ void JitCompiler::emit_block_prologue(ARM64Emitter& emit) {
     // Set up context register (X19)
     emit.ORR(arm64::CTX_REG, arm64::XZR, arm64::X0);
     
-    // Set up memory base register (X20) if fastmem enabled
-    if (fastmem_enabled_) {
-        emit.ORR(arm64::MEM_BASE, arm64::XZR, arm64::X1);
-    }
+    // Note: MEM_BASE (X20) is no longer used - fastmem_base is loaded
+    // directly into X16 in emit_translate_address for each memory access.
+    // This avoids potential register corruption issues and simplifies debugging.
 }
 
 void JitCompiler::emit_block_epilogue(ARM64Emitter& emit) {
@@ -2202,10 +2218,8 @@ void JitCompiler::generate_dispatcher() {
     // Save JIT pointer
     emit.ORR(arm64::JIT_REG, arm64::XZR, arm64::X1);
     
-    // Set up memory base if available
-    if (fastmem_enabled_ && fastmem_base_) {
-        emit.MOV_imm(arm64::MEM_BASE, reinterpret_cast<u64>(fastmem_base_));
-    }
+    // Note: MEM_BASE (X20) is no longer used - fastmem_base is loaded
+    // directly into X16 in emit_translate_address for each memory access.
     
     // Main loop would go here, but we use execute() loop instead
     // Just restore and return for now

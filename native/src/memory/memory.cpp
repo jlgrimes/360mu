@@ -89,9 +89,14 @@ Status Memory::initialize() {
 void Memory::shutdown() {
     std::lock_guard<std::mutex> lock(mutex_);
     
-    teardown_fastmem();
-    
-    if (main_memory_ && main_memory_ != MAP_FAILED) {
+    // If fastmem is active, main_memory_ points into fastmem_base_
+    // So we only need to free one or the other, not both
+    if (fastmem_base_) {
+        teardown_fastmem();
+        // main_memory_ was pointing into fastmem_base_, now invalid
+        main_memory_ = nullptr;
+    } else if (main_memory_ && main_memory_ != MAP_FAILED) {
+        // Fastmem wasn't set up, free main_memory_ separately
         munmap(main_memory_, main_memory_size_);
         main_memory_ = nullptr;
     }
@@ -137,7 +142,7 @@ Status Memory::setup_fastmem() {
     
     LOGI("Reserved fastmem at %p (4GB)", fastmem_base_);
     
-    // Map main memory into the fastmem region
+    // Map the first 512MB as read/write for physical memory
     void* mapped = mmap(
         fastmem_base_,
         main_memory_size_,
@@ -153,23 +158,24 @@ Status Memory::setup_fastmem() {
         return Status::Error;
     }
     
-    // Copy initial memory content to physical region (0x00000000)
+    // CRITICAL: Copy existing main_memory content to fastmem region
     memcpy(fastmem_base_, main_memory_, main_memory_size_);
     
-    // Install signal handler for page faults
+    // CRITICAL FIX: Now redirect main_memory_ to point to fastmem_base_
+    // This ensures both interpreter and JIT use the SAME memory region.
+    // The original main_memory_ allocation becomes orphaned (small leak)
+    // but this is acceptable for correctness.
+    void* old_main_memory = main_memory_;
+    main_memory_ = fastmem_base_;
+    
+    // Free the old allocation to avoid the leak
+    munmap(old_main_memory, main_memory_size_);
+    
+    LOGI("Fastmem: main_memory_ redirected to fastmem_base_ at %p", main_memory_);
+    
+    // Note: We don't install a signal handler as it interferes with Android's runtime.
+    // Instead, we rely on the JIT to do proper address translation.
     g_memory_instance = this;
-    
-    struct sigaction sa;
-    sa.sa_sigaction = fastmem_signal_handler;
-    sa.sa_flags = SA_SIGINFO;
-    sigemptyset(&sa.sa_mask);
-    
-    if (sigaction(SIGSEGV, &sa, nullptr) != 0) {
-        LOGE("Failed to install SIGSEGV handler");
-    }
-    if (sigaction(SIGBUS, &sa, nullptr) != 0) {
-        LOGE("Failed to install SIGBUS handler");
-    }
     
     LOGI("Fastmem initialized successfully");
     return Status::Ok;

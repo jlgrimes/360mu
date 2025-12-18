@@ -120,14 +120,21 @@ void Cpu::execute_thread(u32 thread_id, u64 cycles) {
 #ifdef X360MU_JIT_ENABLED
     if (jit_ && config_.enable_jit) {
         // JIT execution path
-        jit_->execute(ctx, cycles);
+        u64 executed = jit_->execute(ctx, cycles);
         
         // Check for syscall after JIT execution too
         if (ctx.interrupted) {
             ctx.interrupted = false;
             dispatch_syscall(ctx);
         }
-        return;
+        
+        // If JIT actually executed something, we're done
+        // Otherwise fall through to interpreter (JIT may have bailed out)
+        if (executed > 0) {
+            return;
+        }
+        // Fall through to interpreter
+        LOGI("JIT returned 0 cycles - falling back to interpreter");
     }
 #endif
     

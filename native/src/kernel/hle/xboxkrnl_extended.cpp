@@ -357,9 +357,10 @@ static void HLE_ExCreateThread(Cpu* cpu, Memory* memory, u64* args, u64* result)
     if (stack_size == 0) stack_size = 64 * KB;
     stack_size = align_up(stack_size, static_cast<u32>(memory::MEM_PAGE_SIZE));
     
-    // Allocate stack
-    GuestAddr stack_base = 0x70000000 + (g_ext_hle.threads.size() * (stack_size + memory::MEM_PAGE_SIZE));
-    memory->allocate(stack_base, stack_size, MemoryRegion::Read | MemoryRegion::Write);
+    // Allocate stack in virtual address range that maps to physical memory
+    // 0x8E000000 maps to physical 0x0E000000 (within 512MB main memory)
+    GuestAddr stack_base = 0x8E000000 + (g_ext_hle.threads.size() * (stack_size + memory::MEM_PAGE_SIZE));
+    memory->allocate(stack_base & 0x1FFFFFFF, stack_size, MemoryRegion::Read | MemoryRegion::Write);
     
     // Generate IDs
     u32 handle = g_ext_hle.next_handle++;
