@@ -724,7 +724,7 @@ std::string VirtualFileSystem::translate_path(const std::string& xbox_path) {
     if (!parse_device(xbox_path, device, relative)) {
         return "";
     }
-    return device + relative;
+    return device + ":" + relative;
 }
 
 Status VirtualFileSystem::open_file(const std::string& path, FileAccess access, u32& handle_out) {

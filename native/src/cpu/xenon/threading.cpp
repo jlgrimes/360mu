@@ -305,6 +305,20 @@ GuestThread* ThreadScheduler::dequeue_thread(u32 affinity_mask) {
     return nullptr;
 }
 
+bool ThreadScheduler::has_ready_threads(u32 affinity_mask) {
+    // Check if there are any ready threads matching the affinity
+    for (int i = NUM_PRIORITIES - 1; i >= 0; i--) {
+        GuestThread* thread = ready_queues_[i];
+        while (thread) {
+            if (thread->affinity_mask & affinity_mask) {
+                return true;
+            }
+            thread = thread->next;
+        }
+    }
+    return false;
+}
+
 int ThreadScheduler::priority_to_queue_index(ThreadPriority priority) const {
     // Map priority (-15 to +15) to queue index (0 to 31)
     return static_cast<int>(priority) + 16;
@@ -313,19 +327,32 @@ int ThreadScheduler::priority_to_queue_index(ThreadPriority priority) const {
 u64 ThreadScheduler::run(u64 cycles) {
     u64 total_executed = 0;
     
+    // If we have host threads running, they manage current_thread via hw_thread_main.
+    // We just need to wake them up and let them handle thread scheduling.
+    // Only manually set current_thread if no host threads are running for hw thread 0.
+    if (num_host_threads_ > 0) {
+        // Wake all host threads to process any ready threads
+        for (u32 hw = 0; hw < num_host_threads_; hw++) {
+            hw_threads_[hw].wake_cv.notify_one();
+        }
+        // Give host threads a chance to pick up the work
+        std::this_thread::yield();
+    } else {
+        // No host threads - manually pick up a thread for hw thread 0
+        std::lock_guard<std::mutex> lock(hw_threads_[0].mutex);
+        if (hw_threads_[0].current_thread == nullptr) {
+            hw_threads_[0].current_thread = dequeue_thread(1);  // affinity bit 0x1 for hw thread 0
+            if (hw_threads_[0].current_thread) {
+                hw_threads_[0].current_thread->state = ThreadState::Running;
+            }
+        }
+    }
+    
     // Always execute CPU thread 0 (the main game thread)
     // This is set up via cpu_->start_thread() during prepare_entry
     if (cpu_) {
         cpu_->execute_thread(0, cycles);
         total_executed = cycles;
-    }
-    
-    // If we have scheduler guest threads (from game creating threads),
-    // wake host threads to execute them in parallel
-    if (num_host_threads_ > 0 && running_ && !threads_.empty()) {
-        for (u32 hw = 1; hw < num_host_threads_; hw++) {
-            hw_threads_[hw].wake_cv.notify_one();
-        }
     }
     
     current_time_ += cycles;
@@ -475,9 +502,10 @@ void ThreadScheduler::hw_thread_main(u32 hw_thread_id) {
             std::unique_lock<std::mutex> lock(hwt.mutex);
             
             // Wait for work or stop signal
+            // Note: Don't dequeue in predicate - just check if there's work available
             hwt.wake_cv.wait_for(lock, std::chrono::milliseconds(1), [&]() {
                 return hwt.stop_flag || hwt.current_thread != nullptr || 
-                       dequeue_thread(affinity_bit) != nullptr;
+                       has_ready_threads(affinity_bit);
             });
             
             if (hwt.stop_flag) break;

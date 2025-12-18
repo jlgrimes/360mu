@@ -299,6 +299,7 @@ private:
     // Internal methods
     void enqueue_thread(GuestThread* thread);
     GuestThread* dequeue_thread(u32 affinity_mask);
+    bool has_ready_threads(u32 affinity_mask);
     void schedule_thread(u32 hw_thread_id);
     void execute_thread(u32 hw_thread_id);
     void hw_thread_main(u32 hw_thread_id);
