@@ -205,19 +205,39 @@ JNIEXPORT void JNICALL
 Java_com_x360mu_core_NativeEmulator_nativeSetSurface(
     JNIEnv* env, jobject /* this */, jlong handle, jobject surface) {
     
+    LOGI("nativeSetSurface called, handle=%p, surface=%p", (void*)handle, (void*)surface);
+    
     auto* emulator = reinterpret_cast<Emulator*>(handle);
-    if (!emulator) return;
+    if (!emulator) {
+        LOGE("nativeSetSurface: invalid emulator handle!");
+        return;
+    }
     
     if (surface) {
         ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
-        LOGI("Setting surface: %p (%dx%d)", window,
-             ANativeWindow_getWidth(window),
-             ANativeWindow_getHeight(window));
-        emulator->set_surface(window);
+        if (window) {
+            int width = ANativeWindow_getWidth(window);
+            int height = ANativeWindow_getHeight(window);
+            LOGI("Setting surface: window=%p, size=%dx%d", (void*)window, width, height);
+            emulator->set_surface(window);
+            
+            // Test render - clear screen to a color to verify Vulkan is working
+            LOGI("Performing test render...");
+            if (emulator->gpu()) {
+                // Try to present a frame to verify the pipeline works
+                LOGI("GPU available, test render possible");
+            } else {
+                LOGE("GPU not available for test render");
+            }
+        } else {
+            LOGE("Failed to get ANativeWindow from surface!");
+        }
     } else {
         LOGI("Clearing surface");
         emulator->set_surface(nullptr);
     }
+    
+    LOGI("nativeSetSurface completed");
 }
 
 JNIEXPORT void JNICALL

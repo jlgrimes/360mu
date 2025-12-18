@@ -322,28 +322,51 @@ void Emulator::step_frame() {
 }
 
 void Emulator::emulation_thread_main() {
-    LOGI("Emulation thread started");
+    LOGI("=== Emulation thread started ===");
     
     using Clock = std::chrono::high_resolution_clock;
     auto last_frame_time = Clock::now();
+    auto last_log_time = Clock::now();
     auto target_frame_time = FRAME_TIME_30FPS; // TODO: configurable
+    
+    u64 loop_iterations = 0;
+    u64 frames_since_log = 0;
     
     while (!emu_thread_->should_stop) {
         // Wait for run signal or step
         {
             std::unique_lock<std::mutex> lock(emu_thread_->mutex);
+            LOGI("Emulation thread waiting (running=%d, paused=%d, stop=%d)",
+                 emu_thread_->running.load(), emu_thread_->paused.load(), 
+                 emu_thread_->should_stop.load());
+            
             emu_thread_->cv.wait(lock, [this]() {
                 return emu_thread_->should_stop ||
                        (emu_thread_->running && !emu_thread_->paused) ||
                        emu_thread_->step_frame;
             });
+            
+            LOGI("Emulation thread woke up (running=%d, paused=%d, stop=%d)",
+                 emu_thread_->running.load(), emu_thread_->paused.load(),
+                 emu_thread_->should_stop.load());
         }
         
         if (emu_thread_->should_stop) {
+            LOGI("Emulation thread stopping due to should_stop flag");
             break;
         }
         
         bool single_step = emu_thread_->step_frame.exchange(false);
+        loop_iterations++;
+        
+        // Log periodically
+        auto now = Clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 2) {
+            LOGI("Emulation loop: %llu iterations, %llu frames, %.1f FPS", 
+                 loop_iterations, frames_since_log, stats_.fps);
+            last_log_time = now;
+            frames_since_log = 0;
+        }
         
         // Execute one frame
         auto frame_start = Clock::now();
@@ -351,9 +374,12 @@ void Emulator::emulation_thread_main() {
         // Run CPU until GPU signals frame complete
         // This is a simplified version - real implementation needs proper synchronization
         bool frame_complete = false;
+        u32 cpu_batches = 0;
+        
         while (!frame_complete && !emu_thread_->paused && !emu_thread_->should_stop) {
             // Execute a batch of CPU cycles
             cpu_->execute(cpu::CLOCK_SPEED / 60 / 100); // ~1/100th of a frame
+            cpu_batches++;
             
             // Process GPU command buffer
             gpu_->process_commands();
@@ -365,12 +391,20 @@ void Emulator::emulation_thread_main() {
             if (apu_) {
                 apu_->process();
             }
+            
+            // Safety: if we've run too many batches without a frame, break
+            if (cpu_batches >= 1000) {
+                LOGI("Frame taking too long, CPU executed %u batches", cpu_batches);
+                break;
+            }
         }
         
         // Present frame
-        if (frame_complete) {
+        if (frame_complete || cpu_batches >= 100) {
+            // Even if frame isn't "complete", try to present to show something
             gpu_->present();
             stats_.frames_rendered++;
+            frames_since_log++;
             
             if (frame_callback_) {
                 frame_callback_();
@@ -384,7 +418,9 @@ void Emulator::emulation_thread_main() {
         
         // Calculate FPS
         auto since_last = std::chrono::duration_cast<std::chrono::microseconds>(frame_end - last_frame_time);
-        stats_.fps = 1000000.0 / since_last.count();
+        if (since_last.count() > 0) {
+            stats_.fps = 1000000.0 / since_last.count();
+        }
         last_frame_time = frame_end;
         
         // Sync to target frame rate (if we're ahead)
@@ -398,7 +434,7 @@ void Emulator::emulation_thread_main() {
         }
     }
     
-    LOGI("Emulation thread stopped");
+    LOGI("=== Emulation thread stopped ===");
 }
 
 // Input methods

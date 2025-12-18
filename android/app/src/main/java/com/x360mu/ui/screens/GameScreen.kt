@@ -1,11 +1,13 @@
 package com.x360mu.ui.screens
 
+import android.util.Log
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
@@ -29,32 +31,57 @@ import com.x360mu.core.NativeEmulator
 import kotlinx.coroutines.delay
 import kotlin.math.sqrt
 
+private const val TAG = "360mu-GameScreen"
+
 @Composable
 fun GameScreen(
     emulator: NativeEmulator,
     gamePath: String,
     onBack: () -> Unit
 ) {
+    Log.i(TAG, "GameScreen composable rendering, path: $gamePath")
+    
     var isLoading by remember { mutableStateOf(true) }
     var showControls by remember { mutableStateOf(true) }
     var showMenu by remember { mutableStateOf(false) }
     var fps by remember { mutableStateOf(0.0) }
+    var loadError by remember { mutableStateOf<String?>(null) }
+    var emulatorState by remember { mutableStateOf("Unknown") }
     
     // Load game and start emulation
     LaunchedEffect(gamePath) {
+        Log.i(TAG, "GameScreen LaunchedEffect - loading game: $gamePath")
         isLoading = true
+        loadError = null
         
-        if (emulator.loadGame(gamePath)) {
-            emulator.run()
+        try {
+            Log.i(TAG, "Calling emulator.loadGame()...")
+            val loaded = emulator.loadGame(gamePath)
+            Log.i(TAG, "loadGame returned: $loaded")
+            
+            if (loaded) {
+                Log.i(TAG, "Game loaded successfully, calling emulator.run()...")
+                val running = emulator.run()
+                Log.i(TAG, "run() returned: $running")
+                emulatorState = emulator.state.name
+            } else {
+                loadError = "Failed to load game"
+                Log.e(TAG, "Failed to load game: $gamePath")
+            }
+        } catch (e: Exception) {
+            loadError = "Exception: ${e.message}"
+            Log.e(TAG, "Exception loading game: ${e.message}", e)
         }
         
         isLoading = false
+        Log.i(TAG, "GameScreen LaunchedEffect complete, isLoading=$isLoading, error=$loadError")
     }
     
-    // Update FPS display
+    // Update FPS display and state
     LaunchedEffect(Unit) {
         while (true) {
             fps = emulator.fps
+            emulatorState = emulator.state.name
             delay(500)
         }
     }
@@ -104,26 +131,89 @@ fun GameScreen(
             )
         }
         
-        // Loading overlay
-        if (isLoading) {
+        // Loading overlay or error display
+        if (isLoading || loadError != null) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Black),
+                    .background(Color.Black.copy(alpha = 0.9f)),
                 contentAlignment = Alignment.Center
             ) {
                 Column(
-                    horizontalAlignment = Alignment.CenterHorizontally
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier
+                        .border(2.dp, if (loadError != null) Color.Red else Color.Green, RoundedCornerShape(8.dp))
+                        .padding(24.dp)
                 ) {
-                    CircularProgressIndicator(
-                        color = MaterialTheme.colorScheme.primary
-                    )
+                    if (loadError != null) {
+                        Icon(
+                            Icons.Default.Error,
+                            contentDescription = null,
+                            tint = Color.Red,
+                            modifier = Modifier.size(48.dp)
+                        )
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Text(
+                            text = "Load Error",
+                            color = Color.Red,
+                            style = MaterialTheme.typography.titleLarge
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = loadError!!,
+                            color = Color.White
+                        )
+                    } else {
+                        CircularProgressIndicator(
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Text(
+                            text = "Loading...",
+                            color = Color.White,
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                    }
+                    
                     Spacer(modifier = Modifier.height(16.dp))
                     Text(
-                        text = "Loading...",
-                        color = Color.White
+                        text = "Path: ${gamePath.takeLast(40)}",
+                        color = Color.Gray,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text(
+                        text = "State: $emulatorState",
+                        color = Color.Gray,
+                        style = MaterialTheme.typography.bodySmall
                     )
                 }
+            }
+        }
+        
+        // Debug info overlay (always visible)
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(8.dp)
+                .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(4.dp))
+                .padding(4.dp)
+        ) {
+            Column {
+                Text(
+                    text = "DEBUG: GameScreen Active",
+                    color = Color.Green,
+                    style = MaterialTheme.typography.labelSmall
+                )
+                Text(
+                    text = "State: $emulatorState",
+                    color = Color.Cyan,
+                    style = MaterialTheme.typography.labelSmall
+                )
+                Text(
+                    text = "FPS: %.1f".format(fps),
+                    color = if (fps > 0) Color.Green else Color.Red,
+                    style = MaterialTheme.typography.labelSmall
+                )
             }
         }
         
@@ -143,12 +233,21 @@ private fun EmulatorSurface(
     emulator: NativeEmulator,
     modifier: Modifier = Modifier
 ) {
+    Log.i(TAG, "EmulatorSurface composable rendering")
+    
     AndroidView(
         factory = { context ->
+            Log.i(TAG, "Creating SurfaceView")
             SurfaceView(context).apply {
                 holder.addCallback(object : SurfaceHolder.Callback {
                     override fun surfaceCreated(holder: SurfaceHolder) {
-                        emulator.setSurface(holder.surface)
+                        Log.i(TAG, "SurfaceHolder.Callback.surfaceCreated()")
+                        try {
+                            emulator.setSurface(holder.surface)
+                            Log.i(TAG, "Surface set successfully")
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Error setting surface: ${e.message}", e)
+                        }
                     }
                     
                     override fun surfaceChanged(
@@ -157,11 +256,21 @@ private fun EmulatorSurface(
                         width: Int,
                         height: Int
                     ) {
-                        emulator.resizeSurface(width, height)
+                        Log.i(TAG, "SurfaceHolder.Callback.surfaceChanged() - ${width}x${height}, format=$format")
+                        try {
+                            emulator.resizeSurface(width, height)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Error resizing surface: ${e.message}", e)
+                        }
                     }
                     
                     override fun surfaceDestroyed(holder: SurfaceHolder) {
-                        emulator.setSurface(null)
+                        Log.i(TAG, "SurfaceHolder.Callback.surfaceDestroyed()")
+                        try {
+                            emulator.setSurface(null)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Error clearing surface: ${e.message}", e)
+                        }
                     }
                 })
             }

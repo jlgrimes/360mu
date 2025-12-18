@@ -2,12 +2,14 @@ package com.x360mu.ui.screens
 
 import android.content.Intent
 import android.net.Uri
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -30,6 +32,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import java.io.File
 
+private const val TAG = "360mu-LibraryScreen"
+
 data class GameItem(
     val path: String,
     val name: String,
@@ -42,6 +46,12 @@ fun LibraryScreen(
     onGameSelected: (String) -> Unit,
     onSettingsClick: () -> Unit
 ) {
+    Log.i(TAG, "LibraryScreen composable rendering")
+    
+    LaunchedEffect(Unit) {
+        Log.i(TAG, "LibraryScreen LaunchedEffect - composition complete")
+    }
+    
     val context = LocalContext.current
     var games by remember { mutableStateOf<List<GameItem>>(emptyList()) }
     var isLoading by remember { mutableStateOf(false) }
@@ -168,46 +178,85 @@ fun LibraryScreen(
 private fun EmptyLibraryState(
     onAddClick: () -> Unit
 ) {
+    Log.i(TAG, "EmptyLibraryState rendering")
+    
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
             .padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Icon(
-            imageVector = Icons.Default.SportsEsports,
-            contentDescription = null,
-            modifier = Modifier.size(96.dp),
-            tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
-        )
-        
-        Spacer(modifier = Modifier.height(24.dp))
-        
-        Text(
-            text = "No Games Yet",
-            style = MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.SemiBold
-        )
-        
-        Spacer(modifier = Modifier.height(8.dp))
-        
-        Text(
-            text = "Add your Xbox 360 game files to get started.\nSupported formats: .xex, .iso",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            textAlign = TextAlign.Center
-        )
-        
-        Spacer(modifier = Modifier.height(32.dp))
-        
-        OutlinedButton(
-            onClick = onAddClick,
-            modifier = Modifier.fillMaxWidth(0.6f)
+        // Debug border to make the UI visible
+        Box(
+            modifier = Modifier
+                .border(2.dp, Color.Green, RoundedCornerShape(8.dp))
+                .padding(16.dp)
         ) {
-            Icon(Icons.Default.FolderOpen, contentDescription = null)
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("Browse Files")
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Icon(
+                    imageVector = Icons.Default.SportsEsports,
+                    contentDescription = null,
+                    modifier = Modifier.size(96.dp),
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                
+                Spacer(modifier = Modifier.height(24.dp))
+                
+                Text(
+                    text = "360μ - Xbox 360 Emulator",
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                Text(
+                    text = "No Games Yet",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onBackground
+                )
+                
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                Text(
+                    text = "Add your Xbox 360 game files to get started.\nSupported formats: .xex, .iso",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center
+                )
+                
+                Spacer(modifier = Modifier.height(32.dp))
+                
+                Button(
+                    onClick = {
+                        Log.i(TAG, "Browse Files button clicked")
+                        onAddClick()
+                    },
+                    modifier = Modifier.fillMaxWidth(0.8f),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.primary
+                    )
+                ) {
+                    Icon(Icons.Default.FolderOpen, contentDescription = null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Browse Files", fontWeight = FontWeight.Bold)
+                }
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                // Debug info
+                Text(
+                    text = "UI Rendering OK ✓",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.Green
+                )
+            }
         }
     }
 }

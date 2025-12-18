@@ -1,6 +1,9 @@
 package com.x360mu.core
 
+import android.util.Log
 import android.view.Surface
+
+private const val TAG = "360mu-NativeEmulator"
 
 /**
  * Native emulator interface
@@ -60,7 +63,18 @@ class NativeEmulator : AutoCloseable {
     }
     
     init {
-        nativeHandle = nativeCreate()
+        Log.i(TAG, "NativeEmulator init block - creating native instance")
+        if (!libraryLoaded) {
+            Log.e(TAG, "Native library not loaded! Error: $libraryError")
+            throw RuntimeException("Native library not loaded: $libraryError")
+        }
+        try {
+            nativeHandle = nativeCreate()
+            Log.i(TAG, "Native emulator created, handle=$nativeHandle")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create native emulator: ${e.message}", e)
+            throw e
+        }
     }
     
     /**
@@ -73,14 +87,26 @@ class NativeEmulator : AutoCloseable {
         enableJit: Boolean = true,
         enableVulkan: Boolean = true
     ): Boolean {
-        return nativeInitialize(nativeHandle, dataPath, cachePath, savePath, enableJit, enableVulkan)
+        Log.i(TAG, "initialize() called")
+        Log.i(TAG, "  dataPath: $dataPath")
+        Log.i(TAG, "  cachePath: $cachePath")
+        Log.i(TAG, "  savePath: $savePath")
+        Log.i(TAG, "  enableJit: $enableJit")
+        Log.i(TAG, "  enableVulkan: $enableVulkan")
+        
+        val result = nativeInitialize(nativeHandle, dataPath, cachePath, savePath, enableJit, enableVulkan)
+        Log.i(TAG, "initialize() returned: $result")
+        return result
     }
     
     /**
      * Load a game file
      */
     fun loadGame(path: String): Boolean {
-        return nativeLoadGame(nativeHandle, path)
+        Log.i(TAG, "loadGame() called with path: $path")
+        val result = nativeLoadGame(nativeHandle, path)
+        Log.i(TAG, "loadGame() returned: $result, state: $state")
+        return result
     }
     
     /**
@@ -94,7 +120,10 @@ class NativeEmulator : AutoCloseable {
      * Start/resume emulation
      */
     fun run(): Boolean {
-        return nativeRun(nativeHandle)
+        Log.i(TAG, "run() called, current state: $state")
+        val result = nativeRun(nativeHandle)
+        Log.i(TAG, "run() returned: $result, new state: $state")
+        return result
     }
     
     /**
@@ -137,13 +166,16 @@ class NativeEmulator : AutoCloseable {
      * Set the rendering surface
      */
     fun setSurface(surface: Surface?) {
+        Log.i(TAG, "setSurface() called with surface: ${surface?.toString() ?: "null"}")
         nativeSetSurface(nativeHandle, surface)
+        Log.i(TAG, "setSurface() completed")
     }
     
     /**
      * Notify of surface size change
      */
     fun resizeSurface(width: Int, height: Int) {
+        Log.i(TAG, "resizeSurface() called with ${width}x${height}")
         nativeResizeSurface(nativeHandle, width, height)
     }
     
@@ -197,9 +229,26 @@ class NativeEmulator : AutoCloseable {
     }
     
     companion object {
+        private var libraryLoaded = false
+        private var libraryError: String? = null
+        
         init {
-            System.loadLibrary("x360mu_jni")
+            Log.i(TAG, "Loading native library x360mu_jni...")
+            try {
+                System.loadLibrary("x360mu_jni")
+                libraryLoaded = true
+                Log.i(TAG, "Native library loaded successfully!")
+            } catch (e: UnsatisfiedLinkError) {
+                libraryError = e.message
+                Log.e(TAG, "Failed to load native library: ${e.message}", e)
+            } catch (e: Exception) {
+                libraryError = e.message
+                Log.e(TAG, "Exception loading native library: ${e.message}", e)
+            }
         }
+        
+        fun isLibraryLoaded(): Boolean = libraryLoaded
+        fun getLibraryError(): String? = libraryError
     }
     
     // Native methods
