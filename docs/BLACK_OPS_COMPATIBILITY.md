@@ -16,20 +16,20 @@
 
 ### What's Actually Implemented
 
-| Component                | Implementation Status                                 |
-| ------------------------ | ----------------------------------------------------- |
-| CPU Interpreter          | ✅ Core + extended instructions, passes all tests     |
-| Memory (512MB + Fastmem) | ✅ Big-endian, MMIO, reservations working             |
-| XEX2 Parser              | ✅ Header parsing, decryption, imports with thunks    |
-| XEX Decryption           | ✅ AES-128 CBC, basic compression, key derivation     |
-| ISO/XGD File System      | ✅ Xbox Game Disc mounting, file extraction           |
+| Component                | Implementation Status                                     |
+| ------------------------ | --------------------------------------------------------- |
+| CPU Interpreter          | ✅ Core + extended instructions, passes all tests         |
+| Memory (512MB + Fastmem) | ✅ Big-endian, MMIO, reservations working                 |
+| XEX2 Parser              | ✅ Header parsing, decryption, imports with thunks        |
+| XEX Decryption           | ✅ AES-128 CBC, basic compression, key derivation         |
+| ISO/XGD File System      | ✅ Xbox Game Disc mounting, file extraction               |
 | Basic Kernel HLE         | ✅ 150+ functions implemented, syscall dispatch connected |
-| VMX128 SIMD              | ✅ Float ops, shuffle, dot/cross products             |
-| XMA Audio Decoder        | ✅ Full decoder with Android audio output             |
-| Audio Mixer              | ✅ 256 voices, volume/pan, resampling                 |
-| JIT Compiler             | 🔴 Framework exists, not generating code              |
-| GPU/Vulkan               | ✅ Full pipeline: command processor → shader → Vulkan |
-| Shader Translator        | ✅ Xenos → SPIR-V translation with caching            |
+| VMX128 SIMD              | ✅ Float ops, shuffle, dot/cross products                 |
+| XMA Audio Decoder        | ✅ Full decoder with Android audio output                 |
+| Audio Mixer              | ✅ 256 voices, volume/pan, resampling                     |
+| JIT Compiler             | 🔴 Framework exists, not generating code                  |
+| GPU/Vulkan               | ✅ Full pipeline: command processor → shader → Vulkan     |
+| Shader Translator        | ✅ Xenos → SPIR-V translation with caching                |
 
 ---
 
@@ -226,13 +226,13 @@ Interpreter works but is ~100x too slow for real gameplay.
 
 ## Success Metrics
 
-| Milestone | Criteria                    | Current Status |
-| --------- | --------------------------- | -------------- |
-| Boot      | Shows Activision logo       | 🟢 Ready to test |
-| Menu      | Main menu navigable         | 🟢 Ready to test |
+| Milestone | Criteria                    | Current Status                    |
+| --------- | --------------------------- | --------------------------------- |
+| Boot      | Shows Activision logo       | 🟢 Ready to test                  |
+| Menu      | Main menu navigable         | 🟢 Ready to test                  |
 | Load      | Campaign mission loads      | 🟡 May work (needs JIT for speed) |
 | In-Game   | Can control character       | 🟡 May work (needs JIT for speed) |
-| Playable  | Complete mission at 20+ FPS | 🔴 Needs JIT compiler |
+| Playable  | Complete mission at 20+ FPS | 🔴 Needs JIT compiler             |
 
 ---
 
