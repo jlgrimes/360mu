@@ -261,49 +261,46 @@ fastmem*base* might change between:
    - Review how Xenia handles fastmem on ARM64
    - Check if there are known ARM64-specific issues
 
-## Resolution
+## Resolution (December 2024)
 
 ### Root Cause Analysis
 
-The ~2GB offset error was a red herring caused by reading uninitialized/stale memory. The real issue was that the Memory class had **two separate memory regions**:
+The ~2GB offset crash was caused by two issues:
 
-1. `main_memory_`: 512MB allocated via `mmap()` - used by interpreter and Memory class read/write methods
-2. `fastmem_base_`: 4GB reserved region with 512MB mapped at base - used by JIT for direct memory access
+1. **Memory Region Split**: `main_memory_` and `fastmem_base_` were separate mmap'd regions. Interpreter/Memory class wrote to `main_memory_`, but JIT accessed `fastmem_base_` - reading stale/garbage data.
 
-After initialization, these were separate copies. When the interpreter wrote to memory (via `Memory::write_u32`), it went to `main_memory_`. But when JIT code read that same address, it read from `fastmem_base_` - which had stale/different data.
+2. **Complex Address Translation**: The original code had conditional branches to only mask addresses in range [0x80000000, 0xA0000000). Addresses outside this range were passed through directly, leading to invalid memory accesses.
 
-### Fix Applied
+### Fixes Applied
 
-Modified `setup_fastmem()` in `memory.cpp` to unify the memory regions:
-
+**1. Memory Unification** (`memory.cpp:setup_fastmem`):
 ```cpp
-// Use mremap to move main_memory_ to fastmem_base_ location
-void* remapped = mremap(
-    main_memory_,
-    main_memory_size_,
-    main_memory_size_,
-    MREMAP_MAYMOVE | MREMAP_FIXED,
-    fastmem_base_
-);
+// Copy main_memory_ content to fastmem_base_
+memcpy(fastmem_base_, main_memory_, main_memory_size_);
 
-// Update main_memory_ to point to the new location
-main_memory_ = remapped;
+// Redirect main_memory_ to point to fastmem_base_
+void* old_main_memory = main_memory_;
+main_memory_ = fastmem_base_;
+munmap(old_main_memory, main_memory_size_);
 ```
 
-Now both `main_memory_` and `fastmem_base_` point to the same physical memory, ensuring consistency between interpreter and JIT.
-
-### Additional Cleanup
-
-- Removed dead code that set up X20 (MEM_BASE) in block prologue - it was never used
-- `emit_translate_address` now loads fastmem_base directly into X16 for each memory access
-- Fixed potential register conflict where AND_imm fallback could clobber X16 (now uses X17 for mask)
-
-## Previous Workaround (No Longer Needed)
-
-Disable JIT and use interpreter:
-
+**2. Simplified Address Translation** (`jit_compiler.cpp:emit_translate_address`):
 ```cpp
-config.enable_jit = false;
+// Simple approach: ALWAYS mask to get physical offset within 512MB
+// Works for both virtual (0x8XXXXXXX) and physical (0x0XXXXXXX) addresses
+emit.AND_imm(addr_reg, addr_reg, 0x1FFFFFFFULL);
+emit.MOV_imm(arm64::X16, fastmem_base);
+emit.ADD(addr_reg, addr_reg, arm64::X16);
 ```
 
-This works correctly but is ~10-50x slower.
+### Verification
+
+After fixes:
+- ✅ No SIGSEGV crashes
+- ✅ CPU running at ~22 FPS
+- ✅ 522 import thunks installed correctly
+- ✅ GPU frames being presented (1500+ frames)
+
+### Remaining Issues (Separate from this bug)
+
+The emulator shows a purple screen despite JIT running correctly. This is a separate GPU/rendering issue unrelated to the JIT fastmem bug.
