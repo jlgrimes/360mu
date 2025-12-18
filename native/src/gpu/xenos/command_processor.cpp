@@ -21,6 +21,7 @@
 #include "gpu/descriptor_manager.h"
 #include "memory/memory.h"
 #include <cstring>
+#include <cstdio>
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -197,6 +198,14 @@ void CommandProcessor::write_register(u32 index, u32 value) {
 }
 
 bool CommandProcessor::process(GuestAddr ring_base, u32 ring_size, u32& read_ptr, u32 write_ptr) {
+    // #region agent log
+    static int cp_log_count = 0;
+    if (cp_log_count++ < 10) {
+        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+        if (f) { fprintf(f, "{\"hypothesisId\":\"D\",\"location\":\"command_processor.cpp:process\",\"message\":\"CP process called\",\"data\":{\"ring_base\":%u,\"ring_size\":%u,\"read_ptr\":%u,\"write_ptr\":%u}}\n", ring_base, ring_size, read_ptr, write_ptr); fclose(f); }
+    }
+    // #endregion
+    
     frame_complete_ = false;
     
     // Process packets until read catches up to write

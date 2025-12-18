@@ -596,30 +596,51 @@ void Memory::notify_write(GuestAddr addr, u64 size) {
         }
     }
     
-    // Clear reservation if write overlaps
-    if (has_reservation_) {
-        if (addr < reservation_addr_ + reservation_size_ && 
-            addr + size > reservation_addr_) {
-            has_reservation_ = false;
+    // Invalidate any thread reservations that overlap with this write
+    invalidate_reservations(addr, size);
+}
+
+// Per-thread atomic reservation support
+void Memory::set_reservation(u32 thread_id, GuestAddr addr, u32 size) {
+    if (thread_id >= MAX_THREADS) return;
+    
+    std::lock_guard<std::mutex> lock(reservation_mutex_);
+    reservations_[thread_id].addr = addr;
+    reservations_[thread_id].size = size;
+    reservations_[thread_id].valid = true;
+}
+
+bool Memory::check_reservation(u32 thread_id, GuestAddr addr, u32 size) const {
+    if (thread_id >= MAX_THREADS) return false;
+    
+    std::lock_guard<std::mutex> lock(reservation_mutex_);
+    const auto& res = reservations_[thread_id];
+    if (!res.valid) return false;
+    return (addr == res.addr && size == res.size);
+}
+
+void Memory::clear_reservation(u32 thread_id) {
+    if (thread_id >= MAX_THREADS) return;
+    
+    std::lock_guard<std::mutex> lock(reservation_mutex_);
+    reservations_[thread_id].valid = false;
+}
+
+void Memory::invalidate_reservations(GuestAddr addr, u64 size) {
+    std::lock_guard<std::mutex> lock(reservation_mutex_);
+    
+    // Check all thread reservations for overlap with the written range
+    for (u32 i = 0; i < MAX_THREADS; i++) {
+        auto& res = reservations_[i];
+        if (res.valid) {
+            // Check if write overlaps with reservation
+            GuestAddr res_end = res.addr + res.size;
+            GuestAddr write_end = addr + size;
+            if (addr < res_end && write_end > res.addr) {
+                res.valid = false;
+            }
         }
     }
-}
-
-// Atomic reservation support
-void Memory::set_reservation(GuestAddr addr, u32 size) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    reservation_addr_ = addr;
-    reservation_size_ = size;
-    has_reservation_ = true;
-}
-
-bool Memory::check_reservation(GuestAddr addr, u32 size) const {
-    if (!has_reservation_) return false;
-    return (addr == reservation_addr_ && size == reservation_size_);
-}
-
-void Memory::clear_reservation() {
-    has_reservation_ = false;
 }
 
 // Time base support

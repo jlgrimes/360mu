@@ -234,5 +234,52 @@ bool Cpu::any_running() const {
     return false;
 }
 
+void Cpu::execute_with_context(u32 thread_id, ThreadContext& external_ctx, u64 cycles) {
+    if (thread_id >= cpu::NUM_THREADS) {
+        return;
+    }
+    
+    // Lock the context for this thread
+    std::lock_guard<std::mutex> lock(context_mutexes_[thread_id]);
+    
+    ThreadContext& cpu_ctx = contexts_[thread_id];
+    
+    // Copy external context to CPU context (save state)
+    cpu_ctx = external_ctx;
+    cpu_ctx.running = true;
+    cpu_ctx.memory = memory_;  // Ensure memory pointer is valid
+    
+    // Execute using the CPU's context
+#ifdef X360MU_JIT_ENABLED
+    if (jit_ && config_.enable_jit) {
+        u64 executed = jit_->execute(cpu_ctx, cycles);
+        if (cpu_ctx.interrupted) {
+            cpu_ctx.interrupted = false;
+            dispatch_syscall(cpu_ctx);
+        }
+        if (executed > 0) {
+            // Copy CPU context back to external context
+            external_ctx = cpu_ctx;
+            return;
+        }
+    }
+#endif
+    
+    // Interpreter fallback
+    interpreter_->execute(cpu_ctx, cycles);
+    
+    if (cpu_ctx.interrupted) {
+        cpu_ctx.interrupted = false;
+        dispatch_syscall(cpu_ctx);
+    }
+    
+    // Copy CPU context back to external context (restore state)
+    external_ctx = cpu_ctx;
+}
+
+std::mutex& Cpu::get_context_mutex(u32 thread_id) {
+    return context_mutexes_[thread_id % cpu::NUM_THREADS];
+}
+
 } // namespace x360mu
 

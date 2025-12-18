@@ -10,6 +10,7 @@
 #include <memory>
 #include <array>
 #include <string>
+#include <mutex>
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -136,6 +137,12 @@ struct ThreadContext {
     // Memory pointer for MMIO access from JIT
     void* memory;  // Memory* - use void* to avoid circular include
     
+    // Per-thread atomic reservation state (for lwarx/stwcx)
+    // Each thread maintains its own reservation - writes from any thread invalidate it
+    GuestAddr reservation_addr;
+    u32 reservation_size;
+    bool has_reservation;
+    
     void reset() {
         gpr.fill(0);
         fpr.fill(0.0);
@@ -155,6 +162,9 @@ struct ThreadContext {
         time_base = 0;
         running = false;
         interrupted = false;
+        reservation_addr = 0;
+        reservation_size = 0;
+        has_reservation = false;
     }
 };
 
@@ -347,6 +357,17 @@ public:
      */
     void execute_thread(u32 thread_id, u64 cycles);
     
+    /**
+     * Execute with external context (for scheduler integration)
+     * Copies context in, executes, copies back - thread-safe
+     */
+    void execute_with_context(u32 thread_id, ThreadContext& external_ctx, u64 cycles);
+    
+    /**
+     * Lock/unlock context for external access
+     */
+    std::mutex& get_context_mutex(u32 thread_id);
+    
 private:
     Memory* memory_ = nullptr;
     Kernel* kernel_ = nullptr;
@@ -354,6 +375,9 @@ private:
     
     // Thread contexts
     std::array<ThreadContext, cpu::NUM_THREADS> contexts_;
+    
+    // Per-thread context locks for thread-safe access
+    std::array<std::mutex, cpu::NUM_THREADS> context_mutexes_;
     
     // Execution engines
     std::unique_ptr<Interpreter> interpreter_;

@@ -462,11 +462,27 @@ void JitCompiler::compile_instruction(ARM64Emitter& emit, ThreadContext& ctx_tem
             break;
             
         case DecodedInst::Type::SYNC:
+            // Full memory barrier (PowerPC sync L=0)
+            // DMB SY (option 15) - full system data memory barrier
+            emit.DMB(15);  // SY - full system barrier
+            break;
+            
         case DecodedInst::Type::LWSYNC:
+            // Lightweight sync (PowerPC sync L=1) - acquire-release semantics
+            // DMB ISH (option 11) - inner shareable barrier
+            emit.DMB(11);  // ISH - inner shareable (sufficient for SMP)
+            break;
+            
         case DecodedInst::Type::EIEIO:
+            // Enforce In-Order Execution of I/O - store ordering for MMIO
+            // DMB ISHST (option 10) - inner shareable store barrier
+            emit.DMB(10);  // ISHST - inner shareable store-store barrier
+            break;
+            
         case DecodedInst::Type::ISYNC:
-            // Memory barriers - emit ARM64 DMB
-            emit.DMB();
+            // Instruction synchronize - ensures instruction fetch is synchronized
+            // ISB - instruction synchronization barrier
+            emit.ISB();
             break;
             
         case DecodedInst::Type::DCBF:
@@ -1360,7 +1376,7 @@ void JitCompiler::compile_store_multiple(ARM64Emitter& emit, const DecodedInst& 
 }
 
 //=============================================================================
-// Atomic Operations (lwarx/stwcx)
+// Atomic Operations (lwarx/stwcx) - Per-Thread Reservation
 //=============================================================================
 
 void JitCompiler::compile_atomic_load(ARM64Emitter& emit, const DecodedInst& inst) {
@@ -1379,16 +1395,25 @@ void JitCompiler::compile_atomic_load(ARM64Emitter& emit, const DecodedInst& ins
     
     store_gpr(emit, inst.rd, arm64::X1);
     
-    // Store reservation address (untranslated) in context
-    emit.STR(arm64::X2, arm64::CTX_REG, offsetof(ThreadContext, lr) + 8); // Use spare field
+    // Store per-thread reservation in ThreadContext
+    emit.STR(arm64::X2, arm64::CTX_REG, offsetof(ThreadContext, reservation_addr));
+    emit.MOV_imm(arm64::X3, 4);  // reservation size = 4 bytes
+    emit.STR(arm64::X3, arm64::CTX_REG, offsetof(ThreadContext, reservation_size));
+    emit.MOV_imm(arm64::X3, 1);  // has_reservation = true
+    emit.STRB(arm64::X3, arm64::CTX_REG, offsetof(ThreadContext, has_reservation));
 }
 
 void JitCompiler::compile_atomic_store(ARM64Emitter& emit, const DecodedInst& inst) {
     // stwcx. rS, rA, rB - Store Word Conditional Indexed
     calc_ea_indexed(emit, arm64::X0, inst.ra, inst.rb);
     
+    // Check if reservation is valid
+    emit.LDRB(arm64::X3, arm64::CTX_REG, offsetof(ThreadContext, has_reservation));
+    emit.CBZ(arm64::X3, 0);  // Branch if no reservation
+    u8* no_reservation = emit.current() - 4;
+    
     // Load reservation address (untranslated) from context
-    emit.LDR(arm64::X2, arm64::CTX_REG, offsetof(ThreadContext, lr) + 8);
+    emit.LDR(arm64::X2, arm64::CTX_REG, offsetof(ThreadContext, reservation_addr));
     
     // Compare addresses (both untranslated)
     emit.CMP(arm64::X0, arm64::X2);
@@ -1413,19 +1438,25 @@ void JitCompiler::compile_atomic_store(ARM64Emitter& emit, const DecodedInst& in
     u8* done = emit.current();
     emit.B(0);
     
+    // Patch no_reservation branch (CBZ)
+    s64 no_res_offset = emit.current() - no_reservation;
+    *reinterpret_cast<u32*>(no_reservation) = 0xB4000000 | ((no_res_offset >> 2) << 5) | arm64::X3;
+    
     // Patch skip branch
     s64 skip_offset = emit.current() - skip;
     *reinterpret_cast<u32*>(skip) = 0x54000000 | ((skip_offset >> 2) << 5) | arm64_cond::NE;
     
     // Set CR0.EQ=0 (failure)
     emit.STRB(arm64::XZR, arm64::CTX_REG, ctx_offset_cr(0) + 2); // EQ = 0
+    emit.STRB(arm64::XZR, arm64::CTX_REG, ctx_offset_cr(0) + 0); // LT = 0
+    emit.STRB(arm64::XZR, arm64::CTX_REG, ctx_offset_cr(0) + 1); // GT = 0
     
     // Patch done branch
     s64 done_offset = emit.current() - done;
     *reinterpret_cast<u32*>(done) = 0x14000000 | ((done_offset >> 2) & 0x03FFFFFF);
     
-    // Clear reservation
-    emit.STR(arm64::XZR, arm64::CTX_REG, offsetof(ThreadContext, lr) + 8);
+    // Clear reservation (has_reservation = false)
+    emit.STRB(arm64::XZR, arm64::CTX_REG, offsetof(ThreadContext, has_reservation));
 }
 
 //=============================================================================

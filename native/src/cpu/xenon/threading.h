@@ -397,6 +397,10 @@ private:
     void execute_thread(u32 hw_thread_id);
     void hw_thread_main(u32 hw_thread_id);
     
+    // Internal unlocked helpers (caller must hold ready_queues_mutex_)
+    GuestThread* dequeue_thread_unlocked(u32 affinity_mask);
+    bool has_ready_threads_unlocked(u32 affinity_mask) const;
+    
     int priority_to_queue_index(ThreadPriority priority) const;
     
     // Synchronization helpers

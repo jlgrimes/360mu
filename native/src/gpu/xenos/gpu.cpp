@@ -17,6 +17,7 @@
 #include "gpu/vulkan/vulkan_backend.h"
 #include "memory/memory.h"
 #include <cstring>
+#include <cstdio>
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -59,11 +60,11 @@ Status Gpu::initialize(Memory* memory, const GpuConfig& config) {
     // Create command processor
     command_processor_ = std::make_unique<CommandProcessor>();
     
-    // Initialize ring buffer
-    ring_buffer_base_ = 0;
-    ring_buffer_size_ = 0;
-    read_ptr_ = 0;
-    write_ptr_ = 0;
+    // Initialize ring buffer (atomics already initialized to 0 in header)
+    ring_buffer_base_.store(0, std::memory_order_relaxed);
+    ring_buffer_size_.store(0, std::memory_order_relaxed);
+    read_ptr_.store(0, std::memory_order_relaxed);
+    write_ptr_.store(0, std::memory_order_relaxed);
     
     LOGI("GPU initialized (waiting for surface)");
     return Status::Ok;
@@ -91,9 +92,9 @@ void Gpu::reset() {
     // Reset registers
     registers_.fill(0);
     
-    // Reset ring buffer state
-    read_ptr_ = 0;
-    write_ptr_ = 0;
+    // Reset ring buffer state (atomic)
+    read_ptr_.store(0, std::memory_order_relaxed);
+    write_ptr_.store(0, std::memory_order_relaxed);
     
     // Reset render state
     render_state_ = {};
@@ -164,16 +165,43 @@ void Gpu::resize(u32 width, u32 height) {
 }
 
 void Gpu::process_commands() {
+    // #region agent log
+    static int process_log_count = 0;
+    if (process_log_count++ < 10) {
+        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+        GuestAddr rb_base = ring_buffer_base_.load(std::memory_order_acquire);
+        u32 rb_size = ring_buffer_size_.load(std::memory_order_acquire);
+        if (f) { fprintf(f, "{\"hypothesisId\":\"A\",\"location\":\"gpu.cpp:process_commands\",\"message\":\"process_commands called\",\"data\":{\"ring_buffer_base\":%u,\"ring_buffer_size\":%u,\"has_cp\":%d,\"has_mem\":%d}}\n", rb_base, rb_size, command_processor_!=nullptr, memory_!=nullptr); fclose(f); }
+    }
+    // #endregion
+    
     if (!command_processor_ || !memory_) return;
     
+    // Load ring buffer state atomically (acquire to see CPU's writes)
+    GuestAddr rb_base = ring_buffer_base_.load(std::memory_order_acquire);
+    u32 rb_size = ring_buffer_size_.load(std::memory_order_acquire);
+    
     // Check if we have commands to process
-    if (ring_buffer_base_ == 0 || ring_buffer_size_ == 0) {
+    if (rb_base == 0 || rb_size == 0) {
         return;
     }
     
+    // Load pointers with acquire semantics to see CPU's command writes
+    u32 rp = read_ptr_.load(std::memory_order_acquire);
+    u32 wp = write_ptr_.load(std::memory_order_acquire);
+    
     // Let the command processor handle the ring buffer
-    bool frame_done = command_processor_->process(
-        ring_buffer_base_, ring_buffer_size_, read_ptr_, write_ptr_);
+    bool frame_done = command_processor_->process(rb_base, rb_size, rp, wp);
+    
+    // Store updated read pointer with release semantics
+    read_ptr_.store(rp, std::memory_order_release);
+    
+    // Signal GPU fence: we've processed up to the current CPU fence
+    // This tells waiting CPU threads that GPU has caught up
+    u64 current_cpu_fence = cpu_fence_.load(std::memory_order_acquire);
+    if (current_cpu_fence > gpu_fence_.load(std::memory_order_relaxed)) {
+        gpu_signal_fence(current_cpu_fence);
+    }
     
     if (frame_done) {
         frame_complete_ = true;
@@ -184,6 +212,13 @@ void Gpu::process_commands() {
 void Gpu::present() {
     static u64 present_count = 0;
     present_count++;
+    
+    // #region agent log
+    if (present_count <= 5) {
+        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+        if (f) { fprintf(f, "{\"hypothesisId\":\"B\",\"location\":\"gpu.cpp:present\",\"message\":\"present called\",\"data\":{\"frame\":%llu,\"in_frame\":%d,\"vulkan_valid\":%d}}\n", present_count, in_frame_, vulkan_!=nullptr); fclose(f); }
+    }
+    // #endregion
     
     // Log every 60 frames (roughly every second at 60fps)
     if (present_count % 60 == 1) {
@@ -238,22 +273,35 @@ void Gpu::write_register(u32 offset, u32 value) {
         // Handle special registers
         switch (offset) {
             case xenos_reg::CP_RB_BASE:
-                ring_buffer_base_ = value;
+                // Use release to ensure command buffer writes are visible before base is set
+                ring_buffer_base_.store(value, std::memory_order_release);
                 LOGI("Ring buffer base set: 0x%08X", value);
+                // #region agent log
+                { FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a"); if (f) { fprintf(f, "{\"hypothesisId\":\"C\",\"location\":\"gpu.cpp:write_register\",\"message\":\"ring buffer base set\",\"data\":{\"base\":\"0x%08X\"}}\n", value); fclose(f); } }
+                // #endregion
                 break;
                 
             case xenos_reg::CP_RB_CNTL:
-                // Ring buffer size is encoded in bits
-                ring_buffer_size_ = 1 << ((value & 0x3F) + 1);
-                LOGD("Ring buffer size: %u bytes", ring_buffer_size_);
+                {
+                    // Ring buffer size is encoded in bits
+                    u32 rb_size = 1 << ((value & 0x3F) + 1);
+                    ring_buffer_size_.store(rb_size, std::memory_order_release);
+                    LOGD("Ring buffer size: %u bytes", rb_size);
+                    // #region agent log
+                    { FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a"); if (f) { fprintf(f, "{\"hypothesisId\":\"C\",\"location\":\"gpu.cpp:write_register\",\"message\":\"ring buffer size set\",\"data\":{\"size\":%u}}\n", rb_size); fclose(f); } }
+                    // #endregion
+                }
                 break;
                 
             case xenos_reg::CP_RB_RPTR:
-                read_ptr_ = value;
+                read_ptr_.store(value, std::memory_order_release);
                 break;
                 
             case xenos_reg::CP_RB_WPTR:
-                write_ptr_ = value;
+                // CRITICAL: Use release ordering so GPU sees all command buffer writes
+                // that the CPU made before updating the write pointer
+                write_ptr_.store(value, std::memory_order_release);
+                LOGD("Ring buffer write pointer updated: %u", value);
                 break;
         }
     }
@@ -285,14 +333,22 @@ void Gpu::execute_type0(u32 packet) {
     u32 base_reg = packet & 0xFFFF;
     u32 count = ((packet >> 16) & 0x3FFF) + 1;
     
+    // Load ring buffer state atomically
+    GuestAddr rb_base = ring_buffer_base_.load(std::memory_order_acquire);
+    u32 rb_size = ring_buffer_size_.load(std::memory_order_acquire);
+    u32 rp = read_ptr_.load(std::memory_order_acquire);
+    
     // Read data words following the header
     for (u32 i = 0; i < count; i++) {
-        read_ptr_ = (read_ptr_ + 1) % (ring_buffer_size_ / 4);
-        GuestAddr data_addr = ring_buffer_base_ + (read_ptr_ * 4);
+        rp = (rp + 1) % (rb_size / 4);
+        GuestAddr data_addr = rb_base + (rp * 4);
         u32 data = memory_->read_u32(data_addr);
         
         write_register(base_reg + i, data);
     }
+    
+    // Store updated read pointer
+    read_ptr_.store(rp, std::memory_order_release);
 }
 
 void Gpu::execute_type3(u32 packet) {
@@ -302,13 +358,21 @@ void Gpu::execute_type3(u32 packet) {
     u32 opcode = packet & 0xFF;
     u32 count = ((packet >> 16) & 0x3FFF);
     
+    // Load ring buffer state atomically
+    GuestAddr rb_base = ring_buffer_base_.load(std::memory_order_acquire);
+    u32 rb_size = ring_buffer_size_.load(std::memory_order_acquire);
+    u32 rp = read_ptr_.load(std::memory_order_acquire);
+    
     // Read data words
     std::vector<u32> data(count);
     for (u32 i = 0; i < count; i++) {
-        read_ptr_ = (read_ptr_ + 1) % (ring_buffer_size_ / 4);
-        GuestAddr data_addr = ring_buffer_base_ + (read_ptr_ * 4);
+        rp = (rp + 1) % (rb_size / 4);
+        GuestAddr data_addr = rb_base + (rp * 4);
         data[i] = memory_->read_u32(data_addr);
     }
+    
+    // Store updated read pointer
+    read_ptr_.store(rp, std::memory_order_release);
     
     // Dispatch based on opcode
     // These opcodes are from the PM4 spec
@@ -427,6 +491,72 @@ void Gpu::update_shaders() {
 
 void Gpu::update_textures() {
     // Texture state is handled by the texture cache when samplers are bound
+}
+
+//=============================================================================
+// CPU/GPU Fence Synchronization
+//=============================================================================
+
+void Gpu::cpu_signal_fence(u64 fence_value) {
+    // CPU has written commands up to this fence
+    u64 current = cpu_fence_.load(std::memory_order_relaxed);
+    while (fence_value > current) {
+        if (cpu_fence_.compare_exchange_weak(current, fence_value,
+                                              std::memory_order_release,
+                                              std::memory_order_relaxed)) {
+            break;
+        }
+    }
+    LOGD("CPU signaled fence: %llu", fence_value);
+}
+
+void Gpu::gpu_signal_fence(u64 fence_value) {
+    // GPU has processed commands up to this fence
+    u64 current = gpu_fence_.load(std::memory_order_relaxed);
+    while (fence_value > current) {
+        if (gpu_fence_.compare_exchange_weak(current, fence_value,
+                                              std::memory_order_release,
+                                              std::memory_order_relaxed)) {
+            break;
+        }
+    }
+    
+    // Notify any waiting threads
+    {
+        std::lock_guard<std::mutex> lock(fence_mutex_);
+        fence_cv_.notify_all();
+    }
+    
+    LOGD("GPU signaled fence: %llu", fence_value);
+}
+
+bool Gpu::wait_for_gpu_fence(u64 fence_value, u64 timeout_ns) {
+    // Fast path: already reached
+    if (gpu_fence_.load(std::memory_order_acquire) >= fence_value) {
+        return true;
+    }
+    
+    // Zero timeout: just check, don't wait
+    if (timeout_ns == 0) {
+        return false;
+    }
+    
+    // Wait with timeout
+    std::unique_lock<std::mutex> lock(fence_mutex_);
+    
+    if (timeout_ns == UINT64_MAX) {
+        // Infinite wait
+        fence_cv_.wait(lock, [this, fence_value]() {
+            return gpu_fence_.load(std::memory_order_acquire) >= fence_value;
+        });
+        return true;
+    } else {
+        // Timed wait
+        auto timeout = std::chrono::nanoseconds(timeout_ns);
+        return fence_cv_.wait_for(lock, timeout, [this, fence_value]() {
+            return gpu_fence_.load(std::memory_order_acquire) >= fence_value;
+        });
+    }
 }
 
 } // namespace x360mu

@@ -893,10 +893,30 @@ void Interpreter::exec_system(ThreadContext& ctx, const DecodedInst& d) {
             break;
             
         case DecodedInst::Type::SYNC:
+            // Full memory barrier - ensures all preceding memory operations complete
+            // before any subsequent memory operations
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            break;
+            
         case DecodedInst::Type::LWSYNC:
+            // Lightweight sync - load-store ordering (acquire-release semantics)
+            // Ensures loads before lwsync complete before stores after lwsync
+            std::atomic_thread_fence(std::memory_order_acq_rel);
+            break;
+            
         case DecodedInst::Type::EIEIO:
+            // Enforce In-Order Execution of I/O
+            // For non-cacheable memory (MMIO), ensures I/O operations are ordered
+            // Acts as a release barrier for stores
+            std::atomic_thread_fence(std::memory_order_release);
+            break;
+            
         case DecodedInst::Type::ISYNC:
-            // Memory barriers - no-op for single-threaded interpreter
+            // Instruction synchronize - context synchronizing instruction
+            // Ensures all previous instructions have completed (including branches)
+            // before instruction fetch resumes
+            // For JIT: would need to flush instruction cache
+            std::atomic_thread_fence(std::memory_order_seq_cst);
             break;
             
         case DecodedInst::Type::DCBF:

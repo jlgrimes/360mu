@@ -13,6 +13,9 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
 
 namespace x360mu {
 
@@ -355,6 +358,44 @@ public:
     };
     Stats get_stats() const { return stats_; }
     
+    // ----- CPU/GPU Synchronization -----
+    
+    /**
+     * Signal that CPU has written commands up to this fence value
+     * Call this after writing to the command buffer
+     */
+    void cpu_signal_fence(u64 fence_value);
+    
+    /**
+     * Get the current CPU fence value (what CPU has written up to)
+     */
+    u64 get_cpu_fence() const { return cpu_fence_.load(std::memory_order_acquire); }
+    
+    /**
+     * Get the current GPU fence value (what GPU has processed up to)
+     */
+    u64 get_gpu_fence() const { return gpu_fence_.load(std::memory_order_acquire); }
+    
+    /**
+     * Wait for GPU to reach a specific fence value
+     * @param fence_value The fence value to wait for
+     * @param timeout_ns Timeout in nanoseconds (0 = don't wait, UINT64_MAX = infinite)
+     * @return true if fence was reached, false if timed out
+     */
+    bool wait_for_gpu_fence(u64 fence_value, u64 timeout_ns = UINT64_MAX);
+    
+    /**
+     * Check if GPU has reached a fence value (non-blocking)
+     */
+    bool gpu_fence_reached(u64 fence_value) const {
+        return gpu_fence_.load(std::memory_order_acquire) >= fence_value;
+    }
+    
+    /**
+     * Allocate a new fence value for CPU to use
+     */
+    u64 allocate_fence() { return next_fence_.fetch_add(1, std::memory_order_relaxed); }
+    
 private:
     Memory* memory_ = nullptr;
     GpuConfig config_;
@@ -362,11 +403,11 @@ private:
     // GPU registers (subset)
     std::array<u32, 0x10000> registers_;
     
-    // Ring buffer state
-    GuestAddr ring_buffer_base_;
-    u32 ring_buffer_size_;
-    u32 read_ptr_;
-    u32 write_ptr_;
+    // Ring buffer state (atomic for thread-safe CPU/GPU access)
+    std::atomic<GuestAddr> ring_buffer_base_{0};
+    std::atomic<u32> ring_buffer_size_{0};
+    std::atomic<u32> read_ptr_{0};
+    std::atomic<u32> write_ptr_{0};
     
     // Current render state
     RenderState render_state_;
@@ -383,6 +424,16 @@ private:
     
     // Statistics
     Stats stats_{};
+    
+    // CPU/GPU fence synchronization
+    std::atomic<u64> cpu_fence_{0};       // What CPU has written
+    std::atomic<u64> gpu_fence_{0};       // What GPU has processed
+    std::atomic<u64> next_fence_{1};      // Next fence value to allocate
+    std::mutex fence_mutex_;              // For condition variable
+    std::condition_variable fence_cv_;    // For waiting on GPU
+    
+    // Internal: GPU signals completion
+    void gpu_signal_fence(u64 fence_value);
     
     // Command processing
     void execute_packet(u32 packet);

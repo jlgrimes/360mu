@@ -9,6 +9,7 @@
 #include "x360mu/types.h"
 #include <memory>
 #include <vector>
+#include <array>
 #include <unordered_map>
 #include <functional>
 #include <mutex>
@@ -167,22 +168,38 @@ public:
      */
     void untrack_writes(GuestAddr base);
     
-    // ----- Atomic/reservation support -----
+    // ----- Atomic/reservation support (per-thread) -----
     
     /**
-     * Set reservation for lwarx/ldarx
+     * Set reservation for lwarx/ldarx for a specific thread
+     * @param thread_id The hardware thread (0-5)
+     * @param addr Guest address being reserved
+     * @param size Size of reservation (4 or 8 bytes)
      */
-    void set_reservation(GuestAddr addr, u32 size);
+    void set_reservation(u32 thread_id, GuestAddr addr, u32 size);
     
     /**
-     * Check reservation for stwcx./stdcx.
+     * Check reservation for stwcx./stdcx. for a specific thread
+     * @param thread_id The hardware thread (0-5)
+     * @param addr Guest address to check
+     * @param size Size to check (4 or 8 bytes)
+     * @return true if reservation is still valid
      */
-    bool check_reservation(GuestAddr addr, u32 size) const;
+    bool check_reservation(u32 thread_id, GuestAddr addr, u32 size) const;
     
     /**
-     * Clear reservation
+     * Clear reservation for a specific thread
+     * @param thread_id The hardware thread (0-5)
      */
-    void clear_reservation();
+    void clear_reservation(u32 thread_id);
+    
+    /**
+     * Invalidate all reservations that overlap with an address range
+     * Called on every write to memory
+     * @param addr Start address of write
+     * @param size Size of write
+     */
+    void invalidate_reservations(GuestAddr addr, u64 size);
     
     // ----- Time base -----
     
@@ -246,10 +263,16 @@ private:
     // Thread safety
     mutable std::mutex mutex_;
     
-    // Reservation for atomic ops
-    GuestAddr reservation_addr_ = 0;
-    u32 reservation_size_ = 0;
-    bool has_reservation_ = false;
+    // Per-thread reservation state for atomic ops (lwarx/stwcx)
+    // Xbox 360 has 6 hardware threads, each maintains its own reservation
+    static constexpr u32 MAX_THREADS = 6;
+    struct ThreadReservation {
+        GuestAddr addr = 0;
+        u32 size = 0;
+        bool valid = false;
+    };
+    std::array<ThreadReservation, MAX_THREADS> reservations_;
+    mutable std::mutex reservation_mutex_;  // Separate lock for reservation access
     
     // Time base counter
     std::atomic<u64> time_base_{0};

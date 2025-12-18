@@ -116,10 +116,13 @@ void XThread::allocate_stack() {
     
     // Allocate stack in physical memory (first 512MB)
     // Use addresses starting at 16MB mark to avoid kernel structures
-    static GuestAddr next_stack = 0x01000000;  // 16MB
-    stack_base_ = next_stack;
+    // Thread-safe: use atomic to prevent race conditions when multiple threads create stacks
+    static std::atomic<GuestAddr> next_stack{0x01000000};  // 16MB
+    
+    // Atomically allocate stack space (stack + guard page)
+    u32 alloc_size = stack_size_ + memory::MEM_PAGE_SIZE;
+    stack_base_ = next_stack.fetch_add(alloc_size, std::memory_order_relaxed);
     stack_limit_ = stack_base_ + stack_size_;
-    next_stack += stack_size_ + memory::MEM_PAGE_SIZE;  // Guard page
     
     // Memory should already be mapped, just zero it
     for (u32 i = 0; i < stack_size_; i += 4) {
@@ -129,9 +132,11 @@ void XThread::allocate_stack() {
 
 void XThread::allocate_tls() {
     // Allocate TLS slots in guest memory (within first 512MB)
-    static GuestAddr next_tls = 0x00800000;  // 8MB mark
-    tls_address_ = next_tls;
-    next_tls += sizeof(XTls);
+    // Thread-safe: use atomic to prevent race conditions
+    static std::atomic<GuestAddr> next_tls{0x00800000};  // 8MB mark
+    
+    // Atomically allocate TLS space
+    tls_address_ = next_tls.fetch_add(sizeof(XTls), std::memory_order_relaxed);
     
     // Zero the TLS area
     for (u32 i = 0; i < sizeof(XTls); i += 4) {
@@ -145,9 +150,11 @@ void XThread::create_guest_thread_struct() {
     constexpr u32 KTHREAD_SIZE = 0x200;  // Size of KTHREAD structure
     
     // Use addresses in low memory (within first 512MB)
-    static GuestAddr next_kthread = 0x00400000;  // 4MB mark
-    guest_thread_ = next_kthread;
-    next_kthread += KTHREAD_SIZE;
+    // Thread-safe: use atomic to prevent race conditions
+    static std::atomic<GuestAddr> next_kthread{0x00400000};  // 4MB mark
+    
+    // Atomically allocate KTHREAD space
+    guest_thread_ = next_kthread.fetch_add(KTHREAD_SIZE, std::memory_order_relaxed);
     
     // Zero the KTHREAD structure
     for (u32 i = 0; i < KTHREAD_SIZE; i += 4) {

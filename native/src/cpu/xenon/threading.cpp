@@ -123,12 +123,12 @@ GuestThread* ThreadScheduler::create_thread(GuestAddr entry_point, GuestAddr par
     stack_size = std::max(stack_size, 64u * 1024u);  // Minimum 64KB
     stack_size = align_up(stack_size, static_cast<u32>(memory::MEM_PAGE_SIZE));
     
-    // Find free stack space
-    static GuestAddr next_stack = 0x70000000;
-    thread->stack_base = next_stack;
+    // Find free stack space (thread-safe atomic allocation)
+    static std::atomic<GuestAddr> next_stack{0x70000000};
+    u32 alloc_size = stack_size + memory::MEM_PAGE_SIZE;  // Include guard page
+    thread->stack_base = next_stack.fetch_add(alloc_size, std::memory_order_relaxed);
     thread->stack_size = stack_size;
     thread->stack_limit = thread->stack_base + stack_size;
-    next_stack += stack_size + memory::MEM_PAGE_SIZE;  // Guard page
     
     // Allocate stack memory
     memory_->allocate(thread->stack_base, stack_size,
@@ -278,9 +278,8 @@ void ThreadScheduler::enqueue_thread(GuestThread* thread) {
     stats_.ready_thread_count++;
 }
 
-GuestThread* ThreadScheduler::dequeue_thread(u32 affinity_mask) {
-    std::lock_guard<std::mutex> lock(ready_queues_mutex_);
-    
+// Internal helper: dequeue without locking (caller must hold ready_queues_mutex_)
+GuestThread* ThreadScheduler::dequeue_thread_unlocked(u32 affinity_mask) {
     // Find highest priority thread that matches affinity
     for (int i = NUM_PRIORITIES - 1; i >= 0; i--) {
         GuestThread* thread = ready_queues_[i];
@@ -309,9 +308,13 @@ GuestThread* ThreadScheduler::dequeue_thread(u32 affinity_mask) {
     return nullptr;
 }
 
-bool ThreadScheduler::has_ready_threads(u32 affinity_mask) {
+GuestThread* ThreadScheduler::dequeue_thread(u32 affinity_mask) {
     std::lock_guard<std::mutex> lock(ready_queues_mutex_);
-    
+    return dequeue_thread_unlocked(affinity_mask);
+}
+
+// Internal helper: check without locking (caller must hold ready_queues_mutex_)
+bool ThreadScheduler::has_ready_threads_unlocked(u32 affinity_mask) const {
     // Check if there are any ready threads matching the affinity
     for (int i = NUM_PRIORITIES - 1; i >= 0; i--) {
         GuestThread* thread = ready_queues_[i];
@@ -323,6 +326,11 @@ bool ThreadScheduler::has_ready_threads(u32 affinity_mask) {
         }
     }
     return false;
+}
+
+bool ThreadScheduler::has_ready_threads(u32 affinity_mask) {
+    std::lock_guard<std::mutex> lock(ready_queues_mutex_);
+    return has_ready_threads_unlocked(affinity_mask);
 }
 
 int ThreadScheduler::priority_to_queue_index(ThreadPriority priority) const {
@@ -523,18 +531,23 @@ void ThreadScheduler::hw_thread_main(u32 hw_thread_id) {
             std::unique_lock<std::mutex> lock(hwt.mutex);
             
             // Wait for work or stop signal
-            // Note: Don't dequeue in predicate - just check if there's work available
+            // Atomic check: acquire queue lock inside predicate to avoid TOCTOU race
             hwt.wake_cv.wait_for(lock, std::chrono::milliseconds(1), [&]() {
-                return hwt.stop_flag || hwt.current_thread != nullptr || 
-                       has_ready_threads(affinity_bit);
+                if (hwt.stop_flag || hwt.current_thread != nullptr) {
+                    return true;
+                }
+                // Atomically check AND dequeue to prevent TOCTOU race
+                std::lock_guard<std::mutex> queue_lock(ready_queues_mutex_);
+                if (has_ready_threads_unlocked(affinity_bit)) {
+                    // Immediately dequeue while holding the lock
+                    hwt.current_thread = dequeue_thread_unlocked(affinity_bit);
+                    return hwt.current_thread != nullptr;
+                }
+                return false;
             });
             
             if (hwt.stop_flag) break;
             
-            // Check if we have a current thread or can get one
-            if (hwt.current_thread == nullptr) {
-                hwt.current_thread = dequeue_thread(affinity_bit);
-            }
             thread = hwt.current_thread;
         }
         
@@ -542,19 +555,17 @@ void ThreadScheduler::hw_thread_main(u32 hw_thread_id) {
         
         // Execute guest thread on the actual CPU
         thread->state = ThreadState::Running;
-        thread->context.running = true;
         
         // Map guest thread to CPU hardware thread context
         // Use the thread's context.thread_id for CPU execution
         u32 cpu_thread_id = thread->context.thread_id % 6;
         
         // Execute for a time slice using the real CPU
+        // Use execute_with_context for proper context synchronization and thread safety
         if (cpu_) {
-            cpu_->execute_thread(cpu_thread_id, TIME_SLICE);
+            cpu_->execute_with_context(cpu_thread_id, thread->context, TIME_SLICE);
             thread->execution_time += TIME_SLICE;
         }
-        
-        thread->context.running = false;
         
         // Put thread back in ready queue if it's still runnable
         {

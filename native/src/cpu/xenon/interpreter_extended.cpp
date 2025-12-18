@@ -724,13 +724,13 @@ void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
             }
             break;
             
-        // --- Atomic operations ---
+        // --- Atomic operations (per-thread reservation) ---
         case 20: // lwarx (load word and reserve)
             {
                 GuestAddr addr = (d.ra ? ctx.gpr[d.ra] : 0) + ctx.gpr[d.rb];
                 ctx.gpr[d.rd] = read_u32(ctx, addr);
-                // Set reservation (simplified - would need global tracking)
-                memory_->set_reservation(addr, 4);
+                // Set per-thread reservation
+                memory_->set_reservation(ctx.thread_id, addr, 4);
             }
             break;
             
@@ -738,28 +738,32 @@ void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
             {
                 GuestAddr addr = (d.ra ? ctx.gpr[d.ra] : 0) + ctx.gpr[d.rb];
                 ctx.gpr[d.rd] = read_u64(ctx, addr);
-                memory_->set_reservation(addr, 8);
+                // Set per-thread reservation
+                memory_->set_reservation(ctx.thread_id, addr, 8);
             }
             break;
             
         case 150: // stwcx. (store word conditional)
             {
                 GuestAddr addr = (d.ra ? ctx.gpr[d.ra] : 0) + ctx.gpr[d.rb];
-                bool success = memory_->check_reservation(addr, 4);
+                // Check per-thread reservation
+                bool success = memory_->check_reservation(ctx.thread_id, addr, 4);
                 if (success) {
                     write_u32(ctx, addr, static_cast<u32>(ctx.gpr[d.rs]));
                 }
                 // Set CR0: [lt, gt, eq, so] = [0, 0, success, xer.so]
                 u8 cr0_byte = (success ? 0x2 : 0) | (ctx.xer.so ? 0x1 : 0);
                 ctx.cr[0].from_byte(cr0_byte);
-                memory_->clear_reservation();
+                // Clear this thread's reservation (success or failure)
+                memory_->clear_reservation(ctx.thread_id);
             }
             break;
             
         case 214: // stdcx. (store doubleword conditional)
             {
                 GuestAddr addr = (d.ra ? ctx.gpr[d.ra] : 0) + ctx.gpr[d.rb];
-                if (memory_->check_reservation(addr, 8)) {
+                // Check per-thread reservation
+                if (memory_->check_reservation(ctx.thread_id, addr, 8)) {
                     write_u64(ctx, addr, ctx.gpr[d.rs]);
                     ctx.cr[0].eq = true;
                 } else {
@@ -768,7 +772,8 @@ void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
                 ctx.cr[0].lt = false;
                 ctx.cr[0].gt = false;
                 ctx.cr[0].so = ctx.xer.so;
-                memory_->clear_reservation();
+                // Clear this thread's reservation (success or failure)
+                memory_->clear_reservation(ctx.thread_id);
             }
             break;
             
@@ -932,11 +937,29 @@ void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
             }
             break;
             
-        // --- Cache/sync operations ---
-        case 598: // sync
-        case 854: // eieio
-            // Memory barriers - no-op in single-threaded
-            std::atomic_thread_fence(std::memory_order_seq_cst);
+        // --- Memory Barrier Operations ---
+        case 598: // sync (full barrier) or lwsync (if L=1)
+            {
+                // Check L bit (bit 9 of instruction) to distinguish sync from lwsync
+                // sync L=0: full barrier, sync L=1: lightweight sync (lwsync)
+                u32 L = (d.raw >> 21) & 0x1;
+                if (L == 0) {
+                    // Full sync - all memory operations before sync complete before
+                    // any memory operations after sync
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                } else {
+                    // lwsync - provides acquire-release semantics
+                    // Loads before lwsync complete before loads/stores after
+                    // Stores before lwsync complete before stores after
+                    std::atomic_thread_fence(std::memory_order_acq_rel);
+                }
+            }
+            break;
+            
+        case 854: // eieio (Enforce In-Order Execution of I/O)
+            // For memory-mapped I/O, ensures all prior stores to MMIO complete
+            // before subsequent MMIO accesses
+            std::atomic_thread_fence(std::memory_order_release);
             break;
             
         case 86: // dcbf
