@@ -48,8 +48,11 @@ Status Cpu::initialize(Memory* memory, const CpuConfig& config) {
 #ifdef X360MU_JIT_ENABLED
     if (config_.enable_jit) {
         LOGI("Initializing JIT compiler (cache: %llu MB)", config_.jit_cache_size / MB);
-        // JIT initialization would go here
-        // jit_ = std::make_unique<JitCompiler>(memory_, config_.jit_cache_size);
+        jit_ = std::make_unique<JitCompiler>();
+        if (jit_->initialize(memory_, config_.jit_cache_size) != Status::Ok) {
+            LOGE("Failed to initialize JIT compiler, falling back to interpreter");
+            jit_.reset();
+        }
     }
 #endif
     
@@ -81,7 +84,7 @@ void Cpu::reset() {
     
 #ifdef X360MU_JIT_ENABLED
     if (jit_) {
-        // jit_->flush_cache();
+        jit_->flush_cache();
     }
 #endif
 }
@@ -115,7 +118,13 @@ void Cpu::execute_thread(u32 thread_id, u64 cycles) {
 #ifdef X360MU_JIT_ENABLED
     if (jit_ && config_.enable_jit) {
         // JIT execution path
-        // jit_->execute(ctx, cycles);
+        jit_->execute(ctx, cycles);
+        
+        // Check for syscall after JIT execution too
+        if (ctx.interrupted) {
+            ctx.interrupted = false;
+            dispatch_syscall(ctx);
+        }
         return;
     }
 #endif
