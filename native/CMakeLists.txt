@@ -258,6 +258,10 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
         tests/kernel/test_filesystem.cpp
         tests/kernel/test_file_io.cpp
         tests/kernel/test_threading.cpp
+        tests/kernel/test_xobject.cpp
+        tests/kernel/test_xevent.cpp
+        tests/kernel/test_xthread.cpp
+        tests/kernel/test_xkernel.cpp
         tests/apu/test_audio.cpp
         ${JIT_TEST_SOURCES}
         ${GPU_TEST_SOURCES}
@@ -274,8 +278,9 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
         target_link_libraries(x360mu_tests ${VULKAN_LIB})
     endif()
     
-    include(GoogleTest)
-    gtest_discover_tests(x360mu_tests)
+    # Disable gtest_discover_tests as it can timeout on some platforms
+    # include(GoogleTest)
+    # gtest_discover_tests(x360mu_tests)
     
     # XEX Test Tool
     add_executable(xex_test

@@ -72,8 +72,19 @@ public:
         
         // Configure for XMA
         codec_ctx_->sample_rate = sample_rate;
+#if LIBAVUTIL_VERSION_MAJOR >= 58
+        // FFmpeg 6.0+ uses ch_layout instead of channels/channel_layout
+        AVChannelLayout ch_layout;
+        if (num_channels == 2) {
+            ch_layout = AV_CHANNEL_LAYOUT_STEREO;
+        } else {
+            ch_layout = AV_CHANNEL_LAYOUT_MONO;
+        }
+        av_channel_layout_copy(&codec_ctx_->ch_layout, &ch_layout);
+#else
         codec_ctx_->channels = num_channels;
         codec_ctx_->channel_layout = (num_channels == 2) ? AV_CH_LAYOUT_STEREO : AV_CH_LAYOUT_MONO;
+#endif
         codec_ctx_->sample_fmt = AV_SAMPLE_FMT_FLTP;
         codec_ctx_->bits_per_coded_sample = 16;
         codec_ctx_->block_align = 2048;  // XMA packet size
@@ -117,6 +128,17 @@ public:
         }
         
         // Initialize resampler (FLTP to S16)
+#if LIBAVUTIL_VERSION_MAJOR >= 58
+        swr_alloc_set_opts2(&swr_ctx_,
+            &codec_ctx_->ch_layout,
+            AV_SAMPLE_FMT_S16,
+            sample_rate,
+            &codec_ctx_->ch_layout,
+            AV_SAMPLE_FMT_FLTP,
+            sample_rate,
+            0, nullptr
+        );
+#else
         swr_ctx_ = swr_alloc_set_opts(
             nullptr,
             codec_ctx_->channel_layout,
@@ -127,6 +149,7 @@ public:
             sample_rate,
             0, nullptr
         );
+#endif
         
         if (!swr_ctx_ || swr_init(swr_ctx_) < 0) {
             LOGW("Resampler init failed, will do manual conversion");

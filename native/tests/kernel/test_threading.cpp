@@ -25,7 +25,7 @@ protected:
         ASSERT_EQ(cpu_->initialize(memory_.get(), cpu_config), Status::Ok);
         
         scheduler_ = std::make_unique<ThreadScheduler>();
-        ASSERT_EQ(scheduler_->initialize(memory_.get(), nullptr, 1), Status::Ok);
+        ASSERT_EQ(scheduler_->initialize(memory_.get(), nullptr, cpu_.get(), 1), Status::Ok);
         
         thread_mgr_ = std::make_unique<KernelThreadManager>();
         ASSERT_EQ(thread_mgr_->initialize(memory_.get(), cpu_.get(), scheduler_.get()), Status::Ok);

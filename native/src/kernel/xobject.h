@@ -152,6 +152,9 @@ public:
     // Statistics
     size_t object_count() const;
     
+    // Clear all objects (for shutdown)
+    void clear();
+    
 private:
     std::mutex mutex_;
     std::unordered_map<u32, std::shared_ptr<XObject>> objects_;

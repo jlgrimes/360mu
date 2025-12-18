@@ -114,29 +114,29 @@ void XThread::allocate_stack() {
     // Align stack size to page boundary
     stack_size_ = (stack_size_ + memory::MEM_PAGE_SIZE - 1) & ~(memory::MEM_PAGE_SIZE - 1);
     
-    // Allocate stack in virtual memory
-    // Stack grows downward, so we allocate and set limit at top
-    static GuestAddr next_stack = 0x70000000;
+    // Allocate stack in physical memory (first 512MB)
+    // Use addresses starting at 16MB mark to avoid kernel structures
+    static GuestAddr next_stack = 0x01000000;  // 16MB
     stack_base_ = next_stack;
     stack_limit_ = stack_base_ + stack_size_;
     next_stack += stack_size_ + memory::MEM_PAGE_SIZE;  // Guard page
     
-    memory_->allocate(stack_base_, stack_size_, 
-                      MemoryRegion::Read | MemoryRegion::Write);
-    
-    // Zero the stack
-    memory_->zero_bytes(stack_base_, stack_size_);
+    // Memory should already be mapped, just zero it
+    for (u32 i = 0; i < stack_size_; i += 4) {
+        memory_->write_u32(stack_base_ + i, 0);
+    }
 }
 
 void XThread::allocate_tls() {
-    // Allocate TLS slots in guest memory
-    static GuestAddr next_tls = 0x6F000000;
+    // Allocate TLS slots in guest memory (within first 512MB)
+    static GuestAddr next_tls = 0x00800000;  // 8MB mark
     tls_address_ = next_tls;
     next_tls += sizeof(XTls);
     
-    memory_->allocate(tls_address_, sizeof(XTls),
-                      MemoryRegion::Read | MemoryRegion::Write);
-    memory_->zero_bytes(tls_address_, sizeof(XTls));
+    // Zero the TLS area
+    for (u32 i = 0; i < sizeof(XTls); i += 4) {
+        memory_->write_u32(tls_address_ + i, 0);
+    }
 }
 
 void XThread::create_guest_thread_struct() {
@@ -144,13 +144,15 @@ void XThread::create_guest_thread_struct() {
     // This is what the game sees when it calls KeGetCurrentThread()
     constexpr u32 KTHREAD_SIZE = 0x200;  // Size of KTHREAD structure
     
-    static GuestAddr next_kthread = 0x6E000000;
+    // Use addresses in low memory (within first 512MB)
+    static GuestAddr next_kthread = 0x00400000;  // 4MB mark
     guest_thread_ = next_kthread;
     next_kthread += KTHREAD_SIZE;
     
-    memory_->allocate(guest_thread_, KTHREAD_SIZE,
-                      MemoryRegion::Read | MemoryRegion::Write);
-    memory_->zero_bytes(guest_thread_, KTHREAD_SIZE);
+    // Zero the KTHREAD structure
+    for (u32 i = 0; i < KTHREAD_SIZE; i += 4) {
+        memory_->write_u32(guest_thread_ + i, 0);
+    }
     
     // Initialize key KTHREAD fields
     // Offset 0x00: DISPATCHER_HEADER

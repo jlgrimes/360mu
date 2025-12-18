@@ -4,6 +4,10 @@
  * Stub GPU implementation when Vulkan is not available
  */
 
+// Include full headers for complete type definitions
+#include "gpu/xenos/shader_translator.h"
+#include "gpu/xenos/texture.h"
+
 // Define empty types for forward declared classes to avoid unique_ptr issues
 namespace x360mu {
     class VulkanBackend {};
@@ -80,6 +84,12 @@ void Gpu::update_textures() {}
 ShaderTranslator::ShaderTranslator() = default;
 ShaderTranslator::~ShaderTranslator() = default;
 
+Status ShaderTranslator::initialize(const std::string& /*cache_path*/) {
+    return Status::Ok;
+}
+
+void ShaderTranslator::shutdown() {}
+
 std::vector<u32> ShaderTranslator::translate(const void* /*microcode*/, u32 /*size*/, ShaderType /*type*/) {
     return {};
 }
@@ -96,25 +106,36 @@ void ShaderTranslator::cache(u64 hash, std::vector<u32> spirv) {
     cache_[hash] = std::move(spirv);
 }
 
-void ShaderTranslator::decode_alu_instruction(u32 /*instr*/) {}
-void ShaderTranslator::decode_fetch_instruction(u32 /*instr*/) {}
-void ShaderTranslator::emit_spirv_header(std::vector<u32>& /*out*/) {}
-void ShaderTranslator::emit_spirv_body(std::vector<u32>& /*out*/) {}
+void ShaderTranslator::save_cache() {}
+void ShaderTranslator::load_cache() {}
+
+ShaderInfo ShaderTranslator::analyze(const void* /*microcode*/, u32 /*size*/, ShaderType /*type*/) {
+    return ShaderInfo{};
+}
+
+u64 ShaderTranslator::compute_hash(const void* /*data*/, u32 /*size*/) {
+    return 0;
+}
 
 // TextureCache stub
 TextureCache::TextureCache() = default;
 TextureCache::~TextureCache() = default;
 
-void* TextureCache::get_texture(const FetchConstant& /*fetch*/, Memory* /*memory*/) {
+Status TextureCache::initialize(u32 /*max_size_mb*/) {
+    return Status::Ok;
+}
+
+void TextureCache::shutdown() {}
+
+const u8* TextureCache::get_texture(const TextureInfo& /*info*/, class Memory* /*memory*/) {
     return nullptr;
 }
 
-void TextureCache::invalidate(GuestAddr /*base*/, u64 /*size*/) {}
-void TextureCache::clear() {
-    textures_.clear();
-}
+void TextureCache::invalidate_range(GuestAddr /*address*/, u32 /*size*/) {}
+void TextureCache::invalidate_all() {}
 
-void TextureCache::detile_texture(const void* /*src*/, void* /*dst*/, u32 /*width*/, u32 /*height*/, TextureFormat /*format*/) {}
-void TextureCache::convert_format(const void* /*src*/, void* /*dst*/, u32 /*width*/, u32 /*height*/, TextureFormat /*src_format*/) {}
+TextureCache::Stats TextureCache::get_stats() const {
+    return Stats{};
+}
 
 } // namespace x360mu

@@ -117,11 +117,10 @@ void XKernel::perform_system_init() {
 }
 
 void XKernel::init_system_structures() {
-    // Use addresses in physical memory range that's already mapped
-    // The 0x80000000+ range is virtual and maps to physical 0x00000000+
-    // Use a safe range in physical memory that won't conflict with game code
+    // Use addresses in the first 512MB of physical memory which is always available
+    // These structures should be at low addresses that are definitely accessible
     
-    constexpr GuestAddr SYSTEM_BASE = 0x00100000;  // 1MB mark, safe area
+    constexpr GuestAddr SYSTEM_BASE = 0x00001000;  // 4KB mark, after null page
     
     // Allocate system process (EPROCESS)
     constexpr u32 EPROCESS_SIZE = 0x300;
@@ -154,16 +153,16 @@ void XKernel::init_system_structures() {
 
 void XKernel::init_processors() {
     // Use addresses in physical memory that are safe
+    // These addresses must be in the main memory region (first 512MB)
     constexpr u32 KPCR_SIZE = 0x1000;  // Smaller KPCR for safety
-    kpcr_base_ = 0x00110000;  // Right after system structures
+    kpcr_base_ = 0x00010000;  // Use low address that's definitely in main memory
     
     for (u32 i = 0; i < 6; i++) {
         GuestAddr kpcr = kpcr_base_ + (i * KPCR_SIZE);
         
-        // Zero manually
-        for (u32 j = 0; j < KPCR_SIZE; j += 4) {
-            memory_->write_u32(kpcr + j, 0);
-        }
+        // First ensure memory is accessible (touch it)
+        // The memory system should handle this through fastmem
+        memory_->write_u32(kpcr, 0);  // Touch to ensure page is mapped
         
         // KPCR structure offsets (approximate, based on Xbox 360)
         // 0x00: Self pointer
@@ -454,7 +453,7 @@ void XKernel::process_apcs() {
 
 GuestAddr XKernel::get_kpcr_address(u32 processor) const {
     if (processor >= 6) return 0;
-    return kpcr_base_ + (processor * 0x3000);
+    return kpcr_base_ + (processor * 0x1000);  // KPCR_SIZE = 0x1000
 }
 
 GuestAddr XKernel::get_system_process() const {

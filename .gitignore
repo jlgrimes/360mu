@@ -22,7 +22,9 @@ android/captures/
 
 # Native build
 native/build/
+native/build_tests/
 native/cmake-build-*/
+*.o.d
 
 # IDE
 .idea/

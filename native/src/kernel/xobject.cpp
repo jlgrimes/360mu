@@ -139,6 +139,12 @@ size_t ObjectTable::object_count() const {
     return objects_.size();
 }
 
+void ObjectTable::clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    objects_.clear();
+    next_handle_ = 0x10000;
+}
+
 //=============================================================================
 // KernelState
 //=============================================================================
@@ -158,15 +164,16 @@ void KernelState::initialize(Memory* memory) {
 }
 
 void KernelState::shutdown() {
-    // Clear all objects by clearing the internal map
-    // We can't assign a new ObjectTable due to the mutex
-    while (object_table_.object_count() > 0) {
-        // This is a workaround - in practice we'd need a clear() method
-        break;
+    // Clear all objects
+    object_table_.clear();
+    
+    // Clear DPC queue
+    {
+        std::lock_guard<std::mutex> lock(dpc_mutex_);
+        dpc_queue_.clear();
     }
     
-    std::lock_guard<std::mutex> lock(dpc_mutex_);
-    dpc_queue_.clear();
+    memory_ = nullptr;
     
     LOGI("KernelState shutdown complete");
 }
