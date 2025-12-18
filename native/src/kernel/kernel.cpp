@@ -214,7 +214,13 @@ void Kernel::handle_syscall(u32 ordinal, u32 module_ordinal) {
     
     auto it = hle_functions_.find(key);
     if (it == hle_functions_.end()) {
-        LOGE("Unimplemented syscall: module=%u, ordinal=%u", module_ordinal, ordinal);
+        static int syscall_spam_count = 0;
+        if (syscall_spam_count < 5) {
+            auto& ctx = cpu_->get_context(0);
+            LOGE("Unimplemented syscall: module=%u, ordinal=%u at PC=0x%08llX, r0=0x%llX, LR=0x%llX", 
+                 module_ordinal, ordinal, ctx.pc, ctx.gpr[0], ctx.lr);
+            syscall_spam_count++;
+        }
         return;
     }
     

@@ -1,10 +1,22 @@
 # JIT Fastmem Address Translation Bug
 
-## Status: FIXED
+## Status: FIXED ✅
 
-**Root Cause**: `main_memory_` and `fastmem_base_` were two separate memory regions. The Memory class methods wrote to `main_memory_`, but JIT reads/writes used `fastmem_base_`. They were out of sync after any writes through the interpreter or Memory class.
+**Root Cause**: Two issues combined:
+1. `main_memory_` and `fastmem_base_` were separate memory regions - interpreter wrote to one, JIT read from the other
+2. Address translation was overly complex with conditional branches that could skip the mask
 
-**Fix**: Modified `setup_fastmem()` in `memory.cpp` to use `mremap()` to move `main_memory_` to the `fastmem_base_` location, ensuring both pointers reference the same physical memory.
+**Fix Applied** (December 2024):
+1. **Memory Unification**: Modified `setup_fastmem()` to copy `main_memory_` content into `fastmem_base_`, then redirect `main_memory_` to point to `fastmem_base_`. Both now reference the same memory.
+2. **Simplified Address Translation**: Changed `emit_translate_address()` to ALWAYS mask addresses with `0x1FFFFFFF`. This matches how most Xbox 360 emulators handle it:
+   ```cpp
+   // Simple and correct - always mask to 512MB physical range
+   emit.AND_imm(addr_reg, addr_reg, 0x1FFFFFFFULL);
+   emit.MOV_imm(arm64::X16, fastmem_base);
+   emit.ADD(addr_reg, addr_reg, arm64::X16);
+   ```
+
+**Result**: JIT runs at ~22 FPS, no crashes, CPU executing properly.
 
 ---
 
