@@ -14,7 +14,30 @@
 
 ## ⚠️ Project Status
 
-**360μ is in early development.** It cannot run commercial games yet. This is a long-term research project aimed at bringing Xbox 360 emulation to Android devices.
+**360μ is in early development.** It cannot run commercial games yet. The emulator boots and begins executing game code, but games currently get stuck during initialization due to incomplete kernel/threading emulation.
+
+### Current State (December 2024)
+
+| Component        | Status     | Notes                                             |
+| ---------------- | ---------- | ------------------------------------------------- |
+| Memory System    | ✅ Working | 512MB main RAM, fastmem optimization              |
+| XEX Loader       | ✅ Working | Loads encrypted/compressed Xbox 360 executables   |
+| CPU Interpreter  | ✅ Working | Full PowerPC instruction set                      |
+| CPU JIT          | ✅ Working | PowerPC to ARM64 translation, ~80% coverage       |
+| VMX128 (SIMD)    | 🟡 Partial | Basic vector instructions                         |
+| Kernel HLE       | 🟡 Partial | ~50 syscalls implemented                          |
+| Thread Scheduler | 🟡 Partial | Multi-threaded, but worker threads non-functional |
+| GPU (Vulkan)     | 🟡 Partial | Initialized, waiting for game commands            |
+| Audio (XMA)      | 🟡 Partial | Decoder present, not receiving data               |
+| File System      | ✅ Working | ISO mounting, VFS layer                           |
+
+### Known Issues
+
+**Primary Blocker:** Games get stuck in a spin loop waiting for worker thread completion. See [SPIN_LOOP_WORKER_THREAD_ISSUE.md](docs/issues/SPIN_LOOP_WORKER_THREAD_ISSUE.md) for details.
+
+- Worker threads created with no executable code (entry=0)
+- Games expect Xbox 360 kernel to be fully initialized before entry
+- Results in purple screen (GPU test clear color)
 
 ## 🎯 Goals
 
@@ -26,12 +49,14 @@
 ## 📋 Requirements
 
 ### Minimum
+
 - Android 10 (API 29)
 - ARM64 processor
 - Vulkan 1.1 support
 - 6GB RAM
 
 ### Recommended
+
 - Android 12+
 - Snapdragon 8 Gen 2 or newer
 - 8GB+ RAM
@@ -40,6 +65,7 @@
 ## 🏗️ Building
 
 ### Prerequisites
+
 - Android Studio Hedgehog (2023.1.1) or newer
 - Android NDK r26 or newer
 - CMake 3.22+
@@ -57,64 +83,111 @@ cd android
 ./gradlew assembleDebug
 
 # Install on device
-./gradlew installDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
 ## 📁 Project Structure
 
 ```
 360mu/
-├── android/          # Android app (Kotlin + Jetpack Compose)
-├── native/           # Emulator core (C++)
-│   ├── src/cpu/      # PowerPC Xenon emulation
-│   ├── src/gpu/      # ATI Xenos emulation (Vulkan)
-│   ├── src/apu/      # Audio processing (XMA)
-│   ├── src/kernel/   # Xbox kernel HLE
-│   └── src/memory/   # Memory management
-├── shaders/          # Vulkan shaders
-└── docs/             # Documentation
+├── android/              # Android app (Kotlin + Jetpack Compose)
+│   └── app/src/main/
+│       ├── java/         # Kotlin UI code
+│       └── cpp/          # JNI bridge
+├── native/               # Emulator core (C++)
+│   └── src/
+│       ├── cpu/          # PowerPC Xenon emulation
+│       │   ├── xenon/    # Interpreter, CPU state
+│       │   ├── jit/      # ARM64 JIT compiler
+│       │   └── vmx128/   # Vector unit (SIMD)
+│       ├── gpu/          # ATI Xenos emulation
+│       │   └── xenos/    # Vulkan backend
+│       ├── apu/          # Audio processing (XMA)
+│       ├── kernel/       # Xbox kernel HLE
+│       │   └── hle/      # High-level syscall emulation
+│       ├── memory/       # Memory management, fastmem
+│       ├── loader/       # XEX/ISO loading
+│       └── vfs/          # Virtual file system
+├── shaders/              # Vulkan shaders (GLSL)
+└── docs/                 # Documentation
+    ├── tasks/            # Development task tracking
+    └── issues/           # Known issues documentation
 ```
 
 ## 🗺️ Roadmap
 
 See [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) for the detailed technical plan.
 
-### Phase 1: Foundation ⏳
+### Phase 1: Foundation ✅
+
 - [x] Project setup
-- [ ] Memory system
-- [ ] XEX loader
-- [ ] CPU interpreter
+- [x] Memory system (512MB + fastmem)
+- [x] XEX loader (encryption, compression, imports)
+- [x] CPU interpreter (full PPC instruction set)
 
-### Phase 2: CPU JIT
-- [ ] JIT framework
-- [ ] Full PPC support
-- [ ] VMX128 emulation
+### Phase 2: CPU JIT ✅
 
-### Phase 3: GPU
-- [ ] Vulkan backend
+- [x] JIT framework (ARM64 emitter)
+- [x] Block cache with invalidation
+- [x] ~80% PPC instruction coverage
+- [ ] VMX128 JIT (currently interpreted)
+
+### Phase 3: Kernel & Threading 🟡 (Current Focus)
+
+- [x] Basic syscall dispatch
+- [x] Thread creation/scheduling
+- [ ] **Worker thread execution** ← Blocking issue
+- [ ] DPC/APC processing
+- [ ] Proper kernel initialization
+
+### Phase 4: GPU
+
+- [x] Vulkan backend initialization
+- [ ] Ring buffer command processing
 - [ ] Shader translator
 - [ ] eDRAM emulation
 
-### Phase 4: Audio & I/O
-- [ ] XMA decoder
-- [ ] Input system
-- [ ] File system
+### Phase 5: Audio & I/O
+
+- [x] XMA decoder framework
+- [ ] Audio output integration
+- [ ] Controller input
+- [ ] Save states
+
+## 🐛 Debugging
+
+```bash
+# View emulator logs
+adb logcat -s 360mu:* 360mu-cpu:* 360mu-jit:* 360mu-kernel:*
+
+# Check for spin loops
+adb logcat -d | grep "KeSetEventBoostPriority"
+
+# Check thread creation
+adb logcat -d | grep "Created thread"
+
+# Check syscall dispatch
+adb logcat -d | grep "dispatch_syscall"
+```
 
 ## 🤝 Contributing
 
 Contributions are welcome! Please read our contributing guidelines before submitting PRs.
 
 ### Areas needing help:
-- PowerPC JIT optimization
-- Vulkan rendering
-- Xenos shader translation
-- Game compatibility testing
+
+- **Xbox 360 kernel research** - Understanding system initialization
+- **Worker thread implementation** - Making system threads functional
+- **PowerPC JIT optimization** - VMX128, missing instructions
+- **Vulkan rendering** - Xenos command processing
+- **Game compatibility testing**
 
 ## 📚 Resources
 
 - [Xbox 360 Architecture](https://www.copetti.org/writings/consoles/xbox-360/)
 - [Xenia Emulator](https://github.com/xenia-project/xenia) (Reference implementation)
 - [Free60 Wiki](https://free60.org/)
+- [Xbox Dev Wiki](https://xboxdevwiki.net/)
 
 ## ⚖️ Legal
 
@@ -133,4 +206,3 @@ This emulator does not include any Xbox 360 system software or games. Users must
 **Made with ❤️ for the emulation community**
 
 </div>
-
