@@ -191,7 +191,7 @@ void Memory::teardown_fastmem() {
     }
 }
 
-bool Memory::handle_fault(void* fault_addr, void* context) {
+bool Memory::handle_fault(void* fault_addr) {
     if (!fastmem_base_) return false;
     
     uintptr_t addr = reinterpret_cast<uintptr_t>(fault_addr);
@@ -204,9 +204,12 @@ bool Memory::handle_fault(void* fault_addr, void* context) {
     
     GuestAddr guest_addr = static_cast<GuestAddr>(addr - base);
     
-    // Check for MMIO - handle hardware register accesses
+    // MMIO addresses should never be accessed via fastmem - they must use
+    // the slow path (read_u32/write_u32) which routes through MMIO handlers.
+    // If we get here, it's a bug in the JIT/interpreter.
     if (is_mmio(guest_addr)) {
-        return handle_mmio_fault(guest_addr, context);
+        LOGE("MMIO access at 0x%08X went through fastmem - use read_u32/write_u32 instead", guest_addr);
+        return false;
     }
     
     // Check if this is a valid address that just needs mapping
@@ -230,203 +233,6 @@ bool Memory::handle_fault(void* fault_addr, void* context) {
     }
     
     return false;
-}
-
-bool Memory::handle_mmio_fault(GuestAddr guest_addr, void* context) {
-    if (!context) {
-        LOGE("MMIO fault at 0x%08X but no context available", guest_addr);
-        return false;
-    }
-    
-#if defined(__aarch64__)
-    ucontext_t* uc = static_cast<ucontext_t*>(context);
-    
-#if defined(__APPLE__)
-    // macOS uses different mcontext structure
-    mcontext_t mc = uc->uc_mcontext;
-    u64 pc_val = mc->__ss.__pc;
-    #define MC_PC mc->__ss.__pc
-    #define MC_REG(n) mc->__ss.__x[n]
-#else
-    // Linux/Android
-    mcontext_t* mc = &uc->uc_mcontext;
-    u64 pc_val = mc->pc;
-    #define MC_PC mc->pc
-    #define MC_REG(n) mc->regs[n]
-#endif
-    
-    // Get the faulting instruction
-    u32* pc_ptr = reinterpret_cast<u32*>(pc_val);
-    u32 insn = *pc_ptr;
-    
-    // Decode ARM64 load/store instruction
-    // LDR (immediate): 1x111000010iiiiiiiii00nnnnnttttt (size=11 for 32-bit)
-    // STR (immediate): 1x111000000iiiiiiiii00nnnnnttttt
-    // LDR (register):  1x111000011mmmmmooooo10nnnnnttttt
-    // STR (register):  1x111000001mmmmmooooo10nnnnnttttt
-    
-    bool is_load = false;
-    u32 rt = 0;  // Target/source register
-    u32 size = 0; // 0=8-bit, 1=16-bit, 2=32-bit, 3=64-bit
-    
-    // Check for LDR/STR with register offset or immediate
-    if ((insn & 0x3F000000) == 0x38000000 || (insn & 0x3F000000) == 0x39000000) {
-        size = (insn >> 30) & 0x3;
-        rt = insn & 0x1F;
-        
-        // Bit 22 distinguishes load (1) from store (0) for most encodings
-        is_load = (insn & (1 << 22)) != 0;
-    } else {
-        // Unknown instruction format
-        LOGE("MMIO fault: unknown instruction 0x%08X at PC 0x%llX for addr 0x%08X", 
-             insn, static_cast<unsigned long long>(pc_val), guest_addr);
-        return false;
-    }
-    
-    auto* handler = find_mmio(guest_addr);
-    
-    if (is_load) {
-        // MMIO read
-        u32 value = 0;
-        if (handler && handler->read) {
-            value = handler->read(guest_addr);
-        } else {
-            // No handler - return 0 for unhandled reads
-            LOGI("MMIO read from unhandled address 0x%08X", guest_addr);
-        }
-        
-        // Write result to target register (handle different sizes)
-        if (rt < 31) {  // Don't write to XZR/WZR
-            switch (size) {
-                case 0: MC_REG(rt) = static_cast<u8>(value); break;
-                case 1: MC_REG(rt) = static_cast<u16>(value); break;
-                case 2: MC_REG(rt) = value; break;
-                case 3: MC_REG(rt) = value; break;  // 64-bit, but MMIO is 32-bit
-            }
-        }
-    } else {
-        // MMIO write
-        u32 value = 0;
-        if (rt < 31) {
-            value = static_cast<u32>(MC_REG(rt));
-        }
-        
-        if (handler && handler->write) {
-            handler->write(guest_addr, value);
-        } else {
-            // No handler - ignore unhandled writes
-            LOGI("MMIO write 0x%08X to unhandled address 0x%08X", value, guest_addr);
-        }
-    }
-    
-    // Advance PC past the faulting instruction
-    MC_PC += 4;
-    
-#undef MC_PC
-#undef MC_REG
-    return true;
-    
-#elif defined(__x86_64__)
-    ucontext_t* uc = static_cast<ucontext_t*>(context);
-    
-    // Get faulting instruction
-    u8* pc = reinterpret_cast<u8*>(uc->uc_mcontext.gregs[REG_RIP]);
-    
-    // Basic x86-64 instruction decoding for MOV instructions
-    // This is simplified - a full decoder would be much more complex
-    bool is_load = false;
-    int reg_index = -1;
-    int insn_len = 0;
-    
-    // Check for REX prefix
-    u8 rex = 0;
-    int idx = 0;
-    if ((pc[idx] & 0xF0) == 0x40) {
-        rex = pc[idx++];
-    }
-    
-    // Check for common MOV instructions
-    u8 opcode = pc[idx++];
-    
-    if (opcode == 0x8B) {
-        // MOV r32/r64, r/m32/r/m64 (load)
-        is_load = true;
-        u8 modrm = pc[idx++];
-        reg_index = (modrm >> 3) & 0x7;
-        if (rex & 0x4) reg_index += 8;
-        
-        // Calculate instruction length (simplified)
-        u8 mod = (modrm >> 6) & 0x3;
-        u8 rm = modrm & 0x7;
-        insn_len = idx;
-        if (mod == 0 && rm == 5) insn_len += 4;  // RIP-relative
-        else if (mod == 1) insn_len += 1;  // disp8
-        else if (mod == 2) insn_len += 4;  // disp32
-        if (rm == 4) insn_len += 1;  // SIB byte
-    } else if (opcode == 0x89) {
-        // MOV r/m32/r/m64, r32/r64 (store)
-        is_load = false;
-        u8 modrm = pc[idx++];
-        reg_index = (modrm >> 3) & 0x7;
-        if (rex & 0x4) reg_index += 8;
-        
-        // Calculate instruction length (simplified)
-        u8 mod = (modrm >> 6) & 0x3;
-        u8 rm = modrm & 0x7;
-        insn_len = idx;
-        if (mod == 0 && rm == 5) insn_len += 4;
-        else if (mod == 1) insn_len += 1;
-        else if (mod == 2) insn_len += 4;
-        if (rm == 4) insn_len += 1;
-    } else {
-        LOGE("MMIO fault: unknown x86 instruction 0x%02X at PC %p for addr 0x%08X",
-             opcode, pc, guest_addr);
-        return false;
-    }
-    
-    // Map reg_index to gregset index
-    static const int reg_map[] = {
-        REG_RAX, REG_RCX, REG_RDX, REG_RBX,
-        REG_RSP, REG_RBP, REG_RSI, REG_RDI,
-        REG_R8,  REG_R9,  REG_R10, REG_R11,
-        REG_R12, REG_R13, REG_R14, REG_R15
-    };
-    
-    auto* handler = find_mmio(guest_addr);
-    
-    if (is_load) {
-        u32 value = 0;
-        if (handler && handler->read) {
-            value = handler->read(guest_addr);
-        } else {
-            LOGI("MMIO read from unhandled address 0x%08X", guest_addr);
-        }
-        
-        if (reg_index >= 0 && reg_index < 16) {
-            uc->uc_mcontext.gregs[reg_map[reg_index]] = value;
-        }
-    } else {
-        u32 value = 0;
-        if (reg_index >= 0 && reg_index < 16) {
-            value = static_cast<u32>(uc->uc_mcontext.gregs[reg_map[reg_index]]);
-        }
-        
-        if (handler && handler->write) {
-            handler->write(guest_addr, value);
-        } else {
-            LOGI("MMIO write 0x%08X to unhandled address 0x%08X", value, guest_addr);
-        }
-    }
-    
-    // Advance PC past the faulting instruction
-    uc->uc_mcontext.gregs[REG_RIP] += insn_len;
-    return true;
-    
-#else
-    // Unsupported platform - fall back to error
-    LOGE("MMIO fault at 0x%08X - platform not supported for signal handling", guest_addr);
-    return false;
-#endif
 }
 
 // Translate virtual address to physical address
