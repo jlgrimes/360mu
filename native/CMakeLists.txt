@@ -338,12 +338,14 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
         tests/kernel/test_xevent.cpp
         tests/kernel/test_xthread.cpp
         tests/kernel/test_xkernel.cpp
+        tests/kernel/test_dpc_execution.cpp
         tests/apu/test_audio.cpp
         # Integration tests
         tests/integration/test_syscall_integration.cpp
         tests/integration/test_threading_integration.cpp
         tests/integration/test_xex_integration.cpp
         tests/integration/test_file_hle_integration.cpp
+        tests/integration/test_dpc_integration.cpp
         ${JIT_TEST_SOURCES}
         ${GPU_TEST_SOURCES}
     )

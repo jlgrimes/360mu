@@ -240,8 +240,11 @@ void XTimer::check_and_fire(u64 current_time_100ns) {
         signaled_ = true;
         
         // Queue DPC if specified
+        // Note: For timer DPCs, we pass 0 for dpc_addr since the timer doesn't track
+        // the associated KDPC structure address. The DPC routine can determine the
+        // context from dpc_context_ passed in r4.
         if (dpc_routine_) {
-            KernelState::instance().queue_dpc(dpc_routine_, dpc_context_);
+            KernelState::instance().queue_dpc(0, dpc_routine_, dpc_context_, 0, 0);
         }
         
         // Wake waiters

@@ -19,6 +19,7 @@
 namespace x360mu {
 
 class Memory;
+class Cpu;
 class XThread;
 class XObject;
 
@@ -170,10 +171,11 @@ class KernelState {
 public:
     static KernelState& instance();
     
-    void initialize(Memory* memory);
+    void initialize(Memory* memory, Cpu* cpu = nullptr);
     void shutdown();
     
     Memory* memory() const { return memory_; }
+    Cpu* cpu() const { return cpu_; }
     ObjectTable& object_table() { return object_table_; }
     
     // System-wide state
@@ -186,13 +188,18 @@ public:
     XThread* current_thread() const;
     
     // DPC support
-    void queue_dpc(GuestAddr dpc_routine, GuestAddr context);
+    void queue_dpc(GuestAddr dpc_addr, GuestAddr dpc_routine, GuestAddr context, 
+                   GuestAddr arg1 = 0, GuestAddr arg2 = 0);
     void process_dpcs();
+    
+    // Set CPU (can be called after initialize if needed)
+    void set_cpu(Cpu* cpu) { cpu_ = cpu; }
     
 private:
     KernelState() = default;
     
     Memory* memory_ = nullptr;
+    Cpu* cpu_ = nullptr;
     ObjectTable object_table_;
     
     // Time tracking
@@ -201,10 +208,13 @@ private:
     // Per-thread current thread (using thread_local)
     static thread_local XThread* current_thread_;
     
-    // DPC queue
+    // DPC queue - stores all info needed to execute the DPC
     struct DpcEntry {
-        GuestAddr routine;
-        GuestAddr context;
+        GuestAddr dpc_addr;    // Pointer to KDPC structure (passed as r3)
+        GuestAddr routine;     // DeferredRoutine to call
+        GuestAddr context;     // DeferredContext (r4)
+        GuestAddr arg1;        // SystemArgument1 (r5)
+        GuestAddr arg2;        // SystemArgument2 (r6)
     };
     std::mutex dpc_mutex_;
     std::vector<DpcEntry> dpc_queue_;

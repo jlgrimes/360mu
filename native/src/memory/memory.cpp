@@ -293,7 +293,18 @@ u32 Memory::read_u32(GuestAddr addr) {
     if (phys_addr + 3 >= main_memory_size_) return 0;
     u32 value;
     memcpy(&value, static_cast<u8*>(main_memory_) + phys_addr, sizeof(u32));
-    return byte_swap(value);
+    value = byte_swap(value);
+    
+    // #region agent log - Hypothesis U: Track ALL reads to event addresses with phys addr
+    static int event_read_log = 0;
+    bool is_event_addr = (addr == 0x9FFEFC44 || addr == 0x9FFEFC48);
+    if (is_event_addr && event_read_log++ < 50) {
+        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+        if (f) { fprintf(f, "{\"hypothesisId\":\"U\",\"location\":\"memory.cpp:read_u32\",\"message\":\"EVENT_READ\",\"data\":{\"virt\":\"%08X\",\"phys\":\"%08X\",\"value\":\"%08X\",\"call\":%d}}\n", (u32)addr, (u32)phys_addr, value, event_read_log); fclose(f); }
+    }
+    // #endregion
+    
+    return value;
 }
 
 u64 Memory::read_u64(GuestAddr addr) {
@@ -351,14 +362,52 @@ void Memory::write_u32(GuestAddr addr, u32 value) {
         auto* handler = find_mmio(addr);
         if (handler) {
             handler->write(addr, value);
+        } else {
+            // #region agent log - Hypothesis O: Track MMIO writes without handler
+            static int mmio_no_handler_log = 0;
+            if (mmio_no_handler_log++ < 30) {
+                GuestAddr phys = translate_address(addr);
+                FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+                if (f) { fprintf(f, "{\"hypothesisId\":\"O\",\"location\":\"memory.cpp:write_u32\",\"message\":\"MMIO NO HANDLER\",\"data\":{\"addr\":\"%08X\",\"phys\":\"%08X\",\"value\":%u}}\n", (u32)addr, (u32)phys, value); fclose(f); }
+            }
+            // #endregion
         }
         return;
     }
     
     GuestAddr phys_addr = translate_address(addr);
+    
+    // #region agent log - Hypothesis U: Track ALL writes to event addresses - especially zeros!
+    static int event_write_log = 0;
+    bool is_event_addr = (addr == 0x9FFEFC44 || addr == 0x9FFEFC48);
+    if (is_event_addr && event_write_log++ < 100) {
+        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+        if (f) { fprintf(f, "{\"hypothesisId\":\"U\",\"location\":\"memory.cpp:write_u32\",\"message\":\"EVENT_WRITE\",\"data\":{\"virt\":\"%08X\",\"phys\":\"%08X\",\"value\":\"%08X\",\"call\":%d,\"is_zero\":%d}}\n", (u32)addr, (u32)phys_addr, value, event_write_log, (value == 0)); fclose(f); }
+    }
+    // #endregion
+    
+    // #region agent log - Hypothesis O: Track writes to GPU physical range
+    static int gpu_phys_write_log = 0;
+    if (phys_addr >= 0x7FC00000 && phys_addr <= 0x7FFFFFFF && gpu_phys_write_log++ < 30) {
+        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+        if (f) { fprintf(f, "{\"hypothesisId\":\"O\",\"location\":\"memory.cpp:write_u32\",\"message\":\"GPU PHYS WRITE MISSED\",\"data\":{\"addr\":\"%08X\",\"phys\":\"%08X\",\"value\":%u}}\n", (u32)addr, (u32)phys_addr, value); fclose(f); }
+    }
+    // #endregion
+    
     if (phys_addr + 3 >= main_memory_size_) return;
     value = byte_swap(value);
     memcpy(static_cast<u8*>(main_memory_) + phys_addr, &value, sizeof(u32));
+    
+    // #region agent log - Hypothesis V: Verify write immediately after
+    if (is_event_addr && event_write_log <= 50) {
+        u32 readback;
+        memcpy(&readback, static_cast<u8*>(main_memory_) + phys_addr, sizeof(u32));
+        readback = byte_swap(readback);
+        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+        if (f) { fprintf(f, "{\"hypothesisId\":\"V\",\"location\":\"memory.cpp:write_u32\",\"message\":\"WRITE_VERIFY\",\"data\":{\"phys\":\"%08X\",\"expected\":\"%08X\",\"readback\":\"%08X\",\"match\":%d}}\n", (u32)phys_addr, byte_swap(value), readback, (byte_swap(value) == readback)); fclose(f); }
+    }
+    // #endregion
+    
     notify_write(addr, 4);
 }
 

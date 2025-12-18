@@ -13,6 +13,8 @@
 #include <unordered_map>
 #include <functional>
 #include <array>
+#include <thread>
+#include <atomic>
 
 namespace x360mu {
 
@@ -236,6 +238,13 @@ private:
         f32 right_stick_x, right_stick_y;
     };
     std::array<InputState, 4> input_state_;
+    
+    // System worker thread for event synchronization
+    std::thread system_worker_thread_;
+    std::atomic<bool> system_worker_running_{false};
+    void start_system_worker();
+    void stop_system_worker();
+    void create_system_guest_threads();
     
     // HLE function table
     std::unordered_map<u64, HleFunction> hle_functions_;

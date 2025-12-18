@@ -164,7 +164,8 @@ void Cpu::dispatch_syscall(ThreadContext& ctx) {
     
     // #region agent log - HYPOTHESIS L: Check syscalls being made
     static int syscall_log = 0;
-    if (syscall_log++ < 50) {
+    // Log first 200 syscalls, plus always log ExCreateThread (ordinal 14)
+    if (syscall_log++ < 200 || ordinal == 14 || (ordinal != 2168 && syscall_log < 500)) {
         FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
         if (f) { fprintf(f, "{\"hypothesisId\":\"L\",\"location\":\"cpu.cpp:dispatch_syscall\",\"message\":\"SYSCALL\",\"data\":{\"call\":%d,\"r0\":%llu,\"module\":%u,\"ordinal\":%u,\"pc\":%u}}\n", syscall_log, ctx.gpr[0], module, ordinal, (u32)ctx.pc); fclose(f); }
     }

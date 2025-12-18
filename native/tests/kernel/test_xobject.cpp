@@ -175,15 +175,22 @@ protected:
     void SetUp() override {
         memory_ = std::make_unique<Memory>();
         ASSERT_EQ(memory_->initialize(), Status::Ok);
-        KernelState::instance().initialize(memory_.get());
+        
+        cpu_ = std::make_unique<Cpu>();
+        CpuConfig cpu_config{};
+        ASSERT_EQ(cpu_->initialize(memory_.get(), cpu_config), Status::Ok);
+        
+        KernelState::instance().initialize(memory_.get(), cpu_.get());
     }
     
     void TearDown() override {
         KernelState::instance().shutdown();
+        cpu_->shutdown();
         memory_->shutdown();
     }
     
     std::unique_ptr<Memory> memory_;
+    std::unique_ptr<Cpu> cpu_;
 };
 
 TEST_F(KernelStateTest, Initialize) {
@@ -229,15 +236,56 @@ TEST_F(KernelStateTest, ObjectTableAccess) {
 }
 
 TEST_F(KernelStateTest, DpcQueue) {
-    // Queue some DPCs
-    KernelState::instance().queue_dpc(0x82001000, 0x12345678);
-    KernelState::instance().queue_dpc(0x82002000, 0x87654321);
+    // Queue some DPCs with full arguments:
+    // queue_dpc(dpc_addr, routine, context, arg1, arg2)
+    KernelState::instance().queue_dpc(0x10000, 0x82001000, 0x12345678, 0xAAA, 0xBBB);
+    KernelState::instance().queue_dpc(0x10030, 0x82002000, 0x87654321, 0xCCC, 0xDDD);
     
-    // Process them (this just clears the queue for now)
+    // Process them
     KernelState::instance().process_dpcs();
     
     // Can queue more after processing
-    KernelState::instance().queue_dpc(0x82003000, 0xDEADBEEF);
+    KernelState::instance().queue_dpc(0x10060, 0x82003000, 0xDEADBEEF, 0xEEE, 0xFFF);
+    
+    // Process again
+    KernelState::instance().process_dpcs();
+}
+
+TEST_F(KernelStateTest, DpcQueueWithNullRoutine) {
+    // Queue DPC with null routine - should be skipped during processing
+    KernelState::instance().queue_dpc(0x10000, 0, 0x12345678, 0, 0);
+    
+    // Should not crash
+    KernelState::instance().process_dpcs();
+}
+
+TEST_F(KernelStateTest, DpcQueueAllArguments) {
+    // Test that all arguments are stored correctly
+    GuestAddr dpc_addr = 0x10000;
+    GuestAddr routine = 0x82001000;
+    GuestAddr context = 0xCCCCCCCC;
+    GuestAddr arg1 = 0x11111111;
+    GuestAddr arg2 = 0x22222222;
+    
+    KernelState::instance().queue_dpc(dpc_addr, routine, context, arg1, arg2);
+    
+    // Process - verifies no crash with all arguments
+    KernelState::instance().process_dpcs();
+}
+
+TEST_F(KernelStateTest, CpuAccessor) {
+    // Test CPU accessor
+    EXPECT_EQ(KernelState::instance().cpu(), cpu_.get());
+}
+
+TEST_F(KernelStateTest, SetCpu) {
+    // Test set_cpu
+    KernelState::instance().set_cpu(nullptr);
+    EXPECT_EQ(KernelState::instance().cpu(), nullptr);
+    
+    // Restore
+    KernelState::instance().set_cpu(cpu_.get());
+    EXPECT_EQ(KernelState::instance().cpu(), cpu_.get());
 }
 
 } // namespace test

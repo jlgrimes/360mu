@@ -434,6 +434,11 @@ void Emulator::emulation_thread_main() {
             scheduler_->run(cpu::CLOCK_SPEED / 60 / 100); // ~1/100th of a frame
             cpu_batches++;
             
+            // Process kernel work items (DPCs, timers, APCs)
+            // This is critical for game initialization - DPCs signal completion events
+            // that the main thread waits for before proceeding to GPU init
+            XKernel::instance().run_for(cpu::CLOCK_SPEED / 60 / 100);
+            
             // Process GPU command buffer
             gpu_->process_commands();
             

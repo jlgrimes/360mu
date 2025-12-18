@@ -11,6 +11,7 @@
 #include "xex_loader.h"
 #include "filesystem/vfs.h"
 #include <unordered_set>
+#include <chrono>
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -58,6 +59,9 @@ Status Kernel::initialize(Memory* memory, Cpu* cpu, VirtualFileSystem* vfs) {
 }
 
 void Kernel::shutdown() {
+    // Stop system worker thread
+    stop_system_worker();
+    
     // Shutdown file I/O state first (closes open handles)
     shutdown_file_io_state();
     
@@ -65,6 +69,17 @@ void Kernel::shutdown() {
     objects_.clear();
     threads_.clear();
     hle_functions_.clear();
+}
+
+void Kernel::stop_system_worker() {
+    // System worker thread removed - DPCs are now processed properly via XKernel::run_for()
+    // in the main emulation loop, and on event signals
+    if (system_worker_running_) {
+        system_worker_running_ = false;
+        if (system_worker_thread_.joinable()) {
+            system_worker_thread_.join();
+        }
+    }
 }
 
 void Kernel::reset() {
@@ -188,9 +203,57 @@ void Kernel::prepare_entry() {
         if (main_thread) {
             LOGI("Created main guest thread %u in scheduler", main_thread->thread_id);
         }
+        
+        // Create system worker guest threads
+        // Xbox 360 kernel creates several system threads that handle DPCs, work items, etc.
+        // Without these, games get stuck waiting for worker thread responses
+        create_system_guest_threads();
     }
     
+    // Start system worker thread that monitors events and responds
+    // This simulates Xbox 360's system threads that handle initialization synchronization
+    start_system_worker();
+    
     LOGI("Prepared entry at 0x%08X", main_module.entry_point);
+}
+
+void Kernel::create_system_guest_threads() {
+    // Create system worker guest threads that process DPCs
+    // These simulate the Xbox 360 kernel's system threads
+    //
+    // Instead of running busy loops, these threads start in Waiting state
+    // and are woken up when there's work to do (DPCs, timers, etc.)
+    
+    if (!scheduler_) return;
+    
+    // Create 3 system worker threads (Xbox 360 typically has 3-6 system threads)
+    for (int i = 0; i < 3; i++) {
+        GuestThread* worker = scheduler_->create_thread(
+            0,           // No initial entry point - DPC processor
+            i,           // param (worker ID)
+            64 * 1024,   // 64KB stack
+            0            // not suspended
+        );
+        if (worker) {
+            // Mark as system thread
+            worker->is_system_thread = true;
+            
+            // Start in waiting state - will be activated when DPCs need processing
+            worker->state = ThreadState::Waiting;
+            
+            LOGI("Created system worker thread %u (DPC processor) - starting in Waiting state", 
+                 worker->thread_id);
+        }
+    }
+}
+
+void Kernel::start_system_worker() {
+    // System worker thread removed - DPCs are now processed properly via XKernel::run_for()
+    // in the main emulation loop, and on event signals via KernelState::process_dpcs()
+    //
+    // The old worker was a hack that pre-signaled event addresses. Now that DPCs
+    // are actually executed, the DPC routines themselves signal the correct events.
+    LOGI("System worker thread disabled - DPCs now processed via XKernel::run_for()");
 }
 
 void Kernel::input_button(u32 player, u32 button, bool pressed) {

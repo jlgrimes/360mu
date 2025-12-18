@@ -267,8 +267,8 @@ TEST_F(InterpreterTest, Stwcx_Failure_NoReservation) {
     ctx.gpr[5] = 0;
     ctx.gpr[6] = 100;
     
-    // Clear any existing reservation
-    memory->clear_reservation();
+    // Clear any existing reservation (use thread_id 0 for tests)
+    memory->clear_reservation(0);
     
     // stwcx. r6, 0, r4 - should fail
     execute_instruction(encode_stwcx(6, 5, 4));

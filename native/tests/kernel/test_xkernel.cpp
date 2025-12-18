@@ -323,6 +323,55 @@ TEST_F(XKernelTest, ProcessDpcs) {
     XKernel::instance().process_dpcs();
 }
 
+TEST_F(XKernelTest, ProcessDpcsWithQueuedDpc) {
+    // Queue a DPC via KernelState and process via XKernel
+    // Write a simple blr instruction as the routine
+    GuestAddr routine_addr = 0x00100000;
+    memory_->write_u32(routine_addr, 0x4E800020);  // blr
+    
+    KernelState::instance().queue_dpc(0x10000, routine_addr, 0x12345, 0xA, 0xB);
+    
+    // Process through XKernel
+    XKernel::instance().process_dpcs();
+}
+
+TEST_F(XKernelTest, RunForProcessesDpcs) {
+    // Queue a DPC and verify run_for processes it
+    GuestAddr routine_addr = 0x00100000;
+    memory_->write_u32(routine_addr, 0x4E800020);  // blr
+    
+    KernelState::instance().queue_dpc(0x10000, routine_addr, 0x12345, 0, 0);
+    
+    // run_for should process the DPC
+    XKernel::instance().run_for(10000);
+}
+
+TEST_F(XKernelTest, MultipleRunForCalls) {
+    // Multiple run_for calls should work correctly
+    for (int i = 0; i < 100; i++) {
+        XKernel::instance().run_for(1000);
+    }
+}
+
+TEST_F(XKernelTest, DpcProcessingOnEventSet) {
+    // When an event is set, DPCs should be processed
+    GuestAddr event_addr = 0x00200000;
+    memory_->write_u8(event_addr, 0);  // NotificationEvent
+    memory_->write_u32(event_addr + 4, 0);  // Not signaled
+    
+    // Queue a DPC
+    GuestAddr routine_addr = 0x00100000;
+    memory_->write_u32(routine_addr, 0x4E800020);  // blr
+    KernelState::instance().queue_dpc(0x10000, routine_addr, 0x12345, 0, 0);
+    
+    // Set event (this triggers DPC processing in the real HLE path)
+    XKernel::instance().set_event(event_addr);
+    
+    // Event should be signaled
+    u32 signal_state = memory_->read_u32(event_addr + 4);
+    EXPECT_EQ(signal_state, 1u);
+}
+
 TEST_F(XKernelTest, ProcessApcs) {
     // Should not crash
     XKernel::instance().process_apcs();

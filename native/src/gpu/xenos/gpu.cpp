@@ -60,13 +60,18 @@ Status Gpu::initialize(Memory* memory, const GpuConfig& config) {
     // Create command processor
     command_processor_ = std::make_unique<CommandProcessor>();
     
-    // Initialize ring buffer (atomics already initialized to 0 in header)
+    // Initialize ring buffer state to 0 (game will configure it)
     ring_buffer_base_.store(0, std::memory_order_relaxed);
     ring_buffer_size_.store(0, std::memory_order_relaxed);
     read_ptr_.store(0, std::memory_order_relaxed);
     write_ptr_.store(0, std::memory_order_relaxed);
     
-    LOGI("GPU initialized (waiting for surface)");
+    // Set GPU status registers to indicate GPU is ready/idle
+    // This helps games that poll GPU status before initializing
+    registers_[0x0010] = 0x80000000;  // GRBM_STATUS - GUI_ACTIVE=0, indicates idle
+    registers_[0x0014] = 0;           // GRBM_STATUS2
+    
+    LOGI("GPU initialized (waiting for game to configure ring buffer)");
     return Status::Ok;
 }
 
@@ -93,8 +98,14 @@ void Gpu::reset() {
     registers_.fill(0);
     
     // Reset ring buffer state (atomic)
+    ring_buffer_base_.store(0, std::memory_order_relaxed);
+    ring_buffer_size_.store(0, std::memory_order_relaxed);
     read_ptr_.store(0, std::memory_order_relaxed);
     write_ptr_.store(0, std::memory_order_relaxed);
+    
+    // Set GPU status to idle/ready
+    registers_[0x0010] = 0x80000000;  // GRBM_STATUS - idle
+    registers_[0x0014] = 0;           // GRBM_STATUS2
     
     // Reset render state
     render_state_ = {};

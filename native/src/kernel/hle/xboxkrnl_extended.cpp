@@ -15,6 +15,7 @@
  */
 
 #include "../kernel.h"
+#include "../xobject.h"
 #include "../../cpu/xenon/cpu.h"
 #include "../../cpu/xenon/threading.h"
 #include "../../memory/memory.h"
@@ -344,6 +345,14 @@ static void HLE_ExCreateThread(Cpu* cpu, Memory* memory, u64* args, u64* result)
     //   PVOID StartContext,       // arg[5] - parameter
     //   DWORD CreationFlags       // arg[6]
     // );
+    
+    // #region agent log - Track ExCreateThread calls
+    static int create_log = 0;
+    if (create_log++ < 30) {
+        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+        if (f) { fprintf(f, "{\"hypothesisId\":\"Y\",\"location\":\"HLE_ExCreateThread\",\"message\":\"EXCREATETHREAD_CALLED\",\"data\":{\"call\":%d,\"entry\":\"%08X\",\"routine\":\"%08X\",\"flags\":%u}}\n", create_log, (u32)args[3], (u32)args[4], (u32)args[6]); fclose(f); }
+    }
+    // #endregion
     
     GuestAddr handle_ptr = static_cast<GuestAddr>(args[0]);
     u32 stack_size = static_cast<u32>(args[1]);
@@ -1066,18 +1075,30 @@ static void HLE_KeInsertQueueDpc(Cpu* cpu, Memory* memory, u64* args, u64* resul
     GuestAddr arg1 = static_cast<GuestAddr>(args[1]);
     GuestAddr arg2 = static_cast<GuestAddr>(args[2]);
     
-    // Store arguments
-    memory->write_u32(dpc + 20, arg1);
-    memory->write_u32(dpc + 24, arg2);
+    // Store arguments in the KDPC structure (per Xbox 360 spec)
+    // Offset 0x14 = SystemArgument1
+    // Offset 0x18 = SystemArgument2
+    memory->write_u32(dpc + 0x14, arg1);
+    memory->write_u32(dpc + 0x18, arg2);
     
-    // Queue the DPC
-    std::lock_guard<std::mutex> lock(g_ext_hle.dpc_mutex);
-    g_ext_hle.dpc_queue.push_back({
-        memory->read_u32(dpc + 12),  // Routine
-        memory->read_u32(dpc + 16),  // Context
-        arg1,
-        arg2
-    });
+    // Read DPC info from structure
+    // Offset 0x0C = DeferredRoutine
+    // Offset 0x10 = DeferredContext
+    GuestAddr routine = memory->read_u32(dpc + 0x0C);
+    GuestAddr context = memory->read_u32(dpc + 0x10);
+    
+    // Queue the DPC using the central KernelState queue
+    // This ensures DPCs are processed in process_dpcs()
+    KernelState::instance().queue_dpc(dpc, routine, context, arg1, arg2);
+    
+    // Also keep local queue for backward compatibility
+    {
+        std::lock_guard<std::mutex> lock(g_ext_hle.dpc_mutex);
+        g_ext_hle.dpc_queue.push_back({routine, context, arg1, arg2});
+    }
+    
+    LOGI("KeInsertQueueDpc: dpc=0x%08X, routine=0x%08X, context=0x%08X, arg1=0x%08X, arg2=0x%08X",
+         dpc, routine, context, arg1, arg2);
     
     *result = 1;  // Inserted
 }
@@ -1711,17 +1732,44 @@ void Kernel::register_xboxkrnl_extended() {
     
     // High ordinal functions (from newer SDK versions)
     // 2168: KeSetEventBoostPriority - sets event to signaled state and boosts priority
-    // LONG KeSetEventBoostPriority(PRKEVENT Event, PRKTHREAD Thread)
+    // LONG KeSetEventBoostPriority(PRKEVENT Event, KPRIORITY Increment)
     // Returns previous signal state
     static u32 boost_call_count = 0;
     hle_functions_[make_import_key(0, 2168)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
         GuestAddr event = static_cast<GuestAddr>(args[0]);
         boost_call_count++;
         
+        // Handle special pseudo-handles
+        // Handle 1 = NtCurrentThread - resolve to current thread's event
+        // Handle 2 = NtCurrentProcess
+        if (event == 1 || event == 2) {
+            // When game passes handle 1 (current thread), it expects the thread's
+            // built-in event to be signaled. Just return success - the thread is "ready"
+            *result = 1;  // Previous state was signaled
+            return;
+        }
+        
         if (event == 0) {
             *result = 1;
             return;
         }
+        
+        // Validate event pointer - must be in valid memory range
+        if (event < 0x80000000 || event >= 0xC0000000) {
+            // Invalid event pointer, treat as no-op
+            *result = 1;
+            return;
+        }
+        
+        // #region agent log - Hypothesis X: Check raw memory at syscall entry
+        static int entry_log = 0;
+        if (entry_log++ < 30) {
+            // Read raw value at event+4 (signal_state location)
+            u32 raw_check = memory->read_u32(event + 4);
+            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+            if (f) { fprintf(f, "{\"hypothesisId\":\"X\",\"location\":\"KeSetEventBoostPriority\",\"message\":\"ENTRY_CHECK\",\"data\":{\"event\":\"%08X\",\"signal_addr\":\"%08X\",\"raw_value\":%u,\"call\":%u}}\n", (u32)event, (u32)(event+4), raw_check, boost_call_count); fclose(f); }
+        }
+        // #endregion
         
         // Read previous signal state from dispatcher header (+4)
         s32 prev_state = static_cast<s32>(memory->read_u32(event + 4));
@@ -1729,25 +1777,104 @@ void Kernel::register_xboxkrnl_extended() {
         // Set event to signaled state (signal_state = 1)
         memory->write_u32(event + 4, 1);
         
+        // CRITICAL: Process pending DPCs immediately when an event is signaled
+        // This simulates the system thread responding to the event and executing
+        // any pending work items. Without this, games get stuck waiting for
+        // DPC completion that never happens.
+        KernelState::instance().process_dpcs();
+        
+        // #region agent log - Hypothesis S: Verify write took effect
+        static int verify_log = 0;
+        if (verify_log++ < 20) {
+            u32 readback = memory->read_u32(event + 4);
+            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+            if (f) { fprintf(f, "{\"hypothesisId\":\"S\",\"location\":\"KeSetEventBoostPriority\",\"message\":\"VERIFY_WRITE\",\"data\":{\"event\":\"%08X\",\"wrote\":1,\"readback\":%u}}\n", (u32)event, readback); fclose(f); }
+        }
+        // #endregion
+        
         // Wake any threads waiting on this event
         if (g_scheduler) {
             g_scheduler->signal_object(event);
         }
         
-        // HACK: After many calls, try to force system init flags
-        // Games often wait for system initialization in this loop
-        if (boost_call_count == 100) {
-            LOGI("KeSetEventBoostPriority called 100 times - checking system init");
-            // Try to set common system-ready flags
-            // 0x7C080000 region is often used for system state
+        // #region agent log - Hypothesis T: Log return value
+        static int ret_log = 0;
+        if (ret_log++ < 20) {
+            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+            if (f) { fprintf(f, "{\"hypothesisId\":\"T\",\"location\":\"KeSetEventBoostPriority\",\"message\":\"RETURN_VALUE\",\"data\":{\"event\":\"%08X\",\"prev_state\":%d,\"call\":%u}}\n", (u32)event, prev_state, boost_call_count); fclose(f); }
+        }
+        // #endregion
+        
+        // Log the event structure to understand what the game checks
+        // #region agent log - Hypothesis Z: Dump event structure
+        static int dump_log = 0;
+        if (dump_log++ < 10) {
+            // Read the full DISPATCHER_HEADER and surrounding data
+            u8 type = memory->read_u8(event);
+            u8 absolute = memory->read_u8(event + 1);
+            u8 size = memory->read_u8(event + 2);
+            u8 inserted = memory->read_u8(event + 3);
+            u32 signal_state = memory->read_u32(event + 4);
+            u32 wait_list_flink = memory->read_u32(event + 8);
+            u32 wait_list_blink = memory->read_u32(event + 12);
+            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+            if (f) { 
+                fprintf(f, "{\"hypothesisId\":\"Z\",\"location\":\"KeSetEventBoostPriority\",\"message\":\"EVENT_DUMP\",\"data\":{\"event\":\"%08X\",\"type\":%u,\"absolute\":%u,\"size\":%u,\"inserted\":%u,\"signal\":%u,\"flink\":\"%08X\",\"blink\":\"%08X\"}}\n", 
+                    (u32)event, type, absolute, size, inserted, signal_state, wait_list_flink, wait_list_blink); 
+                fclose(f); 
+            }
+        }
+        // #endregion
+        
+        *result = prev_state;
+    };
+    
+    // 2144 (0x860): ObReferenceObjectByHandle - get object pointer from handle
+    // Xbox 360 uses variable calling conventions - safely read only first 4 args
+    // The output pointer location varies by SDK version
+    hle_functions_[make_import_key(0, 2144)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
+        GuestAddr handle = static_cast<GuestAddr>(args[0]);
+        GuestAddr arg1 = static_cast<GuestAddr>(args[1]);
+        GuestAddr arg2 = static_cast<GuestAddr>(args[2]);
+        GuestAddr arg3 = static_cast<GuestAddr>(args[3]);
+        
+        // Determine output pointer - could be arg2, arg3, or arg1 depending on signature
+        // Check which looks like a valid writable address
+        GuestAddr object_ptr_addr = 0;
+        if (arg3 >= 0x70000000 && arg3 < 0xA0000000) {
+            object_ptr_addr = arg3;  // Likely the output pointer
+        } else if (arg2 >= 0x70000000 && arg2 < 0xA0000000) {
+            object_ptr_addr = arg2;
+        } else if (arg1 >= 0x70000000 && arg1 < 0xA0000000) {
+            object_ptr_addr = arg1;
         }
         
-        if (boost_call_count % 10000 == 0) {
-            LOGI("KeSetEventBoostPriority called %u times (event=0x%08X)", 
-                 boost_call_count, event);
+        // #region agent log - Hypothesis P: Track ObReferenceObjectByHandle
+        static int ob_ref_log = 0;
+        if (ob_ref_log++ < 30) {
+            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+            if (f) { fprintf(f, "{\"hypothesisId\":\"P\",\"location\":\"xboxkrnl_extended.cpp:ObReferenceObjectByHandle\",\"message\":\"OB_REF_BY_HANDLE\",\"data\":{\"handle\":\"%08X\",\"arg1\":\"%08X\",\"arg2\":\"%08X\",\"arg3\":\"%08X\",\"out\":\"%08X\"}}\n", (u32)handle, (u32)arg1, (u32)arg2, (u32)arg3, (u32)object_ptr_addr); fclose(f); }
+        }
+        // #endregion
+        
+        // Create a fake object address based on handle
+        GuestAddr fake_object = 0xA0000000 + (handle * 0x100);
+        
+        // Write fake object to output pointer if we found one
+        if (object_ptr_addr != 0 && object_ptr_addr >= 0x70000000) {
+            memory->write_u32(object_ptr_addr, fake_object);
         }
         
-        *result = 1;
+        // Initialize the fake object's DISPATCHER_HEADER to look like a signaled event
+        memory->write_u8(fake_object, 0);      // Type = NotificationEvent
+        memory->write_u8(fake_object + 1, 0);  // Absolute
+        memory->write_u8(fake_object + 2, 4);  // Size
+        memory->write_u8(fake_object + 3, 0);  // Inserted
+        memory->write_u32(fake_object + 4, 1); // SignalState = 1 (SIGNALED!)
+        memory->write_u32(fake_object + 8, fake_object + 8);  // WaitListHead.Flink
+        memory->write_u32(fake_object + 12, fake_object + 8); // WaitListHead.Blink
+        
+        *result = 0;  // STATUS_SUCCESS
     };
     
     // 2508: KfAcquireSpinLock - fast spinlock acquire
@@ -1756,9 +1883,99 @@ void Kernel::register_xboxkrnl_extended() {
         *result = 0;  // Return old IRQL
     };
     
+    // Ordinal 0: Null/no-op syscall - games sometimes call this
+    hle_functions_[make_import_key(0, 0)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
+        *result = 0;  // Success
+    };
+    
+    // 1708 (0x6AC): Unknown kernel function
+    hle_functions_[make_import_key(0, 1708)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
+        *result = 0;
+    };
+    
+    // 1712-1720 range: Various kernel functions
+    for (u32 ord = 1712; ord <= 1720; ord += 4) {
+        hle_functions_[make_import_key(0, ord)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
+            *result = 0;
+        };
+    }
+    
+    // 2248 (0x8C8): Unknown - likely KiApcNormalRoutineNop or similar
+    hle_functions_[make_import_key(0, 2248)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
+        *result = 0;
+    };
+    
+    // 2252 (0x8CC): Unknown kernel function
+    hle_functions_[make_import_key(0, 2252)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
+        *result = 0;
+    };
+    
+    // 2256 (0x8D0): Unknown kernel function
+    hle_functions_[make_import_key(0, 2256)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
+        *result = 0;
+    };
+    
+    // 2504 (0x9C8): Unknown kernel function
+    hle_functions_[make_import_key(0, 2504)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
+        *result = 0;
+    };
+    
+    // 2512 (0x9D0): Unknown kernel function
+    hle_functions_[make_import_key(0, 2512)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
+        *result = 0;
+    };
+    
+    // 2516 (0x9D4): Unknown kernel function - stub
+    hle_functions_[make_import_key(0, 2516)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
+        *result = 0;  // STATUS_SUCCESS
+    };
+    
+    // 2520 (0x9D8): SeImpersonateClientEx - security impersonation
+    hle_functions_[make_import_key(0, 2520)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
+        // Stub - security impersonation not needed in emulation
+        *result = 0;  // STATUS_SUCCESS
+    };
+    
     // 2528: KfReleaseSpinLock - fast spinlock release
     hle_functions_[make_import_key(0, 2528)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
         // Stub - nothing to do
+    };
+    
+    // 2532: XexGetModuleHandle - get handle to loaded module
+    hle_functions_[make_import_key(0, 2532)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
+        // args[0] = module name pointer (ANSI string)
+        // args[1] = output module handle pointer
+        GuestAddr name_ptr = static_cast<GuestAddr>(args[0]);
+        GuestAddr handle_out = static_cast<GuestAddr>(args[1]);
+        
+        // Read module name
+        char name[256] = {0};
+        for (int i = 0; i < 255; i++) {
+            name[i] = memory->read_u8(name_ptr + i);
+            if (name[i] == 0) break;
+        }
+        
+        // For now, return a fake handle for any module
+        // The actual handle value doesn't matter much as long as it's non-zero
+        u32 fake_handle = 0x80000000 | (name[0] << 8) | name[1];
+        
+        if (handle_out) {
+            memory->write_u32(handle_out, fake_handle);
+        }
+        
+        // #region agent log - Hypothesis AI: Track XexGetModuleHandle
+        static int xmh_log = 0;
+        if (xmh_log++ < 20) {
+            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+            if (f) { 
+                fprintf(f, "{\"hypothesisId\":\"AI\",\"location\":\"xboxkrnl_extended.cpp\",\"message\":\"XexGetModuleHandle\",\"data\":{\"name\":\"%s\",\"handle\":\"%08X\"}}\n", 
+                    name, fake_handle); 
+                fclose(f); 
+            }
+        }
+        // #endregion
+        
+        *result = 0;  // STATUS_SUCCESS
     };
     
     LOGI("Registered extended xboxkrnl.exe HLE functions (including XMA audio)");

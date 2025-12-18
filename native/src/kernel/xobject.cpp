@@ -7,6 +7,7 @@
 #include "xobject.h"
 #include "xthread.h"
 #include "../memory/memory.h"
+#include "../cpu/xenon/cpu.h"
 #include <chrono>
 
 #ifdef __ANDROID__
@@ -156,11 +157,12 @@ KernelState& KernelState::instance() {
     return instance;
 }
 
-void KernelState::initialize(Memory* memory) {
+void KernelState::initialize(Memory* memory, Cpu* cpu) {
     memory_ = memory;
+    cpu_ = cpu;
     boot_time_ = std::chrono::steady_clock::now();
     
-    LOGI("KernelState initialized");
+    LOGI("KernelState initialized (cpu=%s)", cpu ? "available" : "null");
 }
 
 void KernelState::shutdown() {
@@ -212,10 +214,12 @@ XThread* KernelState::current_thread() const {
     return current_thread_;
 }
 
-void KernelState::queue_dpc(GuestAddr dpc_routine, GuestAddr context) {
+void KernelState::queue_dpc(GuestAddr dpc_addr, GuestAddr dpc_routine, GuestAddr context,
+                            GuestAddr arg1, GuestAddr arg2) {
     std::lock_guard<std::mutex> lock(dpc_mutex_);
-    dpc_queue_.push_back({dpc_routine, context});
-    LOGD("Queued DPC: routine=0x%08X, context=0x%08X", dpc_routine, context);
+    dpc_queue_.push_back({dpc_addr, dpc_routine, context, arg1, arg2});
+    LOGI("Queued DPC: dpc=0x%08X, routine=0x%08X, context=0x%08X, arg1=0x%08X, arg2=0x%08X",
+         dpc_addr, dpc_routine, context, arg1, arg2);
 }
 
 void KernelState::process_dpcs() {
@@ -226,14 +230,75 @@ void KernelState::process_dpcs() {
         to_process.swap(dpc_queue_);
     }
     
+    if (to_process.empty()) return;
+    
+    LOGI("Processing %zu DPCs", to_process.size());
+    
     for (const auto& dpc : to_process) {
-        // In a full implementation, we'd call the DPC routine
-        // For now, we just log it
-        LOGD("Processing DPC: routine=0x%08X, context=0x%08X", 
-             dpc.routine, dpc.context);
+        if (dpc.routine == 0) {
+            LOGW("Skipping DPC with null routine");
+            continue;
+        }
         
-        // TODO: Actually execute the DPC routine
-        // This requires calling back into the CPU emulator
+        // Validate routine address is in a valid executable range
+        // Xbox 360 executable code is typically in 0x80000000-0x90000000 range
+        // or in physical memory mapped regions
+        bool valid_address = false;
+        if (dpc.routine >= 0x80000000 && dpc.routine < 0xA0000000) {
+            valid_address = true;  // Virtual kernel/user space
+        } else if (dpc.routine < 0x20000000) {
+            valid_address = true;  // Physical memory (first 512MB)
+        } else if (dpc.routine >= 0x00100000 && dpc.routine < 0x40000000) {
+            valid_address = true;  // Test addresses and low physical
+        }
+        
+        if (!valid_address) {
+            LOGW("Skipping DPC with invalid routine address 0x%08X", dpc.routine);
+            continue;
+        }
+        
+        LOGI("Executing DPC: dpc=0x%08X, routine=0x%08X, context=0x%08X, arg1=0x%08X, arg2=0x%08X",
+             dpc.dpc_addr, dpc.routine, dpc.context, dpc.arg1, dpc.arg2);
+        
+        // Execute DPC by running the guest routine
+        // DPC routines run at DISPATCH_LEVEL, synchronously
+        // 
+        // DPC routine signature (Xbox 360 / Windows NT):
+        //   void DpcRoutine(PKDPC Dpc, PVOID DeferredContext, 
+        //                   PVOID SystemArgument1, PVOID SystemArgument2);
+        // Register mapping:
+        //   r3 = Dpc pointer (address of KDPC structure)
+        //   r4 = DeferredContext
+        //   r5 = SystemArgument1
+        //   r6 = SystemArgument2
+        
+        if (cpu_ && memory_) {
+            // Create a temporary context for DPC execution
+            ThreadContext ctx;
+            ctx.reset();
+            ctx.pc = dpc.routine;
+            ctx.gpr[3] = dpc.dpc_addr;    // Dpc pointer (r3)
+            ctx.gpr[4] = dpc.context;     // DeferredContext (r4)
+            ctx.gpr[5] = dpc.arg1;        // SystemArgument1 (r5)
+            ctx.gpr[6] = dpc.arg2;        // SystemArgument2 (r6)
+            ctx.lr = 0;                    // Return terminates (blr to 0 = done)
+            ctx.running = true;
+            ctx.memory = memory_;
+            ctx.thread_id = 0;             // Run on CPU thread 0
+            
+            // DPCs should be quick, execute for limited cycles
+            // If DPC doesn't complete, it will resume on next process_dpcs call
+            constexpr u64 DPC_MAX_CYCLES = 50000;
+            
+            // Execute the DPC using cpu context execution
+            // This runs the DPC synchronously until it returns (blr) or hits cycle limit
+            cpu_->execute_with_context(0, ctx, DPC_MAX_CYCLES);
+            
+            LOGI("DPC routine 0x%08X completed (pc after=0x%08llX)", 
+                 dpc.routine, ctx.pc);
+        } else {
+            LOGW("Cannot execute DPC: no CPU or memory available");
+        }
     }
 }
 

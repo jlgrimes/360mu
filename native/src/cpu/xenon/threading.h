@@ -123,6 +123,9 @@ struct GuestThread {
     GuestThread* next;
     GuestThread* prev;
     
+    // System thread flag (kernel worker threads)
+    bool is_system_thread;
+    
     // APC (Asynchronous Procedure Call) support
     std::deque<ApcEntry> apc_queue;
     std::mutex apc_mutex;
@@ -145,6 +148,7 @@ struct GuestThread {
         apc_queue.clear();
         alerted = false;
         in_alertable_wait = false;
+        is_system_thread = false;
     }
     
     /**

@@ -520,6 +520,7 @@ private:
     void compile_store_multiple(ARM64Emitter& emit, const DecodedInst& inst);
     void compile_atomic_load(ARM64Emitter& emit, const DecodedInst& inst);
     void compile_atomic_store(ARM64Emitter& emit, const DecodedInst& inst);
+    void compile_dcbz(ARM64Emitter& emit, const DecodedInst& inst);
     
     // Additional instruction compilation
     void compile_extsb(ARM64Emitter& emit, const DecodedInst& inst);

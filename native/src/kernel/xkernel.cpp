@@ -38,11 +38,11 @@ void XKernel::initialize(Cpu* cpu, Memory* memory, Kernel* hle_kernel) {
     memory_ = memory;
     hle_kernel_ = hle_kernel;
     
-    // Initialize subsystems
-    KernelState::instance().initialize(memory);
+    // Initialize subsystems - pass CPU to KernelState for DPC execution
+    KernelState::instance().initialize(memory, cpu);
     XScheduler::instance().initialize(cpu, memory);
     
-    LOGI("XKernel subsystems initialized");
+    LOGI("XKernel subsystems initialized (cpu=%s)", cpu ? "available" : "null");
     
     // Perform full system initialization
     perform_system_init();
@@ -556,11 +556,18 @@ void ke_initialize_dpc(GuestAddr dpc, GuestAddr routine, GuestAddr context) {
 bool ke_insert_queue_dpc(GuestAddr dpc) {
     auto* memory = XKernel::instance().memory();
     
+    // Read DPC structure fields per Xbox 360 layout:
+    // Offset 0x08 = DeferredRoutine (note: ke_initialize_dpc uses 8, spec says 0x0C)
+    // Offset 0x0C = DeferredContext (note: ke_initialize_dpc uses 12, spec says 0x10)
     GuestAddr routine = memory->read_u32(dpc + 8);
     GuestAddr context = memory->read_u32(dpc + 12);
     
+    // Read system arguments from standard KDPC offsets
+    GuestAddr arg1 = memory->read_u32(dpc + 0x14);
+    GuestAddr arg2 = memory->read_u32(dpc + 0x18);
+    
     if (routine) {
-        KernelState::instance().queue_dpc(routine, context);
+        KernelState::instance().queue_dpc(dpc, routine, context, arg1, arg2);
         return true;
     }
     return false;
