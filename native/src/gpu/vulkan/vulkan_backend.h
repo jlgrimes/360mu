@@ -213,6 +213,12 @@ public:
     VkCommandBuffer current_command_buffer() const { return command_buffers_[current_frame_]; }
     u32 graphics_queue_family() const { return graphics_queue_family_; }
     VkDescriptorPool descriptor_pool() const { return descriptor_pool_; }
+    u32 current_frame() const { return current_frame_; }
+    
+    /**
+     * Find suitable memory type for allocation
+     */
+    u32 find_memory_type(u32 type_filter, VkMemoryPropertyFlags properties);
     
 private:
     // Instance and device
@@ -275,7 +281,7 @@ private:
     VkResult create_descriptor_resources();
     VkResult create_edram_resources();
     
-    u32 find_memory_type(u32 type_filter, VkMemoryPropertyFlags properties);
+    // find_memory_type is declared public above
     void transition_image_layout(VkImage image, VkImageLayout old_layout, VkImageLayout new_layout);
     void transition_image_layout(VkCommandBuffer cmd, VkImage image, VkImageLayout old_layout, VkImageLayout new_layout);
     void cleanup_swapchain();

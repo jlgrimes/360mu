@@ -16,6 +16,9 @@
 #include "shader_translator.h"
 #include "texture.h"
 #include "gpu/vulkan/vulkan_backend.h"
+#include "gpu/shader_cache.h"
+#include "gpu/texture_cache.h"
+#include "gpu/descriptor_manager.h"
 #include "memory/memory.h"
 #include <cstring>
 
@@ -127,15 +130,20 @@ CommandProcessor::~CommandProcessor() {
 
 Status CommandProcessor::initialize(Memory* memory, VulkanBackend* vulkan,
                                     ShaderTranslator* shader_translator,
-                                    TextureCache* texture_cache) {
+                                    TextureCacheImpl* texture_cache,
+                                    ShaderCache* shader_cache,
+                                    DescriptorManager* descriptor_manager) {
     memory_ = memory;
     vulkan_ = vulkan;
     shader_translator_ = shader_translator;
     texture_cache_ = texture_cache;
+    shader_cache_ = shader_cache;
+    descriptor_manager_ = descriptor_manager;
     
     reset();
     
-    LOGI("Command processor initialized");
+    LOGI("Command processor initialized (shader_cache=%s, descriptors=%s)",
+         shader_cache ? "yes" : "no", descriptor_manager ? "yes" : "no");
     return Status::Ok;
 }
 
@@ -144,6 +152,18 @@ void CommandProcessor::shutdown() {
     vulkan_ = nullptr;
     shader_translator_ = nullptr;
     texture_cache_ = nullptr;
+    shader_cache_ = nullptr;
+    descriptor_manager_ = nullptr;
+    current_vertex_shader_ = nullptr;
+    current_pixel_shader_ = nullptr;
+    current_pipeline_ = VK_NULL_HANDLE;
+}
+
+u32 CommandProcessor::read_cmd(GuestAddr addr) {
+    if (memory_) {
+        return memory_->read_u32(addr);
+    }
+    return 0;
 }
 
 void CommandProcessor::reset() {
@@ -1111,92 +1131,306 @@ void CommandProcessor::execute_draw(const DrawCommand& cmd) {
             return;
         }
         in_frame_ = true;
+        current_frame_index_ = (current_frame_index_ + 1) % 3;
     }
     
-    // Get or translate shaders
-    // TODO: Implement shader binding
-    
-    // Configure pipeline state based on render_state_
-    PipelineState pipeline_state = {};
-    
-    // Map primitive type
-    switch (cmd.primitive_type) {
-        case PrimitiveType::PointList:
-            pipeline_state.primitive_topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
-            break;
-        case PrimitiveType::LineList:
-            pipeline_state.primitive_topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-            break;
-        case PrimitiveType::LineStrip:
-            pipeline_state.primitive_topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
-            break;
-        case PrimitiveType::TriangleList:
-            pipeline_state.primitive_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-            break;
-        case PrimitiveType::TriangleFan:
-            pipeline_state.primitive_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
-            break;
-        case PrimitiveType::TriangleStrip:
-            pipeline_state.primitive_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
-            break;
-        default:
-            pipeline_state.primitive_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-            break;
+    // Prepare shaders from current GPU state
+    if (!prepare_shaders()) {
+        LOGD("Draw skipped: shader preparation failed");
+        return;
     }
     
-    // Depth state
-    pipeline_state.depth_test_enable = render_state_.depth_test ? VK_TRUE : VK_FALSE;
-    pipeline_state.depth_write_enable = render_state_.depth_write ? VK_TRUE : VK_FALSE;
-    
-    // Map depth function
-    static const VkCompareOp depth_funcs[] = {
-        VK_COMPARE_OP_NEVER,          // 0
-        VK_COMPARE_OP_LESS,           // 1
-        VK_COMPARE_OP_EQUAL,          // 2
-        VK_COMPARE_OP_LESS_OR_EQUAL,  // 3
-        VK_COMPARE_OP_GREATER,        // 4
-        VK_COMPARE_OP_NOT_EQUAL,      // 5
-        VK_COMPARE_OP_GREATER_OR_EQUAL, // 6
-        VK_COMPARE_OP_ALWAYS,         // 7
-    };
-    pipeline_state.depth_compare_op = depth_funcs[render_state_.depth_func & 0x7];
-    
-    // Blend state
-    pipeline_state.blend_enable = render_state_.blend_enable ? VK_TRUE : VK_FALSE;
-    
-    // Cull mode
-    switch (render_state_.cull_mode) {
-        case 0:  // None
-            pipeline_state.cull_mode = VK_CULL_MODE_NONE;
-            break;
-        case 1:  // Front
-            pipeline_state.cull_mode = VK_CULL_MODE_FRONT_BIT;
-            break;
-        case 2:  // Back
-            pipeline_state.cull_mode = VK_CULL_MODE_BACK_BIT;
-            break;
-        default:
-            pipeline_state.cull_mode = VK_CULL_MODE_NONE;
-            break;
+    // Prepare pipeline for the draw
+    if (!prepare_pipeline(cmd)) {
+        LOGD("Draw skipped: pipeline preparation failed");
+        return;
     }
     
-    pipeline_state.front_face = render_state_.front_ccw ? 
-                                VK_FRONT_FACE_COUNTER_CLOCKWISE : 
-                                VK_FRONT_FACE_CLOCKWISE;
+    // Update shader constants
+    update_constants();
+    
+    // Bind textures
+    bind_textures();
+    
+    // Bind descriptor set
+    if (descriptor_manager_) {
+        VkDescriptorSet desc_set = descriptor_manager_->begin_frame(current_frame_index_);
+        if (desc_set != VK_NULL_HANDLE) {
+            vulkan_->bind_descriptor_set(desc_set);
+        }
+    }
+    
+    // Bind vertex and index buffers
+    bind_vertex_buffers(cmd);
+    if (cmd.indexed) {
+        bind_index_buffer(cmd);
+    }
     
     // Execute draw
     if (cmd.indexed) {
-        vulkan_->draw_indexed(cmd.index_count, 1, 0, 0, 0);
+        vulkan_->draw_indexed(cmd.index_count, cmd.instance_count, cmd.start_index, 
+                             cmd.base_vertex, 0);
     } else {
-        vulkan_->draw(cmd.vertex_count > 0 ? cmd.vertex_count : cmd.index_count, 1, 0, 0);
+        u32 vertex_count = cmd.vertex_count > 0 ? cmd.vertex_count : cmd.index_count;
+        vulkan_->draw(vertex_count, cmd.instance_count, 0, 0);
     }
     
     draws_this_frame_++;
     
-    LOGD("Draw: %s, %u %s", 
+    LOGD("Draw: %s, %u %s (pipeline=%p)", 
          cmd.indexed ? "indexed" : "non-indexed",
          cmd.indexed ? cmd.index_count : cmd.vertex_count,
-         cmd.indexed ? "indices" : "vertices");
+         cmd.indexed ? "indices" : "vertices",
+         (void*)current_pipeline_);
+}
+
+bool CommandProcessor::prepare_shaders() {
+    if (!shader_cache_ || !memory_) {
+        // No shader cache - use fallback behavior
+        current_vertex_shader_ = nullptr;
+        current_pixel_shader_ = nullptr;
+        return true;  // Allow draw to proceed without shaders for testing
+    }
+    
+    // Get shader addresses from GPU state
+    GuestAddr vs_addr = render_state_.vertex_shader_address;
+    GuestAddr ps_addr = render_state_.pixel_shader_address;
+    
+    if (vs_addr == 0 || ps_addr == 0) {
+        LOGD("No shader addresses set (vs=%08x, ps=%08x)", vs_addr, ps_addr);
+        return false;
+    }
+    
+    // Get shader microcode from guest memory
+    const void* vs_microcode = memory_->get_host_ptr(vs_addr);
+    const void* ps_microcode = memory_->get_host_ptr(ps_addr);
+    
+    if (!vs_microcode || !ps_microcode) {
+        LOGE("Failed to translate shader addresses");
+        return false;
+    }
+    
+    // Get shader size from registers (or use default)
+    // The size is typically determined by control flow instructions
+    u32 vs_size = 2048;  // Default size, would be parsed from headers
+    u32 ps_size = 2048;
+    
+    // Get or compile shaders
+    current_vertex_shader_ = shader_cache_->get_shader(vs_microcode, vs_size, ShaderType::Vertex);
+    current_pixel_shader_ = shader_cache_->get_shader(ps_microcode, ps_size, ShaderType::Pixel);
+    
+    if (!current_vertex_shader_ || !current_pixel_shader_) {
+        LOGD("Failed to get shaders");
+        return false;
+    }
+    
+    return true;
+}
+
+bool CommandProcessor::prepare_pipeline(const DrawCommand& cmd) {
+    // Build pipeline key from current state
+    PipelineKey key{};
+    
+    if (current_vertex_shader_) {
+        key.vertex_shader_hash = current_vertex_shader_->hash;
+    }
+    if (current_pixel_shader_) {
+        key.pixel_shader_hash = current_pixel_shader_->hash;
+    }
+    
+    // Map primitive type
+    switch (cmd.primitive_type) {
+        case PrimitiveType::PointList:
+            key.primitive_topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+            break;
+        case PrimitiveType::LineList:
+            key.primitive_topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+            break;
+        case PrimitiveType::LineStrip:
+            key.primitive_topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+            break;
+        case PrimitiveType::TriangleList:
+            key.primitive_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            break;
+        case PrimitiveType::TriangleFan:
+            key.primitive_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+            break;
+        case PrimitiveType::TriangleStrip:
+            key.primitive_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+            break;
+        default:
+            key.primitive_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            break;
+    }
+    
+    // Depth state
+    key.depth_test_enable = render_state_.depth_test ? VK_TRUE : VK_FALSE;
+    key.depth_write_enable = render_state_.depth_write ? VK_TRUE : VK_FALSE;
+    
+    // Map depth function
+    static const VkCompareOp depth_funcs[] = {
+        VK_COMPARE_OP_NEVER, VK_COMPARE_OP_LESS, VK_COMPARE_OP_EQUAL,
+        VK_COMPARE_OP_LESS_OR_EQUAL, VK_COMPARE_OP_GREATER, VK_COMPARE_OP_NOT_EQUAL,
+        VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_ALWAYS,
+    };
+    key.depth_compare_op = depth_funcs[render_state_.depth_func & 0x7];
+    
+    // Blend state
+    key.blend_enable = render_state_.blend_enable ? VK_TRUE : VK_FALSE;
+    key.src_color_blend = VK_BLEND_FACTOR_SRC_ALPHA;
+    key.dst_color_blend = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    key.color_blend_op = VK_BLEND_OP_ADD;
+    
+    // Cull mode
+    switch (render_state_.cull_mode) {
+        case 0: key.cull_mode = VK_CULL_MODE_NONE; break;
+        case 1: key.cull_mode = VK_CULL_MODE_FRONT_BIT; break;
+        case 2: key.cull_mode = VK_CULL_MODE_BACK_BIT; break;
+        default: key.cull_mode = VK_CULL_MODE_NONE; break;
+    }
+    
+    key.front_face = render_state_.front_ccw ? 
+                     VK_FRONT_FACE_COUNTER_CLOCKWISE : 
+                     VK_FRONT_FACE_CLOCKWISE;
+    
+    // Get or create pipeline
+    if (shader_cache_ && current_vertex_shader_ && current_pixel_shader_) {
+        current_pipeline_ = shader_cache_->get_pipeline(
+            current_vertex_shader_, current_pixel_shader_, key);
+        
+        if (current_pipeline_ != VK_NULL_HANDLE) {
+            vulkan_->bind_pipeline(current_pipeline_);
+            return true;
+        }
+    }
+    
+    // Fallback: use default pipeline from Vulkan backend if available
+    return true;  // Allow draw even without pipeline for testing
+}
+
+void CommandProcessor::bind_vertex_buffers(const DrawCommand& cmd) {
+    // For now, vertex data comes through fetch constants
+    // A full implementation would:
+    // 1. Parse vertex fetch constants to get buffer addresses and formats
+    // 2. Create/upload vertex buffers to GPU
+    // 3. Bind them with vkCmdBindVertexBuffers
+    
+    // The vertex shader uses vfetch instructions that read from fetch constants
+    // This is handled by the shader constants uniform buffer
+}
+
+void CommandProcessor::bind_index_buffer(const DrawCommand& cmd) {
+    if (!cmd.indexed || cmd.index_base == 0 || !memory_) {
+        return;
+    }
+    
+    // Get index data from guest memory
+    const void* index_data = memory_->get_host_ptr(cmd.index_base);
+    if (!index_data) {
+        LOGE("Failed to get host pointer for index buffer address %08x", cmd.index_base);
+        return;
+    }
+    
+    // Calculate index buffer size
+    u64 index_size = cmd.index_count * cmd.index_size;
+    
+    // Create and upload index buffer
+    // For now, this is a placeholder - a full implementation would
+    // cache index buffers and upload them efficiently
+    VulkanBuffer ib = vulkan_->create_buffer(
+        index_size,
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+    );
+    
+    if (ib.buffer != VK_NULL_HANDLE && ib.mapped) {
+        memcpy(ib.mapped, index_data, index_size);
+        
+        VkIndexType index_type = (cmd.index_size == 4) ? 
+                                  VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+        vulkan_->bind_index_buffer(ib.buffer, 0, index_type);
+        
+        // Note: In production, we'd cache this buffer and destroy it later
+        // For now, we're leaking it - a proper implementation needs buffer pooling
+    }
+}
+
+void CommandProcessor::update_constants() {
+    if (!descriptor_manager_) return;
+    
+    // Update vertex shader constants
+    descriptor_manager_->update_vertex_constants(
+        current_frame_index_, 
+        vertex_constants_.data(), 
+        static_cast<u32>(vertex_constants_.size())
+    );
+    
+    // Update pixel shader constants
+    descriptor_manager_->update_pixel_constants(
+        current_frame_index_,
+        pixel_constants_.data(),
+        static_cast<u32>(pixel_constants_.size())
+    );
+    
+    // Update bool constants
+    descriptor_manager_->update_bool_constants(
+        current_frame_index_,
+        bool_constants_.data(),
+        static_cast<u32>(bool_constants_.size())
+    );
+    
+    // Update loop constants
+    descriptor_manager_->update_loop_constants(
+        current_frame_index_,
+        loop_constants_.data(),
+        static_cast<u32>(loop_constants_.size())
+    );
+}
+
+void CommandProcessor::bind_textures() {
+    if (!texture_cache_ || !descriptor_manager_) return;
+    
+    std::array<VkImageView, 16> views{};
+    std::array<VkSampler, 16> samplers{};
+    u32 texture_count = 0;
+    
+    // Bind textures from fetch constants
+    for (u32 i = 0; i < 16; i++) {
+        const FetchConstant& fetch = texture_fetch_[i];
+        
+        // Check if this texture slot is used
+        if (fetch.texture_address() == 0) {
+            continue;
+        }
+        
+        // Get or create texture
+        const CachedTexture* tex = texture_cache_->get_texture(fetch);
+        if (tex && tex->is_valid()) {
+            views[i] = tex->view;
+            
+            // Get sampler (use default for now)
+            VkSamplerConfig sampler_config{};
+            sampler_config.min_filter = VK_FILTER_LINEAR;
+            sampler_config.mag_filter = VK_FILTER_LINEAR;
+            sampler_config.mipmap_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+            sampler_config.address_u = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+            sampler_config.address_v = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+            sampler_config.address_w = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+            sampler_config.max_anisotropy = 1.0f;
+            
+            samplers[i] = texture_cache_->get_sampler(sampler_config);
+            texture_count = i + 1;
+        }
+    }
+    
+    if (texture_count > 0) {
+        descriptor_manager_->bind_textures(
+            current_frame_index_,
+            views.data(),
+            samplers.data(),
+            texture_count
+        );
+    }
 }
 
 void CommandProcessor::on_register_write(u32 index, u32 value) {

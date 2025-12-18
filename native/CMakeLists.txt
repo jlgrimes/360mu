@@ -69,6 +69,7 @@ endif()
 # GPU sources - use stubs when Vulkan is not available
 if(X360MU_USE_VULKAN)
     set(GPU_SOURCES
+        src/gpu/xenos/gpu.cpp
         src/gpu/xenos/command_processor.cpp
         src/gpu/xenos/shader_translator.cpp
         src/gpu/xenos/spirv_builder.cpp
@@ -77,6 +78,10 @@ if(X360MU_USE_VULKAN)
         src/gpu/vulkan/vulkan_backend.cpp
         src/gpu/vulkan/memory_manager.cpp
         src/gpu/vulkan/swapchain.cpp
+        src/gpu/shader_cache.cpp
+        src/gpu/texture_cache.cpp
+        src/gpu/descriptor_manager.cpp
+        src/gpu/render_target.cpp
     )
 else()
     set(GPU_SOURCES
@@ -84,9 +89,9 @@ else()
     )
 endif()
 
-# APU sources - stub provides Apu class matching audio.h, xma_decoder provides XmaDecoder/AudioMixer/XmaProcessor
+# APU sources - full implementation with XMA decoder, mixer, and Android audio output
 set(APU_SOURCES
-    src/apu/stub/apu_stub.cpp
+    src/apu/apu.cpp
     src/apu/xma_decoder.cpp
     src/apu/android_audio.cpp
 )

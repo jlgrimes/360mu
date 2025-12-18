@@ -605,31 +605,60 @@ void Interpreter::exec_load_store(ThreadContext& ctx, const DecodedInst& d) {
                 addr += 4;
             }
             break;
-        case 48: // lfs
+        case 48: // lfs - Load Floating-Point Single
             {
                 u32 fval = read_u32(ctx, addr);
                 float f = *reinterpret_cast<float*>(&fval);
                 ctx.fpr[d.rd] = static_cast<f64>(f);
             }
             break;
-        case 50: // lfd
-            ctx.fpr[d.rd] = *reinterpret_cast<f64*>(&ctx.gpr[0]); // Temp
+        case 49: // lfsu - Load Floating-Point Single with Update
+            {
+                u32 fval = read_u32(ctx, addr);
+                float f = *reinterpret_cast<float*>(&fval);
+                ctx.fpr[d.rd] = static_cast<f64>(f);
+                ctx.gpr[d.ra] = addr;
+            }
+            break;
+        case 50: // lfd - Load Floating-Point Double
             {
                 u64 dval = read_u64(ctx, addr);
                 ctx.fpr[d.rd] = *reinterpret_cast<f64*>(&dval);
             }
             break;
-        case 52: // stfs
+        case 51: // lfdu - Load Floating-Point Double with Update
+            {
+                u64 dval = read_u64(ctx, addr);
+                ctx.fpr[d.rd] = *reinterpret_cast<f64*>(&dval);
+                ctx.gpr[d.ra] = addr;
+            }
+            break;
+        case 52: // stfs - Store Floating-Point Single
             {
                 float f = static_cast<float>(ctx.fpr[d.rs]);
                 u32 fval = *reinterpret_cast<u32*>(&f);
                 write_u32(ctx, addr, fval);
             }
             break;
-        case 54: // stfd
+        case 53: // stfsu - Store Floating-Point Single with Update
+            {
+                float f = static_cast<float>(ctx.fpr[d.rs]);
+                u32 fval = *reinterpret_cast<u32*>(&f);
+                write_u32(ctx, addr, fval);
+                ctx.gpr[d.ra] = addr;
+            }
+            break;
+        case 54: // stfd - Store Floating-Point Double
             {
                 u64 dval = *reinterpret_cast<u64*>(&ctx.fpr[d.rs]);
                 write_u64(ctx, addr, dval);
+            }
+            break;
+        case 55: // stfdu - Store Floating-Point Double with Update
+            {
+                u64 dval = *reinterpret_cast<u64*>(&ctx.fpr[d.rs]);
+                write_u64(ctx, addr, dval);
+                ctx.gpr[d.ra] = addr;
             }
             break;
             
@@ -875,6 +904,94 @@ void Interpreter::exec_system(ThreadContext& ctx, const DecodedInst& d) {
                 addr &= ~31; // Align to 32 bytes
                 memory_->zero_bytes(addr, 32);
             }
+            break;
+            
+        case DecodedInst::Type::TW:
+        case DecodedInst::Type::TD:
+            // Trap instructions - check condition and trigger exception if matched
+            {
+                // For now, just ignore traps (don't trigger exception)
+                // In a full implementation, we'd check the TO field and operands
+                LOGD("Trap instruction at 0x%08llX (ignored)", ctx.pc);
+            }
+            break;
+            
+        case DecodedInst::Type::CRLogical:
+            // CR logical operations (opcode 19)
+            {
+                u32 xo = (d.raw >> 1) & 0x3FF;
+                u32 crbD = (d.raw >> 21) & 0x1F;  // Target CR bit
+                u32 crbA = (d.raw >> 16) & 0x1F;  // Source CR bit A
+                u32 crbB = (d.raw >> 11) & 0x1F;  // Source CR bit B
+                
+                // Get CR bits (CR is stored as array of 4-bit fields)
+                auto get_crbit = [&](u32 bit) -> bool {
+                    u32 field = bit / 4;
+                    u32 pos = 3 - (bit % 4);
+                    return (ctx.cr[field].to_byte() >> pos) & 1;
+                };
+                
+                auto set_crbit = [&](u32 bit, bool val) {
+                    u32 field = bit / 4;
+                    u32 pos = 3 - (bit % 4);
+                    u8 byte = ctx.cr[field].to_byte();
+                    if (val) {
+                        byte |= (1 << pos);
+                    } else {
+                        byte &= ~(1 << pos);
+                    }
+                    ctx.cr[field].from_byte(byte);
+                };
+                
+                bool a = get_crbit(crbA);
+                bool b = get_crbit(crbB);
+                bool result = false;
+                
+                switch (xo) {
+                    case 257: // crand
+                        result = a && b;
+                        break;
+                    case 449: // cror
+                        result = a || b;
+                        break;
+                    case 225: // crnand
+                        result = !(a && b);
+                        break;
+                    case 33: // crnor
+                        result = !(a || b);
+                        break;
+                    case 193: // crxor
+                        result = a != b;
+                        break;
+                    case 289: // creqv
+                        result = a == b;
+                        break;
+                    case 129: // crandc
+                        result = a && !b;
+                        break;
+                    case 417: // crorc
+                        result = a || !b;
+                        break;
+                    case 0: // mcrf - Move CR field
+                        {
+                            u32 crfD = (d.raw >> 23) & 0x7;
+                            u32 crfS = (d.raw >> 18) & 0x7;
+                            ctx.cr[crfD] = ctx.cr[crfS];
+                        }
+                        return; // mcrf doesn't use crbD result
+                    default:
+                        LOGD("Unknown CR logical xo=%d at 0x%08llX", xo, ctx.pc);
+                        return;
+                }
+                
+                set_crbit(crbD, result);
+            }
+            break;
+            
+        case DecodedInst::Type::RFI:
+            // Return from interrupt - would restore MSR and jump to SRR0
+            // For HLE, we don't really use this
+            LOGD("RFI at 0x%08llX (ignored)", ctx.pc);
             break;
             
         default:

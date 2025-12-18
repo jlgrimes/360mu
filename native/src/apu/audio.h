@@ -38,9 +38,9 @@ struct XmaPacketHeader {
 };
 
 /**
- * XMA context (per-voice state)
+ * APU XMA context (per-voice state for APU internal use)
  */
-struct XmaContext {
+struct ApuXmaContext {
     // Control registers
     u32 input_buffer_ptr;
     u32 input_buffer_read_offset;
@@ -108,9 +108,9 @@ public:
     /**
      * XMA context management
      */
-    Status create_context(u32 index, const XmaContext& ctx);
+    Status create_context(u32 index, const ApuXmaContext& ctx);
     void destroy_context(u32 index);
-    XmaContext* get_context(u32 index);
+    ApuXmaContext* get_context(u32 index);
     
     /**
      * Voice management
@@ -148,7 +148,7 @@ private:
     ApuConfig config_;
     
     // XMA contexts (up to 256)
-    std::array<XmaContext, 256> xma_contexts_;
+    std::array<ApuXmaContext, 256> xma_contexts_;
     
     // Audio voices (up to 256)
     std::array<AudioVoice, 256> voices_;

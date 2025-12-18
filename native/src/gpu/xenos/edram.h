@@ -295,7 +295,6 @@ public:
      */
     static u32 get_tiled_offset_3d(u32 x, u32 y, u32 z, u32 width, u32 height, u32 bpp);
     
-private:
     // Xbox 360 texture tiling uses a modified Morton curve (Z-order curve)
     static u32 morton_encode(u32 x, u32 y);
     static void morton_decode(u32 code, u32& x, u32& y);

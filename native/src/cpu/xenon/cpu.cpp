@@ -6,6 +6,7 @@
 
 #include "cpu.h"
 #include "memory/memory.h"
+#include "kernel/kernel.h"
 
 #ifdef X360MU_JIT_ENABLED
 #include "../jit/jit.h"
@@ -121,6 +122,25 @@ void Cpu::execute_thread(u32 thread_id, u64 cycles) {
     
     // Interpreter fallback
     interpreter_->execute(ctx, cycles);
+    
+    // Check for syscall after execution
+    if (ctx.interrupted) {
+        ctx.interrupted = false;
+        dispatch_syscall(ctx);
+    }
+}
+
+void Cpu::dispatch_syscall(ThreadContext& ctx) {
+    // r0 contains: (module_id << 16) | ordinal
+    // This encoding is set up by the import thunks (Task A.4)
+    u32 ordinal = ctx.gpr[0] & 0xFFFF;
+    u32 module = (ctx.gpr[0] >> 16) & 0xFF;
+    
+    if (kernel_) {
+        kernel_->handle_syscall(ordinal, module);
+    } else {
+        LOGE("Syscall with no kernel: module=%u, ordinal=%u", module, ordinal);
+    }
 }
 
 Status Cpu::start_thread(u32 thread_id, GuestAddr entry_point, GuestAddr stack) {

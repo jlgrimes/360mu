@@ -19,6 +19,7 @@ namespace x360mu {
 
 class Memory;
 class JitCompiler;
+class Kernel;
 
 /**
  * CPU configuration
@@ -323,8 +324,19 @@ public:
      */
     bool any_running() const;
     
+    /**
+     * Set kernel pointer for syscall dispatch
+     */
+    void set_kernel(Kernel* kernel) { kernel_ = kernel; }
+    
+    /**
+     * Dispatch syscall to kernel HLE
+     */
+    void dispatch_syscall(ThreadContext& ctx);
+    
 private:
     Memory* memory_ = nullptr;
+    Kernel* kernel_ = nullptr;
     CpuConfig config_;
     
     // Thread contexts

@@ -176,7 +176,8 @@ int main(int argc, char** argv) {
             exports = &XAM_EXPORTS;
         }
         
-        for (u32 ordinal : lib.imports) {
+        for (const auto& entry : lib.imports) {
+            u32 ordinal = entry.ordinal;
             std::string name = "ordinal_" + std::to_string(ordinal);
             if (exports) {
                 auto it = exports->find(ordinal);

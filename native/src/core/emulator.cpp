@@ -131,6 +131,10 @@ Status Emulator::initialize(const EmulatorConfig& config) {
         return status;
     }
     
+    // Connect kernel to CPU for syscall dispatch
+    cpu_->set_kernel(kernel_.get());
+    LOGI("Connected kernel to CPU for syscall dispatch");
+    
     // Create emulation thread controller
     emu_thread_ = std::make_unique<EmulationThread>();
     

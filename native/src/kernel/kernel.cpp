@@ -101,6 +101,9 @@ Status Kernel::load_xex(const std::string& path) {
          modules_.back().base_address,
          modules_.back().entry_point);
     
+    // Install import thunks for syscall handling
+    install_import_thunks(*xex_module);
+    
     return Status::Ok;
 }
 
@@ -271,6 +274,87 @@ Status Kernel::load_xex_image(const std::vector<u8>& /*data*/, LoadedModule& /*m
 
 Status Kernel::resolve_imports(LoadedModule& /*module*/) {
     return Status::NotImplemented;
+}
+
+void Kernel::install_import_thunks(const XexModule& module) {
+    LOGI("Installing import thunks for %zu libraries", module.imports.size());
+    
+    // Thunk area base - allocate space above the loaded image
+    // We'll place generated thunks here if the XEX doesn't specify thunk addresses
+    GuestAddr thunk_area_base = module.base_address + module.image_size;
+    thunk_area_base = (thunk_area_base + 0xFFF) & ~0xFFFu;  // Align to 4KB
+    GuestAddr thunk_ptr = thunk_area_base;
+    
+    u32 total_thunks = 0;
+    
+    for (const auto& lib : module.imports) {
+        // Determine module ID based on library name
+        u32 module_id = 0;
+        if (lib.name == "xboxkrnl.exe" || lib.name.find("xboxkrnl") != std::string::npos) {
+            module_id = 0;
+        } else if (lib.name == "xam.xex" || lib.name.find("xam") != std::string::npos) {
+            module_id = 1;
+        } else {
+            module_id = 2; // Unknown/other
+        }
+        
+        LOGI("  Library: %s (module_id=%u, %zu imports)", 
+             lib.name.c_str(), module_id, lib.imports.size());
+
+        for (size_t i = 0; i < lib.imports.size(); i++) {
+            u32 thunk_addr = lib.imports[i].thunk_address;
+            u32 ordinal = lib.imports[i].ordinal;
+            
+            // If no thunk address specified, allocate one
+            if (thunk_addr == 0) {
+                thunk_addr = thunk_ptr;
+                thunk_ptr += 16;  // Each thunk needs up to 16 bytes
+            }
+
+            // Encode: (module_id << 16) | ordinal
+            u32 encoded = (module_id << 16) | (ordinal & 0xFFFF);
+
+            // Write thunk code:
+            // For values <= 0x7FFF: li r0, encoded (single instruction)
+            // For larger values: lis r0, high16; ori r0, r0, low16
+            u32 write_addr = thunk_addr;
+            
+            if (encoded <= 0x7FFF) {
+                // li r0, encoded (addi r0, 0, encoded)
+                // PowerPC: addi rD, rA, SIMM -> 001110 DDDDD AAAAA SSSSSSSSSSSSSSSS
+                // For li r0, imm: opcode=14, rD=0, rA=0, SIMM=encoded
+                u32 li_inst = 0x38000000 | (encoded & 0xFFFF);
+                memory_->write_u32(write_addr, li_inst);
+                write_addr += 4;
+            } else {
+                // lis r0, high16 (addis r0, 0, high16)
+                // PowerPC: addis rD, rA, SIMM -> 001111 DDDDD AAAAA SSSSSSSSSSSSSSSS
+                u32 lis_inst = 0x3C000000 | ((encoded >> 16) & 0xFFFF);
+                memory_->write_u32(write_addr, lis_inst);
+                write_addr += 4;
+                
+                // ori r0, r0, low16
+                // PowerPC: ori rA, rS, UIMM -> 011000 SSSSS AAAAA UUUUUUUUUUUUUUUU
+                u32 ori_inst = 0x60000000 | (encoded & 0xFFFF);
+                memory_->write_u32(write_addr, ori_inst);
+                write_addr += 4;
+            }
+
+            // Write: sc (syscall instruction)
+            // PowerPC sc: 010001 00000 00000 0000000000000010 -> 0x44000002
+            memory_->write_u32(write_addr, 0x44000002);
+            write_addr += 4;
+
+            // Write: blr (branch to link register - return)
+            // PowerPC blr: 010011 00000 00000 00000 0000010000 0 -> 0x4E800020
+            memory_->write_u32(write_addr, 0x4E800020);
+            
+            total_thunks++;
+        }
+    }
+    
+    LOGI("Installed %u import thunks (thunk area: 0x%08X - 0x%08X)", 
+         total_thunks, thunk_area_base, thunk_ptr);
 }
 
 //=============================================================================

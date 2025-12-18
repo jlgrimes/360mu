@@ -156,6 +156,7 @@ enum ExtOp31 {
     XO31_DIVD = 489,
     XO31_DIVW = 491,
     XO31_LWBRX = 534,
+    XO31_STWBRX = 662,
     XO31_LFSX = 535,
     XO31_SRW = 536,
     XO31_SRD = 539,
@@ -183,6 +184,16 @@ enum ExtOp31 {
     XO31_EXTSW = 986,
     XO31_ICBI = 982,
     XO31_DCBZ = 1014,
+    XO31_LWAX = 341,
+    XO31_LWAUX = 373,
+    XO31_LDBRX = 532,
+    XO31_LSWX = 533,
+    XO31_STDBRX = 660,
+    XO31_STSWX = 725,
+    XO31_POPCNTB = 122,
+    XO31_POPCNTW = 378,
+    XO31_POPCNTD = 506,
+    XO31_CMPB = 508,
 };
 
 // Bit extraction helpers
@@ -517,7 +528,26 @@ DecodedInst Decoder::decode(u32 inst) {
                 case XO31_EXTSB:
                 case XO31_EXTSH:
                 case XO31_EXTSW:
+                case XO31_POPCNTB:
+                case XO31_POPCNTW:
+                case XO31_POPCNTD:
+                case XO31_CMPB:
                     d.type = DecodedInst::Type::And;
+                    break;
+                    
+                case XO31_LWAX:
+                case XO31_LWAUX:
+                case XO31_LDBRX:
+                case XO31_LSWX:
+                case XO31_LSWI:
+                    d.type = DecodedInst::Type::Load;
+                    break;
+                    
+                case XO31_STDBRX:
+                case XO31_STSWX:
+                case XO31_STSWI:
+                case XO31_STHBRX:
+                    d.type = DecodedInst::Type::Store;
                     break;
                     
                 case XO31_NEG:

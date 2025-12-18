@@ -160,15 +160,7 @@ enum class FetchOp : u8 {
     UnknownTextureOp = 27,
 };
 
-/**
- * Texture dimension
- */
-enum class TextureDimension : u8 {
-    k1D = 0,
-    k2D = 1,
-    k3D = 2,
-    kCube = 3,
-};
+// TextureDimension is defined in texture.h
 
 /**
  * Swizzle component values
@@ -672,6 +664,11 @@ public:
      */
     ShaderInfo analyze(const void* microcode, u32 size, ShaderType type);
     
+    /**
+     * Compute hash of shader microcode (for caching)
+     */
+    static u64 compute_hash(const void* data, u32 size);
+    
 private:
     std::string cache_path_;
     std::unordered_map<u64, std::vector<u32>> cache_;
@@ -835,7 +832,6 @@ private:
     u32 emit_cube_vector(TranslationContext& ctx, u32 src0, u32 src1);
     
     // Utility
-    static u64 compute_hash(const void* data, u32 size);
     ShaderInfo analyze_shader(const ShaderMicrocode& microcode);
     
     // Helper to get constant register value  

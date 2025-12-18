@@ -67,9 +67,11 @@ enum class TextureFormat : u8 {
     k_DXT3A = 39,
     k_DXT5A = 40,         // BC4
     k_CTX1 = 41,          // Xbox 360 specific
-    k_DXT3A_AS_1_1_1_1 = 42,
-    k_8_8_8_8_GAMMA = 43,
-    k_2_10_10_10_GAMMA = 44,
+    k_DXN = 42,           // BC5 - two-channel normal map compression
+    k_DXT3A_AS_1_1_1_1 = 43,
+    k_8_8_8_8_GAMMA = 44,
+    k_2_10_10_10_GAMMA = 45,
+    k_16 = 46,  // 16-bit single channel
 };
 
 /**

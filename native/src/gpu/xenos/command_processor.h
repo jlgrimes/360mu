@@ -16,6 +16,7 @@
 
 #include "x360mu/types.h"
 #include "gpu.h"
+#include <vulkan/vulkan.h>
 #include <vector>
 #include <functional>
 #include <array>
@@ -25,7 +26,11 @@ namespace x360mu {
 class Memory;
 class VulkanBackend;
 class ShaderTranslator;
-class TextureCache;
+class TextureCacheImpl;
+class ShaderCache;
+class DescriptorManager;
+struct CachedShader;
+struct CachedTexture;
 
 /**
  * GPU packet types (bits 30-31 of header)
@@ -170,7 +175,9 @@ public:
      */
     Status initialize(Memory* memory, VulkanBackend* vulkan,
                      ShaderTranslator* shader_translator,
-                     TextureCache* texture_cache);
+                     TextureCacheImpl* texture_cache,
+                     ShaderCache* shader_cache = nullptr,
+                     DescriptorManager* descriptor_manager = nullptr);
     
     /**
      * Shutdown
@@ -245,7 +252,17 @@ private:
     Memory* memory_ = nullptr;
     VulkanBackend* vulkan_ = nullptr;
     ShaderTranslator* shader_translator_ = nullptr;
-    TextureCache* texture_cache_ = nullptr;
+    TextureCacheImpl* texture_cache_ = nullptr;
+    ShaderCache* shader_cache_ = nullptr;
+    DescriptorManager* descriptor_manager_ = nullptr;
+    
+    // Current frame index for descriptor management
+    u32 current_frame_index_ = 0;
+    
+    // Cached shaders for current draw
+    const CachedShader* current_vertex_shader_ = nullptr;
+    const CachedShader* current_pixel_shader_ = nullptr;
+    VkPipeline current_pipeline_ = VK_NULL_HANDLE;
     
     // GPU registers (complete register file)
     std::array<u32, 0x10000> registers_;
@@ -319,6 +336,14 @@ private:
     // Draw execution
     void execute_draw(const DrawCommand& cmd);
     
+    // Shader and pipeline management
+    bool prepare_shaders();
+    bool prepare_pipeline(const DrawCommand& cmd);
+    void bind_vertex_buffers(const DrawCommand& cmd);
+    void bind_index_buffer(const DrawCommand& cmd);
+    void update_constants();
+    void bind_textures();
+    
     // Register side effects
     void on_register_write(u32 index, u32 value);
     
@@ -326,101 +351,10 @@ private:
     void process_type0_write(u32 base_reg, const u32* data, u32 count);
     
     // Helper to read command buffer
-    u32 read_cmd(GuestAddr addr) { 
-        if (memory_) {
-            return memory_->read_u32(addr); 
-        }
-        return 0;
-    }
+    u32 read_cmd(GuestAddr addr);
 };
 
-/**
- * Xenos shader microcode parser
- */
-class ShaderMicrocode {
-public:
-    /**
-     * Parse shader from memory
-     */
-    Status parse(const void* data, u32 size, ShaderType type);
-    
-    /**
-     * Get shader type
-     */
-    ShaderType type() const { return type_; }
-    
-    /**
-     * Get instruction count
-     */
-    u32 instruction_count() const { return instructions_.size(); }
-    
-    /**
-     * ALU instruction encoding
-     */
-    struct AluInstruction {
-        u32 words[3];  // 96-bit instruction
-        
-        // Decoded fields
-        u8 scalar_opcode;
-        u8 vector_opcode;
-        u8 dest_reg;
-        u8 src_regs[3];
-        bool abs[3];
-        bool negate[3];
-        u8 write_mask;
-        bool export_data;
-        u8 export_type;
-    };
-    
-    /**
-     * Fetch instruction encoding
-     */
-    struct FetchInstruction {
-        u32 words[3];  // 96-bit instruction
-        
-        // Decoded fields
-        u8 opcode;
-        u8 dest_reg;
-        u8 src_reg;
-        u8 const_index;
-        u8 fetch_type;  // Vertex or texture
-        u32 offset;
-        u8 data_format;
-        bool signed_rf;
-        u8 num_format;
-        u8 stride;
-    };
-    
-    /**
-     * Control flow instruction
-     */
-    struct ControlFlowInstruction {
-        u32 word;
-        
-        u8 opcode;
-        u16 address;
-        u8 count;
-        bool end_of_shader;
-        bool predicated;
-        bool condition;
-    };
-    
-    // Access decoded instructions
-    const std::vector<ControlFlowInstruction>& cf_instructions() const { return cf_instructions_; }
-    const std::vector<AluInstruction>& alu_instructions() const { return alu_instructions_; }
-    const std::vector<FetchInstruction>& fetch_instructions() const { return fetch_instructions_; }
-    
-private:
-    ShaderType type_;
-    std::vector<ControlFlowInstruction> cf_instructions_;
-    std::vector<AluInstruction> alu_instructions_;
-    std::vector<FetchInstruction> fetch_instructions_;
-    std::vector<u32> instructions_;
-    
-    void decode_control_flow();
-    void decode_alu_clause(u32 address, u32 count);
-    void decode_fetch_clause(u32 address, u32 count);
-};
+// ShaderMicrocode is defined in shader_translator.h
 
 } // namespace x360mu
 

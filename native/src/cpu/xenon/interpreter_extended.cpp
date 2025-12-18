@@ -357,10 +357,33 @@ void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
         case 826: // sradi
         case 827: // sradi (sh[5] = 1)
             {
-                s64 val = static_cast<s64>(ra);
-                u32 shift = d.sh | ((d.xo & 1) << 5); // sh is 6 bits
-                result = val >> shift;
-                ctx.xer.ca = (val < 0) && ((val & ((1ULL << shift) - 1)) != 0);
+                u64 rs = ctx.gpr[d.rd];  // Source register is RS (bits 6-10)
+                s64 val = static_cast<s64>(rs);
+                // 6-bit shift: sh[0:4] in bits 16-20, sh[5] in bit 30 (part of xo)
+                u32 shift = ((d.raw >> 11) & 0x1F) | (((d.raw >> 1) & 1) << 5);
+                if (shift == 0) {
+                    result = val;
+                    ctx.xer.ca = false;
+                } else {
+                    result = val >> shift;
+                    ctx.xer.ca = (val < 0) && ((val & ((1ULL << shift) - 1)) != 0);
+                }
+                ctx.gpr[d.ra] = result;  // Destination is RA (bits 11-15)
+            }
+            break;
+            
+        case 413: // sradi (another form - XO=413 for extended instructions)
+            {
+                u64 rs = ctx.gpr[d.rd];
+                s64 val = static_cast<s64>(rs);
+                u32 shift = ((d.raw >> 11) & 0x1F) | (((d.raw >> 1) & 1) << 5);
+                if (shift == 0) {
+                    result = val;
+                    ctx.xer.ca = false;
+                } else {
+                    result = val >> shift;
+                    ctx.xer.ca = (val < 0) && ((val & ((1ULL << shift) - 1)) != 0);
+                }
                 ctx.gpr[d.ra] = result;
             }
             break;
@@ -379,6 +402,59 @@ void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
                 result = ra ? __builtin_clzll(ra) : 64;
                 ctx.gpr[d.ra] = result;
             }
+            break;
+            
+        case 122: // popcntb - Population Count Bytes
+            {
+                // Count bits set in each byte of the source register
+                u64 rs = ctx.gpr[d.rd];  // Source register
+                result = 0;
+                for (int i = 0; i < 8; i++) {
+                    u8 byte = (rs >> (i * 8)) & 0xFF;
+                    u8 count = __builtin_popcount(byte);
+                    result |= static_cast<u64>(count) << (i * 8);
+                }
+                ctx.gpr[d.ra] = result;
+            }
+            break;
+            
+        case 378: // popcntw - Population Count Word
+            {
+                u64 rs = ctx.gpr[d.rd];
+                // Count bits in lower and upper 32-bit words separately
+                u32 lo = __builtin_popcount(static_cast<u32>(rs));
+                u32 hi = __builtin_popcount(static_cast<u32>(rs >> 32));
+                result = (static_cast<u64>(hi) << 32) | lo;
+                ctx.gpr[d.ra] = result;
+            }
+            break;
+            
+        case 506: // popcntd - Population Count Doubleword
+            {
+                u64 rs = ctx.gpr[d.rd];
+                result = __builtin_popcountll(rs);
+                ctx.gpr[d.ra] = result;
+            }
+            break;
+            
+        case 508: // cmpb - Compare Bytes
+            {
+                // For each byte position, if bytes match set result byte to 0xFF, else 0x00
+                u64 rs = ctx.gpr[d.rd];
+                result = 0;
+                for (int i = 0; i < 8; i++) {
+                    u8 byte_a = (rs >> (i * 8)) & 0xFF;
+                    u8 byte_b = (rb >> (i * 8)) & 0xFF;
+                    if (byte_a == byte_b) {
+                        result |= 0xFFULL << (i * 8);
+                    }
+                }
+                ctx.gpr[d.ra] = result;
+            }
+            break;
+            
+        case 954 + 64: // prtyw - Parity Word (XO=1018, but overlaps, use different)
+            // Note: prtyw is XO=154
             break;
             
         // --- Sign extension ---
@@ -483,6 +559,21 @@ void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
             }
             break;
             
+        case 341: // lwax - Load Word Algebraic Indexed
+            {
+                GuestAddr addr = (d.ra ? ctx.gpr[d.ra] : 0) + ctx.gpr[d.rb];
+                ctx.gpr[d.rd] = static_cast<s64>(static_cast<s32>(read_u32(ctx, addr)));
+            }
+            break;
+            
+        case 373: // lwaux - Load Word Algebraic with Update Indexed
+            {
+                GuestAddr addr = ctx.gpr[d.ra] + ctx.gpr[d.rb];
+                ctx.gpr[d.rd] = static_cast<s64>(static_cast<s32>(read_u32(ctx, addr)));
+                ctx.gpr[d.ra] = addr;
+            }
+            break;
+            
         case 21: // ldx
             {
                 GuestAddr addr = (d.ra ? ctx.gpr[d.ra] : 0) + ctx.gpr[d.rb];
@@ -570,12 +661,66 @@ void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
             }
             break;
             
-        case 790: // lhbrx
+        case 790: // lhbrx - Load Halfword Byte-Reverse Indexed
             {
                 GuestAddr addr = (d.ra ? ctx.gpr[d.ra] : 0) + ctx.gpr[d.rb];
                 u16 val = read_u16(ctx, addr);
                 val = ((val >> 8) & 0xFF) | ((val << 8) & 0xFF00);
                 ctx.gpr[d.rd] = val;
+            }
+            break;
+            
+        case 532: // ldbrx - Load Doubleword Byte-Reverse Indexed
+            {
+                GuestAddr addr = (d.ra ? ctx.gpr[d.ra] : 0) + ctx.gpr[d.rb];
+                u64 val = read_u64(ctx, addr);
+                // Byte reverse 64-bit value
+                val = ((val >> 56) & 0xFF) |
+                      ((val >> 40) & 0xFF00) |
+                      ((val >> 24) & 0xFF0000) |
+                      ((val >> 8)  & 0xFF000000ULL) |
+                      ((val << 8)  & 0xFF00000000ULL) |
+                      ((val << 24) & 0xFF0000000000ULL) |
+                      ((val << 40) & 0xFF000000000000ULL) |
+                      ((val << 56) & 0xFF00000000000000ULL);
+                ctx.gpr[d.rd] = val;
+            }
+            break;
+            
+        case 662: // stwbrx - Store Word Byte-Reverse Indexed
+            {
+                GuestAddr addr = (d.ra ? ctx.gpr[d.ra] : 0) + ctx.gpr[d.rb];
+                u32 val = static_cast<u32>(ctx.gpr[d.rs]);
+                // Byte reverse
+                val = ((val >> 24) & 0xFF) | ((val >> 8) & 0xFF00) |
+                      ((val << 8) & 0xFF0000) | ((val << 24) & 0xFF000000);
+                write_u32(ctx, addr, val);
+            }
+            break;
+            
+        case 918: // sthbrx - Store Halfword Byte-Reverse Indexed
+            {
+                GuestAddr addr = (d.ra ? ctx.gpr[d.ra] : 0) + ctx.gpr[d.rb];
+                u16 val = static_cast<u16>(ctx.gpr[d.rs]);
+                val = ((val >> 8) & 0xFF) | ((val << 8) & 0xFF00);
+                write_u16(ctx, addr, val);
+            }
+            break;
+            
+        case 660: // stdbrx - Store Doubleword Byte-Reverse Indexed
+            {
+                GuestAddr addr = (d.ra ? ctx.gpr[d.ra] : 0) + ctx.gpr[d.rb];
+                u64 val = ctx.gpr[d.rs];
+                // Byte reverse 64-bit value
+                val = ((val >> 56) & 0xFF) |
+                      ((val >> 40) & 0xFF00) |
+                      ((val >> 24) & 0xFF0000) |
+                      ((val >> 8)  & 0xFF000000ULL) |
+                      ((val << 8)  & 0xFF00000000ULL) |
+                      ((val << 24) & 0xFF0000000000ULL) |
+                      ((val << 40) & 0xFF000000000000ULL) |
+                      ((val << 56) & 0xFF00000000000000ULL);
+                write_u64(ctx, addr, val);
             }
             break;
             
@@ -770,6 +915,23 @@ void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
             }
             break;
             
+        case 371: // mftb - Move From Time Base
+            {
+                u32 tbr = ((d.raw >> 16) & 0x1F) | ((d.raw >> 6) & 0x3E0);
+                switch (tbr) {
+                    case 268: // TBL
+                        ctx.gpr[d.rd] = memory_->get_time_base() & 0xFFFFFFFF;
+                        break;
+                    case 269: // TBU
+                        ctx.gpr[d.rd] = memory_->get_time_base() >> 32;
+                        break;
+                    default:
+                        ctx.gpr[d.rd] = 0;
+                        break;
+                }
+            }
+            break;
+            
         // --- Cache/sync operations ---
         case 598: // sync
         case 854: // eieio
@@ -795,6 +957,89 @@ void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
             
         case 982: // icbi
             // Instruction cache invalidate - would invalidate JIT blocks
+            break;
+            
+        // --- String Instructions ---
+        case 597: // lswi - Load String Word Immediate
+            {
+                GuestAddr addr = (d.ra ? ctx.gpr[d.ra] : 0);
+                u32 nb = d.rb ? d.rb : 32; // 0 means 32 bytes
+                u32 r = d.rd;
+                u32 i = 0;
+                while (nb > 0) {
+                    if (i == 0) {
+                        ctx.gpr[r] = 0;
+                    }
+                    u8 byte = read_u8(ctx, addr++);
+                    ctx.gpr[r] |= static_cast<u64>(byte) << (56 - i * 8);
+                    i++;
+                    nb--;
+                    if (i == 8) {
+                        i = 0;
+                        r = (r + 1) % 32;
+                    }
+                }
+            }
+            break;
+            
+        case 533: // lswx - Load String Word Indexed
+            {
+                GuestAddr addr = (d.ra ? ctx.gpr[d.ra] : 0) + ctx.gpr[d.rb];
+                u32 nb = ctx.xer.byte_count;
+                u32 r = d.rd;
+                u32 i = 0;
+                while (nb > 0) {
+                    if (i == 0) {
+                        ctx.gpr[r] = 0;
+                    }
+                    u8 byte = read_u8(ctx, addr++);
+                    ctx.gpr[r] |= static_cast<u64>(byte) << (56 - i * 8);
+                    i++;
+                    nb--;
+                    if (i == 8) {
+                        i = 0;
+                        r = (r + 1) % 32;
+                    }
+                }
+            }
+            break;
+            
+        case 661: // stswi - Store String Word Immediate
+            {
+                GuestAddr addr = (d.ra ? ctx.gpr[d.ra] : 0);
+                u32 nb = d.rb ? d.rb : 32; // 0 means 32 bytes
+                u32 r = d.rs;
+                u32 i = 0;
+                while (nb > 0) {
+                    u8 byte = (ctx.gpr[r] >> (56 - i * 8)) & 0xFF;
+                    write_u8(ctx, addr++, byte);
+                    i++;
+                    nb--;
+                    if (i == 8) {
+                        i = 0;
+                        r = (r + 1) % 32;
+                    }
+                }
+            }
+            break;
+            
+        case 725: // stswx - Store String Word Indexed
+            {
+                GuestAddr addr = (d.ra ? ctx.gpr[d.ra] : 0) + ctx.gpr[d.rb];
+                u32 nb = ctx.xer.byte_count;
+                u32 r = d.rs;
+                u32 i = 0;
+                while (nb > 0) {
+                    u8 byte = (ctx.gpr[r] >> (56 - i * 8)) & 0xFF;
+                    write_u8(ctx, addr++, byte);
+                    i++;
+                    nb--;
+                    if (i == 8) {
+                        i = 0;
+                        r = (r + 1) % 32;
+                    }
+                }
+            }
             break;
             
         // --- Vector load/store (basic) ---

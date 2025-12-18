@@ -7,6 +7,7 @@
 #pragma once
 
 #include "x360mu/types.h"
+#include "texture.h"  // For TextureFormat, TextureDimension
 #include <memory>
 #include <string>
 #include <vector>
@@ -143,17 +144,17 @@ namespace xenos_reg {
     constexpr u32 PA_SC_CLIPRECT_0_BR = 0x2087;
     constexpr u32 PA_SC_VIZ_QUERY = 0x20C0;
     
-    // Setup unit
-    constexpr u32 PA_SU_SC_MODE_CNTL = 0x2200;
-    constexpr u32 PA_SU_POLY_OFFSET_FRONT_SCALE = 0x2201;
-    constexpr u32 PA_SU_POLY_OFFSET_FRONT_OFFSET = 0x2202;
-    constexpr u32 PA_SU_POLY_OFFSET_BACK_SCALE = 0x2203;
-    constexpr u32 PA_SU_POLY_OFFSET_BACK_OFFSET = 0x2204;
-    constexpr u32 PA_SU_POINT_SIZE = 0x2205;
-    constexpr u32 PA_SU_POINT_MINMAX = 0x2206;
-    constexpr u32 PA_SU_LINE_CNTL = 0x2207;
-    constexpr u32 PA_SU_VTX_CNTL = 0x2208;
-    constexpr u32 PA_SU_PERFCOUNTER0_SELECT = 0x2300;
+    // Setup unit  
+    constexpr u32 PA_SU_SC_MODE_CNTL = 0x2280;
+    constexpr u32 PA_SU_POLY_OFFSET_FRONT_SCALE = 0x2281;
+    constexpr u32 PA_SU_POLY_OFFSET_FRONT_OFFSET = 0x2282;
+    constexpr u32 PA_SU_POLY_OFFSET_BACK_SCALE = 0x2283;
+    constexpr u32 PA_SU_POLY_OFFSET_BACK_OFFSET = 0x2284;
+    constexpr u32 PA_SU_POINT_SIZE = 0x2285;
+    constexpr u32 PA_SU_POINT_MINMAX = 0x2286;
+    constexpr u32 PA_SU_LINE_CNTL = 0x2287;
+    constexpr u32 PA_SU_VTX_CNTL = 0x2288;
+    constexpr u32 PA_SU_PERFCOUNTER0_SELECT = 0x2290;
     
     // eDRAM
     constexpr u32 RB_EDRAM_BASE = 0x0040;
@@ -168,36 +169,7 @@ enum class ShaderType {
     Pixel
 };
 
-/**
- * Xenos texture format
- */
-enum class TextureFormat : u32 {
-    k_8 = 2,                    // DXT1
-    k_1_5_5_5 = 3,
-    k_5_6_5 = 4,
-    k_6_5_5 = 5,
-    k_8_8_8_8 = 6,
-    k_2_10_10_10 = 7,
-    k_8_A = 10,
-    k_8_B = 11,
-    k_8_8 = 12,
-    k_Cr_Y1_Cb_Y0 = 13,
-    k_Y1_Cr_Y0_Cb = 14,
-    k_DXT1 = 18,
-    k_DXT2_3 = 19,
-    k_DXT4_5 = 20,
-    k_CTX1 = 27,
-    k_DXN = 28,
-    k_16 = 36,
-    k_16_16 = 37,
-    k_16_16_16_16 = 38,
-    k_16_FLOAT = 48,
-    k_16_16_FLOAT = 49,
-    k_16_16_16_16_FLOAT = 50,
-    k_32_FLOAT = 54,
-    k_32_32_FLOAT = 55,
-    k_32_32_32_32_FLOAT = 56,
-};
+// TextureFormat is defined in texture.h
 
 /**
  * Surface format for render targets
@@ -211,8 +183,13 @@ enum class SurfaceFormat : u32 {
     k_16_16_16_16 = 5,
     k_16_16_FLOAT = 6,
     k_16_16_16_16_FLOAT = 7,
+    k_5_6_5 = 8,
+    k_6_5_5 = 9,
     k_32_FLOAT = 10,
     k_32_32_FLOAT = 11,
+    k_32_32_32_32_FLOAT = 12,
+    k_1_5_5_5 = 14,
+    k_4_4_4_4 = 15,
 };
 
 /**
@@ -417,81 +394,9 @@ private:
     void update_textures();
 };
 
-/**
- * Shader translator - converts Xenos shaders to SPIR-V
- */
-class ShaderTranslator {
-public:
-    ShaderTranslator();
-    ~ShaderTranslator();
-    
-    /**
-     * Translate a Xenos shader to SPIR-V
-     */
-    std::vector<u32> translate(
-        const void* microcode,
-        u32 size,
-        ShaderType type
-    );
-    
-    /**
-     * Get cached SPIR-V for shader hash
-     */
-    const std::vector<u32>* get_cached(u64 hash) const;
-    
-    /**
-     * Cache translated shader
-     */
-    void cache(u64 hash, std::vector<u32> spirv);
-    
-private:
-    std::unordered_map<u64, std::vector<u32>> cache_;
-    
-    // Translation helpers
-    void decode_alu_instruction(u32 instr);
-    void decode_fetch_instruction(u32 instr);
-    void emit_spirv_header(std::vector<u32>& out);
-    void emit_spirv_body(std::vector<u32>& out);
-};
-
-/**
- * Texture cache - manages GPU textures
- */
-class TextureCache {
-public:
-    TextureCache();
-    ~TextureCache();
-    
-    /**
-     * Get or create texture for fetch constant
-     */
-    void* get_texture(const FetchConstant& fetch, Memory* memory);
-    
-    /**
-     * Invalidate textures in address range
-     */
-    void invalidate(GuestAddr base, u64 size);
-    
-    /**
-     * Clear all cached textures
-     */
-    void clear();
-    
-private:
-    struct CachedTexture {
-        u64 hash;
-        GuestAddr address;
-        u32 width, height;
-        TextureFormat format;
-        void* vulkan_texture;
-    };
-    
-    std::vector<CachedTexture> textures_;
-    
-    // Format conversion
-    void detile_texture(const void* src, void* dst, u32 width, u32 height, TextureFormat format);
-    void convert_format(const void* src, void* dst, u32 width, u32 height, TextureFormat src_format);
-};
+// Forward declarations - real implementations in shader_translator.h and texture.h
+// class ShaderTranslator - see shader_translator.h
+// class TextureCache - see texture.h
 
 } // namespace x360mu
 

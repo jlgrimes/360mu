@@ -55,6 +55,17 @@ namespace spv {
     constexpr u32 DecorationBuiltIn = 11;
     constexpr u32 DecorationBlock = 2;
     constexpr u32 DecorationOffset = 35;
+    constexpr u32 DecorationFlat = 14;
+    constexpr u32 DecorationNoPerspective = 13;
+    
+    // Sampler/Image dimension
+    constexpr u32 Dim1D = 0;
+    constexpr u32 Dim2D = 1;
+    constexpr u32 Dim3D = 2;
+    constexpr u32 DimCube = 3;
+    constexpr u32 DimRect = 4;
+    constexpr u32 DimBuffer = 5;
+    constexpr u32 DimSubpassData = 6;
     
     // BuiltIn values
     constexpr u32 BuiltInPosition = 0;

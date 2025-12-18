@@ -132,6 +132,14 @@ struct XexTlsInfo {
 };
 
 /**
+ * Single import entry info
+ */
+struct XexImportEntry {
+    u32 ordinal;        // Function ordinal within the library
+    u32 thunk_address;  // Address where thunk should be written
+};
+
+/**
  * Import library info
  */
 struct XexImportLibrary {
@@ -140,7 +148,7 @@ struct XexImportLibrary {
     u32 version;
     u8 digest[20];
     u32 import_count;
-    std::vector<u32> imports;  // Import addresses/ordinals
+    std::vector<XexImportEntry> imports;  // Import entries with ordinal and thunk address
 };
 
 /**

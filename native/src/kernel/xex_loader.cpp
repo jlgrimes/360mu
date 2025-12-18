@@ -422,16 +422,41 @@ Status XexLoader::parse_import_libraries(const u8* data, u32 offset, u32 data_si
             lib.name = "<unknown>";
         }
         
-        // Read import addresses/ordinals
-        // Each import is 4 bytes - the value encodes the thunk address or ordinal info
+        // Read import records
+        // Each import is 8 bytes: 4 bytes ordinal/type + 4 bytes thunk address
+        // Some XEX files use a different format with only 4 bytes per import
+        // We'll try to detect and handle both cases
         for (u32 j = 0; j < lib.import_count && ptr + 4 <= data_end; j++) {
-            u32 import_value = read_u32_be(ptr); ptr += 4;
+            XexImportEntry entry;
             
-            // The import value is typically:
-            // - High byte: flags/type
-            // - Low 24 bits: ordinal or address offset
-            // For syscall ordinals, we use the lower bits
-            lib.imports.push_back(import_value);
+            // Read the ordinal/type value
+            u32 ordinal_value = read_u32_be(ptr); ptr += 4;
+            
+            // The ordinal value format:
+            // - High byte (bits 31-24): type/flags
+            // - Bits 23-0: ordinal number
+            entry.ordinal = ordinal_value & 0x00FFFFFF;
+            
+            // Check if there's a thunk address following (8-byte format)
+            // The thunk address should be in the executable's address space
+            if (ptr + 4 <= data_end) {
+                u32 next_value = read_u32_be(ptr);
+                // If next value looks like a valid address (in typical XEX range 0x82000000+)
+                // or if it's clearly not an ordinal, treat it as thunk address
+                if ((next_value >= 0x82000000 && next_value < 0x90000000) ||
+                    (next_value >= 0x80000000 && (next_value & 0x00FFFFFF) > 0x1000)) {
+                    entry.thunk_address = next_value;
+                    ptr += 4;
+                } else {
+                    // 4-byte format: ordinal only, no thunk address specified
+                    // We'll generate thunk addresses later
+                    entry.thunk_address = 0;
+                }
+            } else {
+                entry.thunk_address = 0;
+            }
+            
+            lib.imports.push_back(entry);
         }
         
         // Move ptr to next record based on record_size (not import count)
@@ -810,11 +835,12 @@ void XexTestHarness::print_imports() const {
                lib.version & 0xFF,
                lib.import_count);
         
-        for (u32 i = 0; i < std::min(lib.import_count, 10u); i++) {
-            printf("  0x%08X\n", lib.imports[i]);
+        for (u32 i = 0; i < std::min((u32)lib.imports.size(), 10u); i++) {
+            printf("  ordinal=%4u thunk=0x%08X\n", 
+                   lib.imports[i].ordinal, lib.imports[i].thunk_address);
         }
-        if (lib.import_count > 10) {
-            printf("  ... and %u more\n", lib.import_count - 10);
+        if (lib.imports.size() > 10) {
+            printf("  ... and %zu more\n", lib.imports.size() - 10);
         }
     }
     printf("\n");

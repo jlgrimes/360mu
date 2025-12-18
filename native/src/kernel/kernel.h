@@ -233,6 +233,9 @@ private:
     Status load_xex_image(const std::vector<u8>& data, LoadedModule& module);
     Status resolve_imports(LoadedModule& module);
     
+    // Import thunk installation
+    void install_import_thunks(const class XexModule& module);
+    
     // HLE registration
     void register_hle_functions();
     void register_xboxkrnl();
