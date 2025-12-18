@@ -99,6 +99,22 @@ Status Emulator::initialize(const EmulatorConfig& config) {
         return status;
     }
     
+    // Register GPU MMIO handler so memory writes to GPU registers reach the GPU
+    LOGI("Registering GPU MMIO handler (0x%08X - 0x%08X)", 
+         memory::GPU_REGS_BASE, memory::GPU_REGS_END);
+    memory_->register_mmio(
+        memory::GPU_REGS_BASE,
+        memory::GPU_REGS_END - memory::GPU_REGS_BASE + 1,
+        [this](GuestAddr addr) -> u32 {
+            u32 offset = (addr - memory::GPU_REGS_BASE) / 4;
+            return gpu_->read_register(offset);
+        },
+        [this](GuestAddr addr, u32 value) {
+            u32 offset = (addr - memory::GPU_REGS_BASE) / 4;
+            gpu_->write_register(offset, value);
+        }
+    );
+    
     // Initialize audio
     if (config_.enable_audio) {
         LOGI("Initializing audio subsystem");

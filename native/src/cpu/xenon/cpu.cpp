@@ -40,6 +40,7 @@ Status Cpu::initialize(Memory* memory, const CpuConfig& config) {
     for (u32 i = 0; i < cpu::NUM_THREADS; i++) {
         contexts_[i].reset();
         contexts_[i].thread_id = i;
+        contexts_[i].memory = memory;  // Set memory pointer for MMIO access
     }
     
     // Create interpreter (always needed as fallback)
@@ -80,6 +81,7 @@ void Cpu::reset() {
     for (u32 i = 0; i < cpu::NUM_THREADS; i++) {
         contexts_[i].reset();
         contexts_[i].thread_id = i;
+        contexts_[i].memory = memory_;  // Preserve memory pointer
     }
     
 #ifdef X360MU_JIT_ENABLED
@@ -163,6 +165,7 @@ Status Cpu::start_thread(u32 thread_id, GuestAddr entry_point, GuestAddr stack) 
     // Initialize thread context
     ctx.reset();
     ctx.thread_id = thread_id;
+    ctx.memory = memory_;  // Set memory pointer for MMIO access
     ctx.pc = entry_point;
     ctx.gpr[1] = stack; // Stack pointer in r1
     ctx.gpr[13] = 0;    // TLS pointer (will be set by kernel)

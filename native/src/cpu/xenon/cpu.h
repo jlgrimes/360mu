@@ -129,6 +129,9 @@ struct ThreadContext {
     bool running;
     bool interrupted;
     
+    // Memory pointer for MMIO access from JIT
+    void* memory;  // Memory* - use void* to avoid circular include
+    
     void reset() {
         gpr.fill(0);
         fpr.fill(0.0);

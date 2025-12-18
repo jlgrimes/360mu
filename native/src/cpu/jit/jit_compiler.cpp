@@ -31,6 +31,46 @@ namespace x360mu {
 // Maximum instructions per compiled block
 constexpr u32 MAX_BLOCK_INSTRUCTIONS = 256;
 
+// GPU MMIO base address for runtime checking
+constexpr GuestAddr GPU_MMIO_BASE = 0x7FC00000;
+
+//=============================================================================
+// C-style helper functions for memory access (callable from JIT)
+// These bypass fastmem and go through Memory class for proper MMIO handling
+//=============================================================================
+
+extern "C" void jit_mmio_write_u8(void* mem, GuestAddr addr, u8 value) {
+    static_cast<Memory*>(mem)->write_u8(addr, value);
+}
+
+extern "C" void jit_mmio_write_u16(void* mem, GuestAddr addr, u16 value) {
+    static_cast<Memory*>(mem)->write_u16(addr, value);
+}
+
+extern "C" void jit_mmio_write_u32(void* mem, GuestAddr addr, u32 value) {
+    static_cast<Memory*>(mem)->write_u32(addr, value);
+}
+
+extern "C" void jit_mmio_write_u64(void* mem, GuestAddr addr, u64 value) {
+    static_cast<Memory*>(mem)->write_u64(addr, value);
+}
+
+extern "C" u8 jit_mmio_read_u8(void* mem, GuestAddr addr) {
+    return static_cast<Memory*>(mem)->read_u8(addr);
+}
+
+extern "C" u16 jit_mmio_read_u16(void* mem, GuestAddr addr) {
+    return static_cast<Memory*>(mem)->read_u16(addr);
+}
+
+extern "C" u32 jit_mmio_read_u32(void* mem, GuestAddr addr) {
+    return static_cast<Memory*>(mem)->read_u32(addr);
+}
+
+extern "C" u64 jit_mmio_read_u64(void* mem, GuestAddr addr) {
+    return static_cast<Memory*>(mem)->read_u64(addr);
+}
+
 // Size of temporary code buffer
 constexpr size_t TEMP_BUFFER_SIZE = 64 * 1024;
 
@@ -1099,67 +1139,136 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
     // Load value to store
     load_gpr(emit, arm64::X1, inst.rs);
     
-    // Add memory base for fastmem
+    // Determine store size for MMIO path
+    int store_size = 4; // Default to 32-bit
+    void* mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u32);
+    
+    switch (inst.opcode) {
+        case 36: case 37: // stw, stwu
+            store_size = 4;
+            mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u32);
+            break;
+        case 38: case 39: // stb, stbu
+            store_size = 1;
+            mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u8);
+            break;
+        case 44: case 45: // sth, sthu
+            store_size = 2;
+            mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u16);
+            break;
+        case 52: case 53: case 54: case 55: case 62: // stfs, stfsu, stfd, stfdu, std
+            store_size = 8;
+            mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u64);
+            break;
+        case 31: // Extended stores
+            switch (inst.xo) {
+                case 151: store_size = 4; mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u32); break;
+                case 215: store_size = 1; mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u8); break;
+                case 407: store_size = 2; mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u16); break;
+                case 149: store_size = 8; mmio_helper = reinterpret_cast<void*>(jit_mmio_write_u64); break;
+            }
+            break;
+    }
+    
+    // Check if address might be MMIO (>= 0x7FC00000)
+    // Save address in X2 for potential MMIO path
+    emit.ORR(arm64::X2, arm64::XZR, arm64::X0);  // X2 = X0 (MOV)
+    
+    // Compare against MMIO base
+    emit.MOV_imm(arm64::X3, GPU_MMIO_BASE);
+    emit.CMP(arm64::X0, arm64::X3);
+    
+    // Branch to MMIO slow path if >= GPU_MMIO_BASE (CS = Carry Set = unsigned >=)
+    u8* mmio_branch = emit.current();
+    emit.B_cond(arm64_cond::CS, 0); // Will patch later
+    
+    // === FAST PATH: Normal memory store ===
     if (fastmem_enabled_) {
         emit.ADD(arm64::X0, arm64::X0, arm64::MEM_BASE);
     }
     
     // Store based on opcode
     switch (inst.opcode) {
-        case 36: // stw
-        case 37: // stwu
+        case 36: case 37: // stw, stwu
             byteswap32(emit, arm64::X1);
             emit.STR(arm64::X1, arm64::X0);
             break;
-        case 38: // stb
-        case 39: // stbu
+        case 38: case 39: // stb, stbu
             emit.STRB(arm64::X1, arm64::X0);
             break;
-        case 44: // sth
-        case 45: // sthu
+        case 44: case 45: // sth, sthu
             byteswap16(emit, arm64::X1);
             emit.STRH(arm64::X1, arm64::X0);
             break;
-        case 52: // stfs
-        case 53: // stfsu
-        case 54: // stfd
-        case 55: // stfdu
+        case 52: case 53: case 54: case 55: case 62:
             byteswap64(emit, arm64::X1);
             emit.STR(arm64::X1, arm64::X0);
             break;
-        case 62: // std/stdu (DS-form)
-            byteswap64(emit, arm64::X1);
-            emit.STR(arm64::X1, arm64::X0);
-            break;
-        case 31: // Extended stores
+        case 31:
             switch (inst.xo) {
-                case 151: // stwx
-                    byteswap32(emit, arm64::X1);
-                    emit.STR(arm64::X1, arm64::X0);
-                    break;
-                case 215: // stbx
-                    emit.STRB(arm64::X1, arm64::X0);
-                    break;
-                case 407: // sthx
-                    byteswap16(emit, arm64::X1);
-                    emit.STRH(arm64::X1, arm64::X0);
-                    break;
-                case 149: // stdx
-                    byteswap64(emit, arm64::X1);
-                    emit.STR(arm64::X1, arm64::X0);
-                    break;
+                case 151: byteswap32(emit, arm64::X1); emit.STR(arm64::X1, arm64::X0); break;
+                case 215: emit.STRB(arm64::X1, arm64::X0); break;
+                case 407: byteswap16(emit, arm64::X1); emit.STRH(arm64::X1, arm64::X0); break;
+                case 149: byteswap64(emit, arm64::X1); emit.STR(arm64::X1, arm64::X0); break;
             }
             break;
     }
+    
+    // Restore original address from X2 for update forms (fast path)
+    emit.ORR(arm64::X0, arm64::XZR, arm64::X2);  // X0 = X2 (original EA)
+    
+    // Jump past MMIO slow path
+    u8* skip_mmio = emit.current();
+    emit.B(0); // Will patch later
+    
+    // === MMIO SLOW PATH ===
+    u8* mmio_target = emit.current();
+    
+    // Patch the conditional branch to jump here
+    emit.patch_branch(reinterpret_cast<u32*>(mmio_branch), mmio_target);
+    
+    // At this point:
+    // X0 = effective address (original)
+    // X1 = value to store
+    // X2 = copy of effective address
+    
+    // Push address and value to stack (for preservation across call)
+    emit.SUB_imm(arm64::SP, arm64::SP, 32);  // Reserve stack space
+    emit.STR(arm64::X2, arm64::SP, 0);       // Save EA
+    emit.STR(arm64::X1, arm64::SP, 8);       // Save value
+    
+    // Call jit_mmio_write_*(memory, addr, value)
+    // X0 = memory (from context)
+    // X1 = addr
+    // X2 = value
+    
+    emit.LDR(arm64::X0, arm64::CTX_REG, offsetof(ThreadContext, memory));
+    emit.ORR(arm64::X1, arm64::XZR, arm64::X2);  // X1 = addr (MOV)
+    emit.LDR(arm64::X2, arm64::SP, 8);  // X2 = value (from stack)
+    
+    // Load helper function address and call
+    emit.MOV_imm(arm64::X4, reinterpret_cast<u64>(mmio_helper));
+    emit.BLR(arm64::X4);
+    
+    // Restore address to X0 for update forms
+    emit.LDR(arm64::X0, arm64::SP, 0);
+    emit.ADD_imm(arm64::SP, arm64::SP, 32);  // Restore stack
+    
+    // === END OF MMIO PATH ===
+    u8* end_target = emit.current();
+    
+    // Patch skip branch
+    emit.patch_branch(reinterpret_cast<u32*>(skip_mmio), end_target);
     
     // Update RA for update forms
     bool is_update = (inst.opcode == 37 || inst.opcode == 39 || 
                       inst.opcode == 45 || inst.opcode == 53 ||
                       inst.opcode == 55);
     if (is_update && inst.ra != 0) {
-        if (fastmem_enabled_) {
-            emit.SUB(arm64::X0, arm64::X0, arm64::MEM_BASE);
-        }
+        // For fast path, X0 has addr + MEM_BASE, need to subtract
+        // For MMIO path, X0 has the original addr
+        // For both paths, X0 now has the original address
+        // (fast path: subtract MEM_BASE; MMIO path: restored from stack)
         store_gpr(emit, inst.ra, arm64::X0);
     }
 }

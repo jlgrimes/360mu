@@ -658,7 +658,9 @@ Status VulkanBackend::begin_frame() {
     rp_info.renderArea.extent = swapchain_extent_;
     
     VkClearValue clear_value = {};
-    clear_value.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+    // Use a visible purple color so we can see rendering is working
+    // (will be replaced with actual game graphics when GPU emulation is complete)
+    clear_value.color = {{0.2f, 0.0f, 0.3f, 1.0f}};
     rp_info.clearValueCount = 1;
     rp_info.pClearValues = &clear_value;
     
