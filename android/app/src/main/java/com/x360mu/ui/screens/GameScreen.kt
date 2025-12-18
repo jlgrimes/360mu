@@ -49,6 +49,7 @@ fun GameScreen(
     var emulatorState by remember { mutableStateOf("Unknown") }
     
     // Load game and start emulation
+    // gamePath is now the real file system path (e.g., /storage/emulated/0/ROMS/game.iso)
     LaunchedEffect(gamePath) {
         Log.i(TAG, "GameScreen LaunchedEffect - loading game: $gamePath")
         isLoading = true

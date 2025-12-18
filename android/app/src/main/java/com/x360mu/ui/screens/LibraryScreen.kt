@@ -30,15 +30,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import java.io.File
+import com.x360mu.util.PreferencesManager
+import com.x360mu.util.RomFile
+import com.x360mu.util.RomScanner
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val TAG = "360mu-LibraryScreen"
-
-data class GameItem(
-    val path: String,
-    val name: String,
-    val extension: String
-)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -48,32 +47,63 @@ fun LibraryScreen(
 ) {
     Log.i(TAG, "LibraryScreen composable rendering")
     
-    LaunchedEffect(Unit) {
-        Log.i(TAG, "LibraryScreen LaunchedEffect - composition complete")
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val prefs = remember { PreferencesManager.getInstance(context) }
+    
+    var games by remember { mutableStateOf<List<RomFile>>(emptyList()) }
+    var isLoading by remember { mutableStateOf(false) }
+    var isScanning by remember { mutableStateOf(false) }
+    var romsFolderConfigured by remember { mutableStateOf(prefs.isRomsFolderConfigured) }
+    
+    // Function to scan ROMs folder
+    fun scanRomsFolder() {
+        val folderUri = prefs.romsFolderUri ?: return
+        
+        scope.launch {
+            isScanning = true
+            Log.i(TAG, "Starting ROM scan...")
+            
+            val foundRoms = withContext(Dispatchers.IO) {
+                RomScanner.scanFolder(context, folderUri)
+            }
+            
+            games = foundRoms
+            isScanning = false
+            Log.i(TAG, "ROM scan complete, found ${foundRoms.size} games")
+        }
     }
     
-    val context = LocalContext.current
-    var games by remember { mutableStateOf<List<GameItem>>(emptyList()) }
-    var isLoading by remember { mutableStateOf(false) }
-    
-    // File picker launcher
-    val filePicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
+    // Folder picker launcher
+    val folderPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
     ) { uri: Uri? ->
         uri?.let {
-            // Get persistent permission
-            context.contentResolver.takePersistableUriPermission(
-                it,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION
-            )
+            Log.i(TAG, "Folder selected: $it")
             
-            // Get the file path and add to games list
-            val fileName = it.lastPathSegment ?: "Unknown Game"
-            games = games + GameItem(
-                path = it.toString(),
-                name = fileName.substringBeforeLast('.'),
-                extension = fileName.substringAfterLast('.', "").uppercase()
-            )
+            // Get persistent permission for the folder
+            val takeFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or 
+                           Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            try {
+                context.contentResolver.takePersistableUriPermission(it, takeFlags)
+                Log.i(TAG, "Persistent permission granted")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to get persistent permission: ${e.message}")
+            }
+            
+            // Save the folder URI
+            prefs.romsFolderUri = it
+            romsFolderConfigured = true
+            
+            // Scan for ROMs
+            scanRomsFolder()
+        }
+    }
+    
+    // Scan ROMs on launch if folder is configured
+    LaunchedEffect(romsFolderConfigured) {
+        if (romsFolderConfigured) {
+            scanRomsFolder()
         }
     }
     
@@ -95,6 +125,18 @@ fun LibraryScreen(
                     }
                 },
                 actions = {
+                    // Refresh button
+                    if (romsFolderConfigured) {
+                        IconButton(
+                            onClick = { scanRomsFolder() },
+                            enabled = !isScanning
+                        ) {
+                            Icon(
+                                Icons.Default.Refresh,
+                                contentDescription = "Refresh"
+                            )
+                        }
+                    }
                     IconButton(onClick = onSettingsClick) {
                         Icon(
                             Icons.Default.Settings,
@@ -108,17 +150,14 @@ fun LibraryScreen(
             )
         },
         floatingActionButton = {
-            ExtendedFloatingActionButton(
-                onClick = {
-                    filePicker.launch(arrayOf(
-                        "application/octet-stream",
-                        "*/*"
-                    ))
-                },
-                icon = { Icon(Icons.Default.Add, contentDescription = null) },
-                text = { Text("Add Game") },
-                containerColor = MaterialTheme.colorScheme.primary
-            )
+            if (romsFolderConfigured) {
+                ExtendedFloatingActionButton(
+                    onClick = { folderPicker.launch(null) },
+                    icon = { Icon(Icons.Default.FolderOpen, contentDescription = null) },
+                    text = { Text("Change Folder") },
+                    containerColor = MaterialTheme.colorScheme.secondary
+                )
+            }
         }
     ) { paddingValues ->
         Box(
@@ -126,29 +165,67 @@ fun LibraryScreen(
                 .fillMaxSize()
                 .padding(paddingValues)
         ) {
-            if (games.isEmpty()) {
-                // Empty state
-                EmptyLibraryState(
-                    onAddClick = {
-                        filePicker.launch(arrayOf(
-                            "application/octet-stream",
-                            "*/*"
-                        ))
+            when {
+                // Not configured - show setup screen
+                !romsFolderConfigured -> {
+                    SetupScreen(
+                        onSelectFolder = { folderPicker.launch(null) }
+                    )
+                }
+                
+                // Scanning in progress
+                isScanning -> {
+                    Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            CircularProgressIndicator(
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(
+                                text = "Scanning for games...",
+                                style = MaterialTheme.typography.bodyLarge
+                            )
+                        }
                     }
-                )
-            } else {
-                // Games grid
-                LazyVerticalGrid(
-                    columns = GridCells.Adaptive(minSize = 160.dp),
-                    contentPadding = PaddingValues(16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    items(games) { game ->
-                        GameCard(
-                            game = game,
-                            onClick = { onGameSelected(game.path) }
-                        )
+                }
+                
+                // No games found
+                games.isEmpty() -> {
+                    EmptyLibraryState(
+                        onChangeFolder = { folderPicker.launch(null) },
+                        onRefresh = { scanRomsFolder() }
+                    )
+                }
+                
+                // Show games grid
+                else -> {
+                    LazyVerticalGrid(
+                        columns = GridCells.Adaptive(minSize = 160.dp),
+                        contentPadding = PaddingValues(16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        items(games) { game ->
+                            GameCard(
+                                game = game,
+                                onClick = {
+                                    // Get the real file path and launch game
+                                    val realPath = RomScanner.getRomRealPath(context, game)
+                                    if (realPath != null) {
+                                        Log.i(TAG, "Launching game: $realPath")
+                                        onGameSelected(realPath)
+                                    } else {
+                                        Log.e(TAG, "Could not resolve real path for: ${game.name}")
+                                        // TODO: Show error snackbar
+                                    }
+                                }
+                            )
+                        }
                     }
                 }
             }
@@ -175,10 +252,10 @@ fun LibraryScreen(
 }
 
 @Composable
-private fun EmptyLibraryState(
-    onAddClick: () -> Unit
+private fun SetupScreen(
+    onSelectFolder: () -> Unit
 ) {
-    Log.i(TAG, "EmptyLibraryState rendering")
+    Log.i(TAG, "SetupScreen rendering")
     
     Column(
         modifier = Modifier
@@ -188,11 +265,10 @@ private fun EmptyLibraryState(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        // Debug border to make the UI visible
         Box(
             modifier = Modifier
-                .border(2.dp, Color.Green, RoundedCornerShape(8.dp))
-                .padding(16.dp)
+                .border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(16.dp))
+                .padding(32.dp)
         ) {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally
@@ -207,16 +283,22 @@ private fun EmptyLibraryState(
                 Spacer(modifier = Modifier.height(24.dp))
                 
                 Text(
-                    text = "360μ - Xbox 360 Emulator",
-                    style = MaterialTheme.typography.headlineMedium,
+                    text = "360μ",
+                    style = MaterialTheme.typography.displaySmall,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary
                 )
                 
-                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "Xbox 360 Emulator",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                
+                Spacer(modifier = Modifier.height(32.dp))
                 
                 Text(
-                    text = "No Games Yet",
+                    text = "Welcome!",
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onBackground
@@ -225,7 +307,7 @@ private fun EmptyLibraryState(
                 Spacer(modifier = Modifier.height(8.dp))
                 
                 Text(
-                    text = "Add your Xbox 360 game files to get started.\nSupported formats: .xex, .iso",
+                    text = "Select your ROMs folder to get started.\nThe app will scan for .iso and .xex files.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center
@@ -235,27 +317,88 @@ private fun EmptyLibraryState(
                 
                 Button(
                     onClick = {
-                        Log.i(TAG, "Browse Files button clicked")
-                        onAddClick()
+                        Log.i(TAG, "Select ROMs Folder button clicked")
+                        onSelectFolder()
                     },
-                    modifier = Modifier.fillMaxWidth(0.8f),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(56.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.primary
-                    )
+                    ),
+                    shape = RoundedCornerShape(12.dp)
                 ) {
                     Icon(Icons.Default.FolderOpen, contentDescription = null)
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("Browse Files", fontWeight = FontWeight.Bold)
+                    Text(
+                        text = "Select ROMs Folder",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
                 }
-                
-                Spacer(modifier = Modifier.height(16.dp))
-                
-                // Debug info
-                Text(
-                    text = "UI Rendering OK ✓",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = Color.Green
-                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun EmptyLibraryState(
+    onChangeFolder: () -> Unit,
+    onRefresh: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Icon(
+            imageVector = Icons.Default.SearchOff,
+            contentDescription = null,
+            modifier = Modifier.size(64.dp),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        
+        Spacer(modifier = Modifier.height(16.dp))
+        
+        Text(
+            text = "No Games Found",
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onBackground
+        )
+        
+        Spacer(modifier = Modifier.height(8.dp))
+        
+        Text(
+            text = "No .iso or .xex files were found in the selected folder.\nMake sure your ROMs are in the correct location.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+        
+        Spacer(modifier = Modifier.height(24.dp))
+        
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            OutlinedButton(
+                onClick = onRefresh,
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(Icons.Default.Refresh, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Rescan")
+            }
+            
+            Button(
+                onClick = onChangeFolder,
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(Icons.Default.FolderOpen, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Change Folder")
             }
         }
     }
@@ -263,7 +406,7 @@ private fun EmptyLibraryState(
 
 @Composable
 private fun GameCard(
-    game: GameItem,
+    game: RomFile,
     onClick: () -> Unit
 ) {
     Card(
@@ -305,6 +448,15 @@ private fun GameCard(
                     modifier = Modifier.size(48.dp),
                     tint = MaterialTheme.colorScheme.primary
                 )
+                
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                // File size
+                Text(
+                    text = RomScanner.formatFileSize(game.size),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
             
             // Game info at bottom
@@ -323,7 +475,7 @@ private fun GameCard(
                     .padding(12.dp)
             ) {
                 Text(
-                    text = game.name,
+                    text = game.displayName,
                     style = MaterialTheme.typography.titleSmall,
                     color = Color.White,
                     maxLines = 2,
@@ -347,4 +499,3 @@ private fun GameCard(
         }
     }
 }
-
