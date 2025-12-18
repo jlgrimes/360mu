@@ -682,6 +682,18 @@ u32 SpirvBuilder::i_not_equal(u32 type, u32 a, u32 b) {
     return id;
 }
 
+u32 SpirvBuilder::s_less_than(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 177, type, id, {a, b}); // OpSLessThan
+    return id;
+}
+
+u32 SpirvBuilder::s_greater_than_equal(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, 175, type, id, {a, b}); // OpSGreaterThanEqual
+    return id;
+}
+
 // Logical operations
 u32 SpirvBuilder::logical_and(u32 type, u32 a, u32 b) {
     u32 id = allocate_id();
