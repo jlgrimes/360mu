@@ -16,6 +16,7 @@
 namespace x360mu {
 
 class Memory;
+class AndroidAudioOutput;
 
 /**
  * APU configuration
@@ -163,9 +164,12 @@ private:
     class XmaDecoder;
     std::unique_ptr<XmaDecoder> xma_decoder_;
     
-    // Audio output (platform-specific)
+    // Audio output (platform-specific legacy interface)
     class AudioOutput;
     std::unique_ptr<AudioOutput> audio_output_;
+    
+    // Android audio output (real AAudio connection - from android_audio.h)
+    std::unique_ptr<class ::x360mu::AndroidAudioOutput> android_audio_;
     
     // Statistics
     Stats stats_{};
@@ -174,6 +178,9 @@ private:
     void decode_xma_packets();
     void mix_voices();
     void submit_to_output();
+    
+    // Audio callback for AndroidAudioOutput
+    u32 audio_callback(f32* output, u32 frame_count);
 };
 
 /**

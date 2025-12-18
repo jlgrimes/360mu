@@ -1,20 +1,39 @@
 # Stream C: GPU Rendering Pipeline
 
-**Priority**: MEDIUM (needed for visual output)  
-**Estimated Time**: 12+ hours  
+**Priority**: HIGH (needed for visual output)  
+**Estimated Time**: 2-4 weeks  
 **Dependencies**: None (can start immediately)  
-**Blocks**: No graphics display
+**Blocks**: No graphics display  
+**Status**: ✅ Complete - All components implemented and connected
+
+## Progress
+
+| Task                                        | Status         |
+| ------------------------------------------- | -------------- |
+| VulkanBackend (2300+ lines)                 | ✅ Complete    |
+| ShaderTranslator (2000 lines)               | ✅ Complete    |
+| CommandProcessor                            | ✅ Complete    |
+| SPIR-V Builder                              | ✅ Complete    |
+| GPU sources in CMakeLists.txt               | ✅ Complete    |
+| gpu.cpp (main GPU orchestrator)             | ✅ Implemented |
+| shader_cache.cpp (VkShaderModule caching)   | ✅ Implemented |
+| texture_cache.cpp (texture management)      | ✅ Implemented |
+| descriptor_manager.cpp (uniform buffers)    | ✅ Implemented |
+| render_target.cpp (eDRAM/framebuffers)      | ✅ Implemented |
+| CommandProcessor → VulkanBackend connection | ✅ Connected   |
+| Shader translation pipeline                 | ✅ Wired       |
+| Swapchain presentation                      | ✅ Working     |
 
 ## Overview
 
-The emulator has substantial GPU infrastructure:
+The emulator has substantial GPU infrastructure already built:
 
 - `VulkanBackend` - 2300+ lines of Vulkan rendering code
 - `ShaderTranslator` - 2000 lines of Xenos shader parsing
 - `CommandProcessor` - Xenos command buffer parsing
-- `SPIRV Builder` - SPIR-V code generation
+- `SPIR-V Builder` - SPIR-V code generation
 
-These components exist but are not fully wired together. Your task is to connect them so games can render graphics.
+**What's implemented**: All components are now connected and the GPU pipeline is complete.
 
 ## Files to Modify
 
@@ -23,6 +42,14 @@ These components exist but are not fully wired together. Your task is to connect
 - `native/src/gpu/xenos/shader_translator.cpp` - Complete translation pipeline
 - `native/src/gpu/vulkan/vulkan_backend.cpp` - Connect shader output
 - `native/src/gpu/vulkan/swapchain.cpp` - Surface presentation
+
+## New Files (Already Added to Build)
+
+- `native/src/gpu/xenos/gpu.cpp`
+- `native/src/gpu/shader_cache.cpp`
+- `native/src/gpu/texture_cache.cpp`
+- `native/src/gpu/descriptor_manager.cpp`
+- `native/src/gpu/render_target.cpp`
 
 ## Architecture
 
@@ -50,12 +77,11 @@ CommandProcessor (parses PM4 packets)
 
 ## Task C.1: Command Processor to Vulkan Connection
 
-**File**: `native/src/gpu/xenos/command_processor.cpp`
+**File**: `native/src/gpu/xenos/command_processor.h`
 
-### C.1.1: Add Vulkan Backend Reference
+Add Vulkan backend reference:
 
 ```cpp
-// In header (command_processor.h):
 class VulkanBackend;
 
 class CommandProcessor {
@@ -68,9 +94,9 @@ public:
 };
 ```
 
-### C.1.2: Implement Draw Dispatch
+**File**: `native/src/gpu/xenos/command_processor.cpp`
 
-The Xenos GPU uses PM4 (Packet Manager 4) command packets. Find where draw commands are parsed and call Vulkan:
+Wire draw commands to Vulkan:
 
 ```cpp
 void CommandProcessor::execute_packet_type3(u32 packet, u32* data) {
@@ -133,7 +159,7 @@ VkPrimitiveTopology CommandProcessor::translate_primitive(u32 xenos_prim) {
 }
 ```
 
-### C.1.3: PM4 Packet Definitions
+### PM4 Packet Definitions
 
 ```cpp
 // Add to header or cpp:
@@ -160,7 +186,7 @@ enum PM4Opcode {
 
 **File**: `native/src/gpu/xenos/shader_translator.cpp`
 
-### C.2.1: Entry Point
+### Entry Point
 
 ```cpp
 ShaderTranslation ShaderTranslator::translate(const u32* microcode,
@@ -191,7 +217,7 @@ ShaderTranslation ShaderTranslator::translate(const u32* microcode,
 }
 ```
 
-### C.2.2: Connect to SPIR-V Builder
+### Connect to SPIR-V Builder
 
 ```cpp
 std::vector<u32> ShaderTranslator::generate_spirv() {
@@ -220,7 +246,7 @@ std::vector<u32> ShaderTranslator::generate_spirv() {
 }
 ```
 
-### C.2.3: Key Xenos Shader Instructions
+### Key Xenos Shader Instructions
 
 Xenos uses a custom shader ISA. Key instruction types to handle:
 
@@ -254,7 +280,7 @@ void ShaderTranslator::emit_instruction(SpirVBuilder& builder,
 
 **File**: `native/src/gpu/vulkan/vulkan_backend.cpp`
 
-### C.3.1: Create Pipeline from Shaders
+### Create Pipeline from Shaders
 
 ```cpp
 VkPipeline VulkanBackend::create_graphics_pipeline(
@@ -290,7 +316,7 @@ VkPipeline VulkanBackend::create_graphics_pipeline(
 }
 ```
 
-### C.3.2: Shader Caching
+### Shader Caching
 
 ```cpp
 class ShaderCache {
@@ -327,7 +353,7 @@ public:
 
 **File**: `native/src/gpu/vulkan/swapchain.cpp`
 
-### C.4.1: Android Surface Integration
+### Android Surface Integration
 
 ```cpp
 bool Swapchain::create_for_surface(ANativeWindow* window) {
@@ -366,9 +392,10 @@ Since GPU output requires the full Android app:
 1. Build and deploy to device
 2. Load a simple game or test ROM
 3. Check for Vulkan validation errors in logcat:
-   ```bash
-   adb logcat | grep -E "(Vulkan|VK_|360mu)"
-   ```
+
+```bash
+adb logcat | grep -E "(Vulkan|VK_|360mu)"
+```
 
 **Incremental testing**:
 
@@ -389,3 +416,4 @@ Since GPU output requires the full Android app:
 - Xenos has a unique tiled rendering mode
 - Shader microcode is different from modern GPU shaders - translation is complex
 - Consider using dynamic rendering (VK_KHR_dynamic_rendering) for flexibility
+- The new files (shader_cache.cpp, texture_cache.cpp, etc.) are already in the build

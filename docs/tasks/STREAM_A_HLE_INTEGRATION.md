@@ -1,19 +1,35 @@
 # Stream A: HLE/Syscall Integration
 
 **Priority**: CRITICAL PATH  
-**Estimated Time**: 5 hours  
-**Dependencies**: None (can start immediately)  
-**Blocks**: Game cannot call ANY kernel functions until complete
+**Estimated Time**: Complete  
+**Dependencies**: None  
+**Blocks**: None - all complete!  
+**Status**: ✅ Complete
+
+## Progress
+
+| Task                                                 | Status      |
+| ---------------------------------------------------- | ----------- |
+| XEX import parsing with thunk addresses              | ✅ Complete |
+| `XexImportEntry` struct with ordinal + thunk_address | ✅ Complete |
+| 150+ HLE functions implemented                       | ✅ Complete |
+| Syscall handling in interpreter                      | ✅ Complete |
+| Syscall dispatch in CPU                              | ✅ Complete |
+| Kernel-CPU connection                                | ✅ Complete |
+| Import thunk installation                            | ✅ Complete |
+
+## Implementation Locations
+
+- `interpreter.cpp:815` - Sets `ctx.interrupted = true` on syscall
+- `cpu.cpp:126-142` - `dispatch_syscall()` calls `kernel_->handle_syscall()`
+- `cpu.h:328-335` - `set_kernel()` and `dispatch_syscall()` declarations
+- `kernel.cpp:279-357` - `install_import_thunks()` writes syscall stubs
 
 ## Overview
 
-The emulator has 150+ HLE (High-Level Emulation) functions already implemented in `xboxkrnl.cpp` and `xam.cpp`, but they are never called because:
+The emulator has 150+ HLE functions already implemented in `xboxkrnl.cpp` and `xam.cpp`. The XEX loader now correctly parses import entries with both ordinals and thunk addresses.
 
-1. The interpreter doesn't handle the `sc` (syscall) instruction
-2. The CPU execute loop doesn't check for syscalls
-3. Import thunks don't contain syscall instructions
-
-Your task is to wire these together so games can call kernel functions.
+**What's missing**: The syscall dispatch path to connect game code to HLE functions.
 
 ## Files to Modify
 
@@ -151,11 +167,7 @@ bool Emulator::initialize() {
 
 **File**: `native/src/kernel/kernel.cpp`
 
-When loading a XEX, the import table contains addresses where the game expects kernel functions to be. We need to write small code stubs (thunks) at these addresses that:
-
-1. Load the function identifier into r0
-2. Execute a syscall instruction
-3. Return to the caller
+The XEX loader now provides `XexImportEntry` with both `ordinal` and `thunk_address`. Write syscall stubs at these addresses:
 
 ```cpp
 void Kernel::install_import_thunks(const XexModule& module) {
@@ -171,40 +183,62 @@ void Kernel::install_import_thunks(const XexModule& module) {
             module_id = 2; // Unknown/other
         }
 
-        for (size_t i = 0; i < lib.imports.size(); i++) {
-            u32 thunk_addr = lib.imports[i].thunk_address;
-            u32 ordinal = lib.imports[i].ordinal;
+        for (const auto& entry : lib.imports) {
+            u32 thunk_addr = entry.thunk_address;
+            u32 ordinal = entry.ordinal;
+
+            // Skip if no thunk address provided
+            if (thunk_addr == 0) continue;
 
             // Encode: (module_id << 16) | ordinal
             u32 encoded = (module_id << 16) | ordinal;
 
-            // Write: li r0, encoded (load immediate)
-            // For values > 16 bits, may need lis + ori sequence
+            // For values > 16 bits, need lis + ori sequence
             if (encoded <= 0x7FFF) {
                 // li r0, encoded (addi r0, 0, encoded)
                 u32 li_inst = 0x38000000 | (encoded & 0xFFFF);
                 memory_->write_u32(thunk_addr, li_inst);
+
+                // sc (syscall instruction)
+                memory_->write_u32(thunk_addr + 4, 0x44000002);
+
+                // blr (branch to link register - return)
+                memory_->write_u32(thunk_addr + 8, 0x4E800020);
             } else {
                 // lis r0, high16
                 u32 lis_inst = 0x3C000000 | ((encoded >> 16) & 0xFFFF);
                 memory_->write_u32(thunk_addr, lis_inst);
+
                 // ori r0, r0, low16
                 u32 ori_inst = 0x60000000 | (encoded & 0xFFFF);
                 memory_->write_u32(thunk_addr + 4, ori_inst);
-                thunk_addr += 4;
+
+                // sc (syscall instruction)
+                memory_->write_u32(thunk_addr + 8, 0x44000002);
+
+                // blr (return)
+                memory_->write_u32(thunk_addr + 12, 0x4E800020);
             }
-
-            // Write: sc (syscall instruction)
-            memory_->write_u32(thunk_addr + 4, 0x44000002);
-
-            // Write: blr (branch to link register - return)
-            memory_->write_u32(thunk_addr + 8, 0x4E800020);
         }
     }
 }
 ```
 
-**Call this method** after loading the XEX in `Kernel::load_xex()` or wherever appropriate.
+**Call this method** after loading the XEX. Add to `Kernel::load_executable()` or similar:
+
+```cpp
+bool Kernel::load_executable(const std::string& path) {
+    XexLoader loader;
+    auto module = loader.load(path, memory_);
+    if (!module) return false;
+
+    // ADD: Install thunks for imported functions
+    install_import_thunks(*module);
+
+    // ... rest of loading ...
+    return true;
+}
+```
 
 ---
 
@@ -214,13 +248,13 @@ Use the existing test tool:
 
 ```bash
 cd /Users/jaredgrimes/code/360mu/native/build
-./test_syscalls /path/to/blackops.iso/default.xex 10000
+./test_syscalls /path/to/blackops/default.xex 10000
 ```
 
 **Success criteria**:
 
-- Game should execute more than 200 instructions
-- Should see HLE function calls being logged
+- Game should execute more than 200 instructions (current limit)
+- Should see HLE function calls being logged (e.g., "HLE: xboxkrnl!NtAllocateVirtualMemory")
 - Should not crash at import thunks
 
 ## Reference Files
@@ -229,9 +263,27 @@ cd /Users/jaredgrimes/code/360mu/native/build
 - `native/src/kernel/hle/xam.cpp` - See XAM HLE implementations
 - `native/src/kernel/kernel.h` - See `handle_syscall()` signature
 - `native/src/cpu/xenon/cpu.h` - See `ThreadContext` structure
+- `native/src/kernel/xex_loader.h` - See `XexImportEntry` struct
+
+## XexImportEntry Structure (Already Implemented)
+
+```cpp
+// In xex_loader.h
+struct XexImportEntry {
+    u32 ordinal;        // Function ordinal within the library
+    u32 thunk_address;  // Address where thunk should be written
+};
+
+struct XexImportLibrary {
+    std::string name;
+    // ...
+    std::vector<XexImportEntry> imports;
+};
+```
 
 ## Notes
 
 - The `ThreadContext.interrupted` flag may already exist; check the header
 - The encoding scheme (module_id << 16 | ordinal) is arbitrary but must match between thunk installation and dispatch
 - Black Ops imports 522 functions, mainly from `xboxkrnl.exe`
+- The XEX loader already extracts thunk addresses in the 0x82000000+ range
