@@ -1129,18 +1129,56 @@ static void HLE_KeInitializeTimerEx(Cpu* cpu, Memory* memory, u64* args, u64* re
 static void HLE_KeSetTimerEx(Cpu* cpu, Memory* memory, u64* args, u64* result) {
     GuestAddr timer = static_cast<GuestAddr>(args[0]);
     s64 due_time = static_cast<s64>(args[1]);
-    s32 period = static_cast<s32>(args[2]);
+    s32 period_ms = static_cast<s32>(args[2]);
     GuestAddr dpc = static_cast<GuestAddr>(args[3]);
     
+    // Check if timer was already set
+    bool was_set = (memory->read_u32(timer + 4) != 0);  // Check if signaled/active
+    
+    // Reset signal state
+    memory->write_u32(timer + 4, 0);
+    
+    // Calculate absolute due time in 100ns units
+    u64 absolute_due_time;
+    u64 current_time = KernelState::instance().system_time();
+    
+    if (due_time < 0) {
+        // Negative = relative time (delay in 100ns units)
+        absolute_due_time = current_time + static_cast<u64>(-due_time);
+    } else if (due_time == 0) {
+        // Zero = fire immediately
+        absolute_due_time = current_time;
+    } else {
+        // Positive = absolute time
+        absolute_due_time = static_cast<u64>(due_time);
+    }
+    
+    // Convert period from milliseconds to 100ns units
+    u64 period_100ns = static_cast<u64>(period_ms) * 10000ULL;
+    
+    // Queue the timer
+    KernelState::instance().queue_timer(timer, absolute_due_time, period_100ns, dpc);
+    
+    LOGI("KeSetTimerEx: timer=0x%08X, due_time=%lld (%s), period=%d ms, dpc=0x%08X",
+         timer, (long long)due_time, due_time < 0 ? "relative" : "absolute", 
+         period_ms, dpc);
+    
     // Return whether timer was already set
-    *result = 0;
+    *result = was_set ? 1 : 0;
 }
 
 static void HLE_KeCancelTimer(Cpu* cpu, Memory* memory, u64* args, u64* result) {
     GuestAddr timer = static_cast<GuestAddr>(args[0]);
     
-    // Return whether timer was set
-    *result = 0;
+    // Cancel the timer and return whether it was set
+    bool was_set = KernelState::instance().cancel_timer(timer);
+    
+    // Also reset the signal state
+    memory->write_u32(timer + 4, 0);
+    
+    LOGI("KeCancelTimer: timer=0x%08X, was_set=%d", timer, was_set ? 1 : 0);
+    
+    *result = was_set ? 1 : 0;
 }
 
 //=============================================================================
@@ -1776,6 +1814,21 @@ void Kernel::register_xboxkrnl_extended() {
         
         // Set event to signaled state (signal_state = 1)
         memory->write_u32(event + 4, 1);
+        
+        // HACK: Force work completion for stuck games
+        // The game polls a completion flag at event + 0xFC (offset 0x14C - 0x50)
+        // Since our worker threads don't run, we simulate work completion here
+        // This allows games stuck waiting for worker thread completion to progress
+        if (boost_call_count > 50 && boost_call_count < 60) {
+            // After 50 calls, assume we're stuck and force completion
+            GuestAddr completion_flag = event + 0xFC;  // 0x14C - 0x50
+            u32 current_val = memory->read_u32(completion_flag);
+            if (current_val == 0) {
+                memory->write_u32(completion_flag, 1);
+                LOGI("HACK: Forced work completion at 0x%08X (event=0x%08X)", 
+                     (u32)completion_flag, (u32)event);
+            }
+        }
         
         // CRITICAL: Process pending DPCs immediately when an event is signaled
         // This simulates the system thread responding to the event and executing

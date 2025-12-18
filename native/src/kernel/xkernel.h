@@ -110,6 +110,13 @@ public:
     void process_dpcs();
     void process_apcs();
     
+    // VBlank signaling (called at frame boundaries)
+    void signal_vblank();
+    u32 vblank_count() const { return vblank_count_; }
+    
+    // GPU interrupt registration
+    void set_gpu_interrupt_event(GuestAddr event_addr);
+    
     // System state (in guest memory)
     GuestAddr get_kpcr_address(u32 processor) const;
     GuestAddr get_system_process() const;
@@ -125,6 +132,7 @@ private:
     void init_system_structures();
     void init_system_events();
     void init_processors();
+    void queue_initialization_timers();
     
     Cpu* cpu_ = nullptr;
     Memory* memory_ = nullptr;
@@ -140,6 +148,10 @@ private:
     // System events
     std::shared_ptr<XEvent> system_ready_event_;
     std::shared_ptr<XEvent> video_ready_event_;
+    std::shared_ptr<XEvent> vblank_event_;
+    
+    // VBlank tracking
+    u32 vblank_count_ = 0;
     
     // Object cache (for guest address -> XObject mapping)
     std::unordered_map<GuestAddr, std::weak_ptr<XObject>> guest_object_cache_;

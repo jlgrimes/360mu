@@ -11,6 +11,7 @@
 #include "../../memory/memory.h"
 #include "../xenon/cpu.h"
 #include <thread>
+#include <unordered_map>
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -143,7 +144,29 @@ extern "C" u16 jit_mmio_read_u16(void* mem, GuestAddr addr) {
 }
 
 extern "C" u32 jit_mmio_read_u32(void* mem, GuestAddr addr) {
-    return static_cast<Memory*>(mem)->read_u32(addr);
+    u32 value = static_cast<Memory*>(mem)->read_u32(addr);
+    
+    // SPIN LOOP ANALYSIS: Track frequent reads to detect polling
+    static std::unordered_map<GuestAddr, u32> read_counts;
+    static int total_reads = 0;
+    static int logged_addrs = 0;
+    
+    read_counts[addr]++;
+    total_reads++;
+    
+    // Log addresses being read more than 100 times (likely polling)
+    if (read_counts[addr] == 100 && logged_addrs < 20) {
+        logged_addrs++;
+        LOGI("POLL DETECTED: addr=0x%08X read 100+ times, value=0x%08X", (u32)addr, value);
+        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+        if (f) { 
+            fprintf(f, "{\"hypothesisId\":\"POLL\",\"message\":\"POLLING_ADDR\",\"data\":{\"addr\":\"%08X\",\"value\":\"%08X\",\"count\":100}}\n", 
+                    (u32)addr, value); 
+            fclose(f); 
+        }
+    }
+    
+    return value;
 }
 
 extern "C" u64 jit_mmio_read_u64(void* mem, GuestAddr addr) {
@@ -332,6 +355,13 @@ u64 JitCompiler::execute(ThreadContext& ctx, u64 cycles) {
         
         // Store cycle limit in context or use register
         while (ctx.running && !ctx.interrupted && cycles_executed < cycles) {
+            // Check for PC=0 termination (used for DPC return)
+            // When a DPC routine executes 'blr' with LR=0, PC becomes 0
+            if (ctx.pc == 0) {
+                ctx.running = false;
+                break;
+            }
+            
             // Look up or compile block
             CompiledBlock* block = compile_block(ctx.pc);
             if (!block) {

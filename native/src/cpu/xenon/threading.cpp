@@ -358,28 +358,46 @@ u64 ThreadScheduler::run(u64 cycles) {
     }
     // #endregion
     
-    // If we have host threads running, they manage current_thread via hw_thread_main.
-    // We just need to wake them up and let them handle thread scheduling.
-    // Only manually set current_thread if no host threads are running for hw thread 0.
-    if (num_host_threads_ > 0) {
-        // Wake all host threads to process any ready threads
-        for (u32 hw = 0; hw < num_host_threads_; hw++) {
-            hw_threads_[hw].wake_cv.notify_one();
-        }
-        // Give host threads a chance to pick up the work
-        std::this_thread::yield();
-    } else {
-        // No host threads - manually pick up a thread for hw thread 0
+    // CRITICAL FIX: Ensure hw_threads_[0].current_thread is set to the main thread
+    // before executing CPU thread 0. This is required for KeWaitForSingleObject to
+    // properly block the thread via get_current_thread(0).
+    {
         std::lock_guard<std::mutex> lock(hw_threads_[0].mutex);
         if (hw_threads_[0].current_thread == nullptr) {
-            hw_threads_[0].current_thread = dequeue_thread(1);  // affinity bit 0x1 for hw thread 0
-            if (hw_threads_[0].current_thread) {
-                hw_threads_[0].current_thread->state = ThreadState::Running;
+            // Find the main game thread - it's the first non-system thread
+            // (system threads have is_system_thread=true or start in Waiting state with entry=0)
+            GuestThread* main_thread = nullptr;
+            {
+                std::lock_guard<std::mutex> threads_lock(threads_mutex_);
+                for (auto& thread : threads_) {
+                    if (!thread->is_system_thread && 
+                        thread->state != ThreadState::Terminated &&
+                        thread->context.pc != 0) {
+                        main_thread = thread.get();
+                        break;
+                    }
+                }
+            }
+            
+            // If main thread found, assign it to hw_threads_[0]
+            if (main_thread) {
+                hw_threads_[0].current_thread = main_thread;
+                main_thread->state = ThreadState::Running;
+                LOGI("Assigned main thread %u (entry=0x%08X) to hw_threads_[0]", 
+                     main_thread->thread_id, (u32)main_thread->context.pc);
             }
         }
     }
     
-    // Always execute CPU thread 0 (the main game thread)
+    // Wake host threads to process any ready threads (worker threads)
+    if (num_host_threads_ > 1) {
+        // Start from hw_thread 1 since hw_thread 0 runs main thread directly
+        for (u32 hw = 1; hw < num_host_threads_; hw++) {
+            hw_threads_[hw].wake_cv.notify_one();
+        }
+    }
+    
+    // Execute CPU thread 0 (the main game thread)
     // This is set up via cpu_->start_thread() during prepare_entry
     if (cpu_) {
         cpu_->execute_thread(0, cycles);
@@ -432,16 +450,17 @@ u32 ThreadScheduler::wait_for_object(GuestThread* thread, GuestAddr object, u64 
         if (header.type == static_cast<u8>(KernelObjectType::SynchronizationEvent)) {
             memory_->write_u32(object + 4, 0);
         }
-        return 0;  // STATUS_SUCCESS
+        return 0;  // STATUS_SUCCESS / STATUS_WAIT_0
     }
     
-    // Need to wait
-    thread->state = ThreadState::Waiting;
-    thread->wait_object = object;
-    
+    // Zero timeout means just check, don't wait
     if (timeout_ns == 0) {
         return 0x00000102;  // STATUS_TIMEOUT
     }
+    
+    // Mark thread as waiting
+    thread->state = ThreadState::Waiting;
+    thread->wait_object = object;
     
     if (timeout_ns != ~0ULL) {
         thread->wait_timeout = current_time_ + (timeout_ns / 100);
@@ -449,7 +468,7 @@ u32 ThreadScheduler::wait_for_object(GuestThread* thread, GuestAddr object, u64 
         thread->wait_timeout = ~0ULL;  // Infinite
     }
     
-    // Remove from running
+    // Remove from hardware thread
     for (auto& hw : hw_threads_) {
         if (hw.current_thread == thread) {
             hw.current_thread = nullptr;
@@ -459,7 +478,9 @@ u32 ThreadScheduler::wait_for_object(GuestThread* thread, GuestAddr object, u64 
     
     stats_.waiting_thread_count++;
     
-    return 0x00000102;  // STATUS_WAIT (will be updated when signaled)
+    // Return STATUS_TIMEOUT to indicate we're not signaled yet
+    // The caller should yield/sleep and retry
+    return 0x00000102;  // STATUS_TIMEOUT
 }
 
 void ThreadScheduler::signal_object(GuestAddr object) {
@@ -468,10 +489,9 @@ void ThreadScheduler::signal_object(GuestAddr object) {
     
     // #region agent log - Hypothesis W: Check event type and signal_object write
     static int sig_type_log = 0;
-    if (sig_type_log++ < 20) {
+    if (sig_type_log++ < 50) {
         u32 before = memory_->read_u32(object + 4);
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"W\",\"location\":\"threading.cpp:signal_object\",\"message\":\"SIGNAL_TYPE\",\"data\":{\"object\":\"%08X\",\"type\":%u,\"signal_before\":%u}}\n", (u32)object, header.type, before); fclose(f); }
+        LOGI("signal_object: object=0x%08X, type=%u, signal_before=%u", (u32)object, header.type, before);
     }
     // #endregion
     

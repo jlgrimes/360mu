@@ -155,6 +155,13 @@ void Interpreter::execute(ThreadContext& ctx, u64 cycles) {
     // #endregion
     
     while (executed < cycles && ctx.running && !ctx.interrupted) {
+        // Check for PC=0 termination (used for DPC return)
+        // When a DPC routine executes 'blr' with LR=0, PC becomes 0
+        if (ctx.pc == 0) {
+            ctx.running = false;
+            break;
+        }
+        
         // #region agent log - HYPOTHESIS K: Detect spin loop
         if (ctx.pc == last_pc) {
             same_pc_count++;

@@ -167,15 +167,43 @@ void Cpu::dispatch_syscall(ThreadContext& ctx) {
     // Log first 200 syscalls, plus always log ExCreateThread (ordinal 14)
     if (syscall_log++ < 200 || ordinal == 14 || (ordinal != 2168 && syscall_log < 500)) {
         FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"L\",\"location\":\"cpu.cpp:dispatch_syscall\",\"message\":\"SYSCALL\",\"data\":{\"call\":%d,\"r0\":%llu,\"module\":%u,\"ordinal\":%u,\"pc\":%u}}\n", syscall_log, ctx.gpr[0], module, ordinal, (u32)ctx.pc); fclose(f); }
+        if (f) { fprintf(f, "{\"hypothesisId\":\"L\",\"location\":\"cpu.cpp:dispatch_syscall\",\"message\":\"SYSCALL\",\"data\":{\"call\":%d,\"r0\":%llu,\"module\":%u,\"ordinal\":%u,\"pc\":%u,\"lr\":%u}}\n", syscall_log, ctx.gpr[0], module, ordinal, (u32)ctx.pc, (u32)ctx.lr); fclose(f); }
     }
     // #endregion
+    
+    // SPIN LOOP ANALYSIS: Log LR for ordinal 2168 (KeSetEventBoostPriority)
+    // This tells us where the spin loop is calling from
+    static int spin_log = 0;
+    static bool dumped_spin_code = false;
+    if (ordinal == 2168 && spin_log++ < 10) {
+        LOGI("KeSetEventBoostPriority called from LR=0x%08X, r3(event)=0x%08X, r4(boost)=0x%08X",
+             (u32)ctx.lr, (u32)ctx.gpr[3], (u32)ctx.gpr[4]);
+        
+        // Dump the instructions around LR to understand the spin loop
+        if (!dumped_spin_code && memory_ && ctx.lr >= 0x82000000 && ctx.lr < 0x90000000) {
+            dumped_spin_code = true;
+            LOGI("=== SPIN LOOP CODE DUMP (around LR=0x%08X) ===", (u32)ctx.lr);
+            // Dump 16 instructions before and after LR
+            GuestAddr start = (ctx.lr - 64) & ~3;  // Align to 4 bytes
+            for (int i = 0; i < 32; i++) {
+                GuestAddr addr = start + i * 4;
+                u32 inst = memory_->read_u32(addr);
+                LOGI("  0x%08X: %08X%s", (u32)addr, inst, (addr == ctx.lr) ? " <-- LR" : "");
+            }
+            LOGI("=== END SPIN LOOP CODE DUMP ===");
+            
+            // Also dump key registers
+            LOGI("Key registers: r1(SP)=0x%08X r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X",
+                 (u32)ctx.gpr[1], (u32)ctx.gpr[3], (u32)ctx.gpr[4], (u32)ctx.gpr[5],
+                 (u32)ctx.gpr[6], (u32)ctx.gpr[7], (u32)ctx.gpr[8], (u32)ctx.gpr[9]);
+        }
+    }
     
     // Debug: Log syscall dispatch
     static int dispatch_count = 0;
     if (dispatch_count < 10) {
-        LOGI("dispatch_syscall: r0=0x%llX -> module=%u, ordinal=%u, PC=0x%llX",
-             ctx.gpr[0], module, ordinal, ctx.pc);
+        LOGI("dispatch_syscall: r0=0x%llX -> module=%u, ordinal=%u, PC=0x%llX, LR=0x%llX",
+             ctx.gpr[0], module, ordinal, ctx.pc, ctx.lr);
         dispatch_count++;
     }
     

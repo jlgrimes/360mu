@@ -192,6 +192,15 @@ public:
                    GuestAddr arg1 = 0, GuestAddr arg2 = 0);
     void process_dpcs();
     
+    // Timer support
+    void queue_timer(GuestAddr timer_addr, u64 due_time_100ns, u64 period_100ns, GuestAddr dpc_addr);
+    bool cancel_timer(GuestAddr timer_addr);
+    void process_timer_queue();
+    
+    // GPU interrupt support
+    void queue_gpu_interrupt();
+    void set_gpu_interrupt_event(GuestAddr event_addr) { gpu_interrupt_event_addr_ = event_addr; }
+    
     // Set CPU (can be called after initialize if needed)
     void set_cpu(Cpu* cpu) { cpu_ = cpu; }
     
@@ -218,6 +227,19 @@ private:
     };
     std::mutex dpc_mutex_;
     std::vector<DpcEntry> dpc_queue_;
+    
+    // Timer queue - stores pending timers
+    struct TimerEntry {
+        GuestAddr timer_addr;     // Guest KTIMER structure address
+        u64 due_time_100ns;       // When to fire (absolute system time)
+        u64 period_100ns;         // Repeat interval (0 = one-shot)
+        GuestAddr dpc_addr;       // Associated DPC (optional, 0 if none)
+    };
+    std::mutex timer_mutex_;
+    std::vector<TimerEntry> timer_queue_;
+    
+    // GPU interrupt support
+    GuestAddr gpu_interrupt_event_addr_ = 0;
 };
 
 // Helper macros for object type checking

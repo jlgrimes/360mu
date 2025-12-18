@@ -175,6 +175,13 @@ void KernelState::shutdown() {
         dpc_queue_.clear();
     }
     
+    // Clear timer queue
+    {
+        std::lock_guard<std::mutex> lock(timer_mutex_);
+        timer_queue_.clear();
+    }
+    
+    gpu_interrupt_event_addr_ = 0;
     memory_ = nullptr;
     
     LOGI("KernelState shutdown complete");
@@ -300,6 +307,108 @@ void KernelState::process_dpcs() {
             LOGW("Cannot execute DPC: no CPU or memory available");
         }
     }
+}
+
+void KernelState::queue_timer(GuestAddr timer_addr, u64 due_time_100ns, u64 period_100ns, GuestAddr dpc_addr) {
+    std::lock_guard<std::mutex> lock(timer_mutex_);
+    
+    // Check if timer already exists - update it instead of adding new
+    for (auto& entry : timer_queue_) {
+        if (entry.timer_addr == timer_addr) {
+            entry.due_time_100ns = due_time_100ns;
+            entry.period_100ns = period_100ns;
+            entry.dpc_addr = dpc_addr;
+            LOGI("Updated timer 0x%08X: due=%llu, period=%llu, dpc=0x%08X",
+                 timer_addr, (unsigned long long)due_time_100ns, 
+                 (unsigned long long)period_100ns, dpc_addr);
+            return;
+        }
+    }
+    
+    // Add new timer
+    timer_queue_.push_back({timer_addr, due_time_100ns, period_100ns, dpc_addr});
+    LOGI("Queued timer 0x%08X: due=%llu, period=%llu, dpc=0x%08X",
+         timer_addr, (unsigned long long)due_time_100ns, 
+         (unsigned long long)period_100ns, dpc_addr);
+}
+
+bool KernelState::cancel_timer(GuestAddr timer_addr) {
+    std::lock_guard<std::mutex> lock(timer_mutex_);
+    
+    for (auto it = timer_queue_.begin(); it != timer_queue_.end(); ++it) {
+        if (it->timer_addr == timer_addr) {
+            timer_queue_.erase(it);
+            LOGI("Cancelled timer 0x%08X", timer_addr);
+            return true;  // Was set
+        }
+    }
+    return false;  // Was not set
+}
+
+void KernelState::process_timer_queue() {
+    u64 current_time = system_time();
+    
+    std::vector<TimerEntry> expired;
+    
+    {
+        std::lock_guard<std::mutex> lock(timer_mutex_);
+        
+        for (auto it = timer_queue_.begin(); it != timer_queue_.end(); ) {
+            if (current_time >= it->due_time_100ns) {
+                expired.push_back(*it);
+                
+                // Handle periodic timers
+                if (it->period_100ns > 0) {
+                    // Reschedule periodic timer
+                    it->due_time_100ns = current_time + it->period_100ns;
+                    ++it;
+                } else {
+                    // One-shot timer - remove it
+                    it = timer_queue_.erase(it);
+                }
+            } else {
+                ++it;
+            }
+        }
+    }
+    
+    // Process expired timers outside the lock
+    for (const auto& timer : expired) {
+        LOGI("Timer 0x%08X fired", timer.timer_addr);
+        
+        // Signal the timer object (set SignalState to 1)
+        if (memory_) {
+            memory_->write_u32(timer.timer_addr + 4, 1);  // SignalState = 1
+        }
+        
+        // Queue associated DPC if present
+        if (timer.dpc_addr != 0 && memory_) {
+            // Read DPC routine and context from the KDPC structure
+            // KDPC layout:
+            //   0x0C: DeferredRoutine
+            //   0x10: DeferredContext
+            GuestAddr routine = memory_->read_u32(timer.dpc_addr + 0x0C);
+            GuestAddr context = memory_->read_u32(timer.dpc_addr + 0x10);
+            
+            if (routine != 0) {
+                // For timer DPCs, SystemArgument1 is often the timer address
+                queue_dpc(timer.dpc_addr, routine, context, timer.timer_addr, 0);
+            }
+        }
+    }
+}
+
+void KernelState::queue_gpu_interrupt() {
+    LOGI("GPU interrupt received");
+    
+    // Signal GPU interrupt event if one is registered
+    if (gpu_interrupt_event_addr_ != 0 && memory_) {
+        memory_->write_u32(gpu_interrupt_event_addr_ + 4, 1);  // SignalState = 1
+        LOGI("Signaled GPU interrupt event at 0x%08X", gpu_interrupt_event_addr_);
+    }
+    
+    // Also queue a system DPC to notify any waiters
+    // This simulates the GPU interrupt handler DPC
 }
 
 } // namespace x360mu

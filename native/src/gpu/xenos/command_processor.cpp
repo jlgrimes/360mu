@@ -20,6 +20,7 @@
 #include "gpu/texture_cache.h"
 #include "gpu/descriptor_manager.h"
 #include "memory/memory.h"
+#include "kernel/xobject.h"  // For GPU interrupt signaling
 #include <cstring>
 #include <cstdio>
 
@@ -339,8 +340,9 @@ void CommandProcessor::execute_type3_direct(u32 header, const u32* data) {
             break;
             
         case PM4Opcode::INTERRUPT:
-            // Signal interrupt to CPU
-            LOGD("GPU interrupt");
+            // Signal interrupt to CPU - queue a kernel interrupt callback
+            LOGI("GPU interrupt - signaling kernel");
+            KernelState::instance().queue_gpu_interrupt();
             break;
             
         case PM4Opcode::WAIT_FOR_IDLE:
@@ -453,8 +455,9 @@ void CommandProcessor::execute_type3(u32 header, GuestAddr data_addr) {
             break;
             
         case PM4Opcode::INTERRUPT:
-            // Signal interrupt to CPU
-            LOGD("GPU interrupt");
+            // Signal interrupt to CPU - queue a kernel interrupt callback
+            LOGI("GPU interrupt - signaling kernel");
+            KernelState::instance().queue_gpu_interrupt();
             break;
             
         case PM4Opcode::WAIT_FOR_IDLE:

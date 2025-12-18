@@ -464,6 +464,10 @@ void Emulator::emulation_thread_main() {
             stats_.frames_rendered++;
             frames_since_log++;
             
+            // Signal VBlank - this processes timer DPCs and signals VBlank events
+            // Games rely on VBlank for frame synchronization
+            XKernel::instance().signal_vblank();
+            
             if (frame_callback_) {
                 frame_callback_();
             }

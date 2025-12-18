@@ -54,6 +54,8 @@ void XKernel::shutdown() {
     
     system_ready_event_.reset();
     video_ready_event_.reset();
+    vblank_event_.reset();
+    vblank_count_ = 0;
     
     {
         std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -112,6 +114,11 @@ void XKernel::perform_system_init() {
     if (system_ready_event_) {
         system_ready_event_->set();
     }
+    
+    // Step 10: Queue initialization timers that simulate kernel boot DPCs
+    // These timers fire quickly to signal system initialization events
+    // that games may be waiting for during their own initialization
+    queue_initialization_timers();
     
     LOGI("System initialization complete - all subsystems ready");
 }
@@ -212,6 +219,10 @@ void XKernel::init_system_events() {
     video_ready_event_ = create_event(XEventType::NotificationEvent, false);
     video_ready_event_->set_name("\\SystemRoot\\System32\\VideoReady");
     
+    // Create VBlank event
+    vblank_event_ = create_event(XEventType::SynchronizationEvent, false);
+    vblank_event_->set_name("\\SystemRoot\\System32\\VBlank");
+    
     // Set system initialization flags in a safe location
     // Use the first KPCR + 0x100 offset for flags
     GuestAddr flags_addr = kpcr_base_ + 0x100;
@@ -220,6 +231,68 @@ void XKernel::init_system_events() {
     memory_->write_u32(flags_addr + 8, 1);  // XAM ready flag
     
     LOGD("System events created, flags at 0x%08X", flags_addr);
+}
+
+void XKernel::queue_initialization_timers() {
+    // Queue initialization timers that fire quickly to simulate kernel boot DPCs
+    // These simulate the Xbox 360 kernel's internal initialization sequence
+    // 
+    // On a real Xbox 360, the kernel queues DPCs during system initialization
+    // that signal various events when subsystems are ready. Games often wait
+    // for these events during their own initialization.
+    
+    u64 current_time = KernelState::instance().system_time();
+    
+    // Timer 1: System initialization complete timer (fires after 10ms)
+    // This simulates the kernel signaling that core initialization is done
+    constexpr u64 INIT_DELAY_100NS = 100000;  // 10ms in 100ns units
+    
+    // Allocate a synthetic timer structure in guest memory
+    // We use a reserved area after KPCR structures
+    constexpr GuestAddr INIT_TIMER_BASE = 0x00020000;
+    constexpr u32 TIMER_SIZE = 0x40;
+    
+    // Initialize a KTIMER structure for system init
+    GuestAddr timer1 = INIT_TIMER_BASE;
+    memory_->write_u8(timer1 + 0, 0x08);  // Type = NotificationTimer
+    memory_->write_u8(timer1 + 1, 0);
+    memory_->write_u16(timer1 + 2, TIMER_SIZE);
+    memory_->write_u32(timer1 + 4, 0);  // SignalState = not signaled
+    
+    // Queue the timer - it will signal itself when it fires
+    // No DPC needed, just the timer signal
+    KernelState::instance().queue_timer(timer1, current_time + INIT_DELAY_100NS, 0, 0);
+    
+    // Timer 2: Video initialization timer (fires after 20ms)
+    GuestAddr timer2 = INIT_TIMER_BASE + TIMER_SIZE;
+    memory_->write_u8(timer2 + 0, 0x08);  // Type = NotificationTimer
+    memory_->write_u8(timer2 + 1, 0);
+    memory_->write_u16(timer2 + 2, TIMER_SIZE);
+    memory_->write_u32(timer2 + 4, 0);  // SignalState = not signaled
+    
+    KernelState::instance().queue_timer(timer2, current_time + INIT_DELAY_100NS * 2, 0, 0);
+    
+    // Timer 3: XAM initialization timer (fires after 30ms)
+    GuestAddr timer3 = INIT_TIMER_BASE + TIMER_SIZE * 2;
+    memory_->write_u8(timer3 + 0, 0x08);  // Type = NotificationTimer
+    memory_->write_u8(timer3 + 1, 0);
+    memory_->write_u16(timer3 + 2, TIMER_SIZE);
+    memory_->write_u32(timer3 + 4, 0);  // SignalState = not signaled
+    
+    KernelState::instance().queue_timer(timer3, current_time + INIT_DELAY_100NS * 3, 0, 0);
+    
+    // Timer 4: Periodic VBlank timer (fires every 16.67ms = 60Hz)
+    // This ensures timer processing happens even if the game doesn't call any syscalls
+    GuestAddr vblank_timer = INIT_TIMER_BASE + TIMER_SIZE * 3;
+    memory_->write_u8(vblank_timer + 0, 0x08);  // Type = NotificationTimer
+    memory_->write_u8(vblank_timer + 1, 0);
+    memory_->write_u16(vblank_timer + 2, TIMER_SIZE);
+    memory_->write_u32(vblank_timer + 4, 0);  // SignalState = not signaled
+    
+    constexpr u64 VBLANK_PERIOD_100NS = 166667;  // ~16.67ms in 100ns units (60Hz)
+    KernelState::instance().queue_timer(vblank_timer, current_time + VBLANK_PERIOD_100NS, VBLANK_PERIOD_100NS, 0);
+    
+    LOGI("Queued %d initialization timers", 4);
 }
 
 u32 XKernel::create_handle(std::shared_ptr<XObject> object) {
@@ -423,13 +496,19 @@ u32 XKernel::wait_for_multiple_objects(
 }
 
 void XKernel::run_for(u64 cycles) {
-    // Process pending DPCs first
+    // Process timer queue first (fires DPCs for expired timers)
+    KernelState::instance().process_timer_queue();
+    
+    // Process pending DPCs (including any just queued by timers)
+    KernelState::instance().process_dpcs();
+    
+    // Also call XScheduler DPC processing for compatibility
     process_dpcs();
     
     // Run scheduled threads
     XScheduler::instance().run_for(cycles);
     
-    // Process timers
+    // Process XScheduler timers
     process_timers();
     
     // Process APCs
@@ -449,6 +528,32 @@ void XKernel::process_apcs() {
     if (current) {
         current->deliver_apcs();
     }
+}
+
+void XKernel::signal_vblank() {
+    // Increment VBlank counter
+    vblank_count_++;
+    
+    // Signal VBlank event if one exists
+    if (vblank_event_) {
+        vblank_event_->set();
+    }
+    
+    // Process timers - this ensures timer-based DPCs fire at frame rate
+    KernelState::instance().process_timer_queue();
+    
+    // Process any pending DPCs after timer processing
+    KernelState::instance().process_dpcs();
+    
+    // Log occasionally
+    if ((vblank_count_ % 60) == 0) {
+        LOGI("VBlank #%u (1 second elapsed)", vblank_count_);
+    }
+}
+
+void XKernel::set_gpu_interrupt_event(GuestAddr event_addr) {
+    KernelState::instance().set_gpu_interrupt_event(event_addr);
+    LOGI("GPU interrupt event set to 0x%08X", event_addr);
 }
 
 GuestAddr XKernel::get_kpcr_address(u32 processor) const {
@@ -582,10 +687,9 @@ void ke_initialize_timer(GuestAddr timer) {
 }
 
 bool ke_set_timer(GuestAddr timer, u64 due_time, GuestAddr dpc) {
-    // TODO: Implement timer queue
-    (void)timer;
-    (void)due_time;
-    (void)dpc;
+    // Queue the timer using KernelState
+    // due_time is absolute in 100ns units
+    KernelState::instance().queue_timer(timer, due_time, 0, dpc);
     return true;
 }
 
