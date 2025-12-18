@@ -114,24 +114,47 @@ void Gpu::reset() {
 }
 
 void Gpu::set_surface(void* native_window) {
-    if (vulkan_) {
-        // Initialize Vulkan with the native window
-        // Use default 1280x720 resolution, will be resized as needed
-        if (vulkan_->initialize(native_window, 1280, 720) != Status::Ok) {
-            LOGE("Failed to initialize Vulkan with surface");
-            return;
-        }
-        
-        // Now initialize command processor with Vulkan backend
-        if (command_processor_ && memory_) {
-            if (command_processor_->initialize(memory_, vulkan_.get(), 
-                                               shader_translator_.get(), nullptr) != Status::Ok) {
-                LOGE("Failed to initialize command processor");
-            }
-        }
-        
-        LOGI("Vulkan surface initialized");
+    LOGI("GPU::set_surface called with window=%p", native_window);
+    
+    if (!vulkan_) {
+        LOGE("set_surface: Vulkan backend not created!");
+        return;
     }
+    
+    if (!native_window) {
+        LOGI("Clearing surface (window is null)");
+        // TODO: Handle surface destruction
+        return;
+    }
+    
+    // Initialize Vulkan with the native window
+    // Use default 1280x720 resolution, will be resized as needed
+    LOGI("Initializing Vulkan with window %p...", native_window);
+    Status status = vulkan_->initialize(native_window, 1280, 720);
+    if (status != Status::Ok) {
+        LOGE("Failed to initialize Vulkan with surface! Status=%d", static_cast<int>(status));
+        return;
+    }
+    LOGI("Vulkan initialized successfully");
+    
+    // Now initialize command processor with Vulkan backend
+    if (command_processor_ && memory_) {
+        LOGI("Initializing command processor...");
+        status = command_processor_->initialize(memory_, vulkan_.get(), 
+                                           shader_translator_.get(), nullptr);
+        if (status != Status::Ok) {
+            LOGE("Failed to initialize command processor! Status=%d", static_cast<int>(status));
+        } else {
+            LOGI("Command processor initialized");
+        }
+    }
+    
+    // Perform a test render to verify Vulkan is working
+    LOGI("Performing test render (clear to purple)...");
+    vulkan_->clear_screen(0.4f, 0.1f, 0.6f);  // Purple color for debugging
+    LOGI("Test render complete");
+    
+    LOGI("Vulkan surface fully initialized");
 }
 
 void Gpu::resize(u32 width, u32 height) {
@@ -159,10 +182,37 @@ void Gpu::process_commands() {
 }
 
 void Gpu::present() {
-    if (vulkan_) {
-        vulkan_->end_frame();
-        stats_.frames++;
+    static u64 present_count = 0;
+    present_count++;
+    
+    // Log every 60 frames (roughly every second at 60fps)
+    if (present_count % 60 == 1) {
+        LOGI("GPU::present() called (frame %llu)", present_count);
     }
+    
+    if (vulkan_) {
+        // If we're not in a frame, start one and clear to a debug color
+        if (!in_frame_) {
+            Status status = vulkan_->begin_frame();
+            if (status != Status::Ok) {
+                if (present_count % 60 == 1) {
+                    LOGE("Failed to begin frame for present");
+                }
+                return;
+            }
+        }
+        
+        Status status = vulkan_->end_frame();
+        if (status != Status::Ok) {
+            if (present_count % 60 == 1) {
+                LOGE("end_frame() failed");
+            }
+        }
+        stats_.frames++;
+    } else {
+        LOGE("GPU::present() - vulkan_ is null!");
+    }
+    
     frame_complete_ = true;
     in_frame_ = false;
 }
