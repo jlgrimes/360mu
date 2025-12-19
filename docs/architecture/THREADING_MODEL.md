@@ -181,11 +181,59 @@ Mitigations:
 4. `native/src/kernel/hle/xboxkrnl_extended.cpp` - Extended functions
 5. `native/src/kernel/kernel.cpp` - Thread creation
 
+## Critical Implementation Details
+
+### Thread-Local Storage (TLS) for Thread Identification
+
+In a true multi-threaded system, there is no single "current thread" - multiple threads run simultaneously. Xenia solves this with **thread-local storage**:
+
+```cpp
+// Each host thread has its own TLS slot
+thread_local GuestThread* g_current_guest_thread = nullptr;
+
+GuestThread* GetCurrentGuestThread() {
+    return g_current_guest_thread;
+}
+
+// Set when 1:1 host thread starts
+void SetCurrentGuestThread(GuestThread* thread) {
+    g_current_guest_thread = thread;
+}
+```
+
+When a syscall happens:
+1. The host thread executing the syscall calls `GetCurrentGuestThread()`
+2. Returns the `GuestThread*` associated with THIS host thread
+3. Syscall handler uses the correct `ThreadContext`
+
+**Do NOT** use a global "current thread ID" or "active thread" variable - this is a race condition in multi-threaded code.
+
+### Address Translation Consistency
+
+The JIT and HLE code MUST translate addresses identically:
+
+```cpp
+// JIT: masks ALL addresses to 29 bits (512MB physical)
+emit.AND_imm(addr_reg, addr_reg, 0x1FFFFFFFULL);
+
+// Memory: MUST do the same thing!
+GuestAddr Memory::translate_address(GuestAddr addr) {
+    return addr & 0x1FFFFFFF;  // Match JIT behavior exactly
+}
+```
+
+If translation differs:
+- JIT reads from physical `0x1003FC3C` 
+- HLE writes to virtual `0x7003FC3C` (different location!)
+- Completion flags never seen by game code
+
+The Xbox 360 address space has multiple mappings (0x00000000, 0x40000000, 0x80000000, etc.) that all map to the same 512MB of physical RAM.
+
 ## Testing
 
 After implementation, verify:
 
-1. Call of Duty: Black Ops boots past purple screen
+1. Call of Duty: Black Ops boots past purple screen ✓
 2. Multi-threaded games run correctly
 3. No deadlocks or race conditions
 4. Performance is acceptable on target hardware (Android)
