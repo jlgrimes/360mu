@@ -446,14 +446,23 @@ static void HLE_NtTerminateThread(Cpu* cpu, Memory* memory, u64* args, u64* resu
 
 static void HLE_KeGetCurrentThread(Cpu* cpu, Memory* memory, u64* args, u64* result) {
     // Return KTHREAD pointer for current thread
-    // We return a fake address that can be used to identify the thread
-    u32 hw_thread = cpu->get_context(0).thread_id % 6;
-    u32 handle = g_ext_hle.current_thread_handle[hw_thread];
+    // Use GetCurrentGuestThread() to get the actual thread handle
+    GuestThread* guest = GetCurrentGuestThread();
+    u32 handle = 0x80000001;  // Default fallback
     
-    if (handle == 0) handle = 0x80000001;  // Default main thread
+    if (guest) {
+        handle = guest->handle;
+    }
     
     // Return pseudo-KTHREAD pointer
-    *result = 0x80070000 + (handle & 0xFFFF) * 0x100;
+    // KTHREAD is at 0x80070000 + (handle & 0xFFFF) * 0x200
+    *result = 0x80070000 + (handle & 0xFFFF) * 0x200;
+    
+    static int ke_log_count = 0;
+    if (ke_log_count++ < 5) {
+        LOGI("KeGetCurrentThread: guest=%p, handle=0x%X, returning KTHREAD=0x%llX",
+             guest, handle, *result);
+    }
 }
 
 static void HLE_KeGetCurrentPrcb(Cpu* cpu, Memory* memory, u64* args, u64* result) {

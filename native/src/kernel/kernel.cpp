@@ -169,6 +169,16 @@ Status Kernel::load_xex(const std::string& path) {
          modules_.back().base_address,
          modules_.back().entry_point);
     
+    // Configure TLS template from XEX info
+    // This ensures each thread gets a copy of the game's TLS initial data
+    if (xex_module->tls_info.raw_data_address != 0 && xex_module->tls_info.data_size > 0) {
+        SetTlsTemplateInfo(
+            xex_module->tls_info.raw_data_address,
+            xex_module->tls_info.data_size,
+            xex_module->tls_info.slot_count
+        );
+    }
+    
     // Install import thunks for syscall handling
     install_import_thunks(*xex_module);
     

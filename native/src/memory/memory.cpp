@@ -399,6 +399,15 @@ void Memory::write_u32(GuestAddr addr, u32 value) {
     
     GuestAddr phys_addr = translate_address(addr);
     
+    // DEBUG: Trace writes to PCR region
+    if (phys_addr >= 0x00900000 && phys_addr < 0x00910000) {
+        static int pcr_write_count = 0;
+        // Always log non-zero values, limit zero writes
+        if (value != 0 || pcr_write_count++ < 20) {
+            LOGI("PCR WRITE: addr=0x%08X (phys=0x%08X), value=0x%08X", addr, phys_addr, value);
+        }
+    }
+    
     if (phys_addr + 3 >= main_memory_size_) return;
     value = byte_swap(value);
     memcpy(static_cast<u8*>(main_memory_) + phys_addr, &value, sizeof(u32));

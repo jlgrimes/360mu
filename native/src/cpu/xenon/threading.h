@@ -34,6 +34,11 @@ struct GuestThread;
 GuestThread* GetCurrentGuestThread();
 void SetCurrentGuestThread(GuestThread* thread);
 
+// === TLS TEMPLATE CONFIGURATION ===
+// Called by the kernel after loading an XEX to configure the TLS template.
+// This template data is copied to each new thread's TLS area.
+void SetTlsTemplateInfo(GuestAddr raw_data_address, u32 data_size, u32 slot_count);
+
 /**
  * Thread state
  */
@@ -110,6 +115,11 @@ struct GuestThread {
     GuestAddr stack_base;
     u32 stack_size;
     GuestAddr stack_limit;
+    
+    // Per-thread PCR (Processor Control Region)
+    // r13 points to this, and PCR[0] = TLS pointer
+    GuestAddr pcr_address;
+    GuestAddr tls_address;  // The actual TLS data
     
     // TLS (Thread Local Storage)
     std::array<u64, 64> tls_slots;

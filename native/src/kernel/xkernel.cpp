@@ -171,39 +171,27 @@ void XKernel::init_processors() {
         // The memory system should handle this through fastmem
         memory_->write_u32(kpcr, 0);  // Touch to ensure page is mapped
         
-        // KPCR structure offsets (approximate, based on Xbox 360)
-        // 0x00: Self pointer
-        memory_->write_u32(kpcr + 0x00, kpcr);
+        // KPCR structure offsets based on Xenia's X_KPCR
+        // 0x00: TLS pointer (set later by thread startup)
+        memory_->write_u32(kpcr + 0x00, 0);
         
-        // 0x04: PRCB (Processor Control Block) pointer
-        memory_->write_u32(kpcr + 0x04, kpcr + 0x100);
+        // 0x30: PCR self-pointer
+        memory_->write_u32(kpcr + 0x30, kpcr);
         
-        // 0x08: Interrupt stack
-        memory_->write_u32(kpcr + 0x08, kpcr + 0x2000);
+        // 0x70: Stack base (set later by thread startup)
+        memory_->write_u32(kpcr + 0x70, 0);
         
-        // 0x10: Current thread (starts as idle thread)
-        memory_->write_u32(kpcr + 0x10, idle_thread_);
+        // 0x74: Stack limit (set later by thread startup)
+        memory_->write_u32(kpcr + 0x74, 0);
         
-        // 0x14: Processor number
-        memory_->write_u32(kpcr + 0x14, i);
+        // 0x100: Current thread (starts as idle thread)
+        memory_->write_u32(kpcr + 0x100, idle_thread_);
         
-        // PRCB at offset 0x100
-        GuestAddr prcb = kpcr + 0x100;
+        // 0x10C: Current CPU number
+        memory_->write_u8(kpcr + 0x10C, i);
         
-        // 0x100 + 0x00: Current thread
-        memory_->write_u32(prcb + 0x00, idle_thread_);
-        
-        // 0x100 + 0x04: Next thread
-        memory_->write_u32(prcb + 0x04, 0);
-        
-        // 0x100 + 0x08: Idle thread
-        memory_->write_u32(prcb + 0x08, idle_thread_);
-        
-        // 0x100 + 0x0C: Processor number
-        memory_->write_u8(prcb + 0x0C, i);
-        
-        // 0x100 + 0x80: DPC data
-        // Initialize DPC queue as empty
+        // 0x150: DPC active flag
+        memory_->write_u32(kpcr + 0x150, 0);
         
         LOGD("Initialized KPCR for processor %u at 0x%08X", i, kpcr);
     }

@@ -93,6 +93,19 @@ extern "C" void jit_trace_mirror_access(GuestAddr addr, u32 is_store) {
 // Trace ALL memory accesses, not just mirror range, to find the crash source
 // Trace the ORIGINAL (pre-mask) address to catch invalid/negative pointers
 extern "C" void jit_trace_original_addr(GuestAddr original_addr, GuestAddr masked_addr, u32 is_store) {
+    // ALWAYS trace PCR region writes with the VALUE being written
+    // The value should be in the JIT's X1 register at this point
+    if (is_store && masked_addr >= 0x00900000 && masked_addr < 0x00910000) {
+        static int pcr_trace_count = 0;
+        if (pcr_trace_count++ < 100) {
+            // Note: We can't easily get the value here since it's in a register
+            // But we know if masked_addr == 0x00900000, that's PCR[0] = TLS pointer being cleared!
+            __android_log_print(ANDROID_LOG_ERROR, "JIT_PCR", 
+                "JIT STORE to PCR[0x%X]: original=0x%08llX (PCR[0]=TLS ptr!)",
+                (u32)(masked_addr - 0x00900000), (unsigned long long)original_addr);
+        }
+    }
+    
     if (!FeatureFlags::jit_trace_memory.load(std::memory_order_relaxed)) return;
     
     static int trace_count = 0;

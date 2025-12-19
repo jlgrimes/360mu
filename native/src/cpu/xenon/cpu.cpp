@@ -248,11 +248,42 @@ void Cpu::execute_with_context(u32 thread_id, ThreadContext& external_ctx, u64 c
     // Special tracking for the known stuck PC
     if (external_ctx.pc == 0x825FB308) {
         stuck_pc_count++;
-        if (stuck_pc_count == 1 || stuck_pc_count == 100 || stuck_pc_count == 1000 || 
-            stuck_pc_count == 10000 || stuck_pc_count == 100000) {
-            LOGI("STUCK PC 0x825FB308: count=%llu, time_base=%llu, CTR=%llu, r3=0x%llX, r4=0x%llX, r5=0x%llX, r6=0x%llX",
-                 stuck_pc_count, external_ctx.time_base, external_ctx.ctr,
-                 external_ctx.gpr[3], external_ctx.gpr[4], external_ctx.gpr[5], external_ctx.gpr[6]);
+        if (stuck_pc_count == 1) {
+            // Dump all registers on first hit
+            LOGI("STUCK PC 0x825FB308 FIRST HIT:");
+            LOGI("  r0-r7: 0x%llX 0x%llX 0x%llX 0x%llX 0x%llX 0x%llX 0x%llX 0x%llX",
+                 external_ctx.gpr[0], external_ctx.gpr[1], external_ctx.gpr[2], external_ctx.gpr[3],
+                 external_ctx.gpr[4], external_ctx.gpr[5], external_ctx.gpr[6], external_ctx.gpr[7]);
+            LOGI("  r8-r15: 0x%llX 0x%llX 0x%llX 0x%llX 0x%llX 0x%llX 0x%llX 0x%llX",
+                 external_ctx.gpr[8], external_ctx.gpr[9], external_ctx.gpr[10], external_ctx.gpr[11],
+                 external_ctx.gpr[12], external_ctx.gpr[13], external_ctx.gpr[14], external_ctx.gpr[15]);
+            LOGI("  r30-r31: 0x%llX 0x%llX, LR=0x%llX, CTR=0x%llX",
+                 external_ctx.gpr[30], external_ctx.gpr[31], external_ctx.lr, external_ctx.ctr);
+            // r13 is PCR, PCR[0] should be TLS pointer
+            u32 pcr = (u32)external_ctx.gpr[13];
+            LOGI("  r13(PCR)=0x%08X", pcr);
+            if (pcr > 0 && pcr < 0x20000000) {
+                u32 tls_ptr = memory_->read_u32(pcr + 0);  // PCR[0] = TLS pointer
+                
+                // Also read directly from fastmem for comparison
+                u8* fastmem = static_cast<u8*>(memory_->get_fastmem_base());
+                u32 tls_ptr_direct = 0;
+                if (fastmem) {
+                    u32 raw;
+                    memcpy(&raw, fastmem + (pcr & 0x1FFFFFFF), sizeof(u32));
+                    tls_ptr_direct = __builtin_bswap32(raw);  // Big-endian swap
+                }
+                
+                LOGI("  PCR[0](TLS ptr)=0x%08X, direct_fastmem=0x%08X", tls_ptr, tls_ptr_direct);
+                if (tls_ptr > 0 && tls_ptr < 0x20000000) {
+                    LOGI("  TLS[0-7]: 0x%X 0x%X 0x%X 0x%X 0x%X 0x%X 0x%X 0x%X",
+                         memory_->read_u32(tls_ptr+0), memory_->read_u32(tls_ptr+4), memory_->read_u32(tls_ptr+8), memory_->read_u32(tls_ptr+12),
+                         memory_->read_u32(tls_ptr+16), memory_->read_u32(tls_ptr+20), memory_->read_u32(tls_ptr+24), memory_->read_u32(tls_ptr+28));
+                }
+            }
+        } else if (stuck_pc_count == 100 || stuck_pc_count == 1000) {
+            LOGI("STUCK PC 0x825FB308: count=%llu, LR=0x%08llX, r3=0x%llX",
+                 stuck_pc_count, external_ctx.lr, external_ctx.gpr[3]);
         }
         
         // WORKAROUND: If the loop is stuck with an invalid destination pointer (r3 < 0x1000),
@@ -269,6 +300,17 @@ void Cpu::execute_with_context(u32 thread_id, ThreadContext& external_ctx, u64 c
             LOGI("Left stuck PC after %llu iterations, now at PC=0x%08llX", 
                  stuck_pc_count, external_ctx.pc);
             stuck_pc_count = 0;
+        }
+    }
+    
+    // Trace the caller of the stuck memset (around 0x824D35D4)
+    static u64 trace_count = 0;
+    if (external_ctx.pc >= 0x824D3500 && external_ctx.pc <= 0x824D3600) {
+        if (trace_count < 20) {
+            trace_count++;
+            LOGI("TRACE PC=0x%08llX: r3=0x%llX, r4=0x%llX, r5=0x%llX, r11=0x%llX, r12=0x%llX, LR=0x%08llX",
+                 external_ctx.pc, external_ctx.gpr[3], external_ctx.gpr[4], external_ctx.gpr[5],
+                 external_ctx.gpr[11], external_ctx.gpr[12], external_ctx.lr);
         }
     }
     

@@ -36,12 +36,32 @@ namespace x360mu {
 // When a syscall happens, GetCurrentGuestThread() returns the correct thread.
 thread_local GuestThread* g_current_guest_thread = nullptr;
 
+// === TLS TEMPLATE DATA ===
+// Xbox 360 executables have a TLS template section that contains initial values
+// for thread-local variables. When a thread is created, this template data
+// must be copied to the thread's TLS area.
+static struct {
+    GuestAddr raw_data_address = 0;  // Address of TLS template in guest memory
+    u32 data_size = 0;               // Size of initialized TLS data  
+    u32 slot_count = 0;              // Number of TLS slots (usually 64)
+    bool initialized = false;
+} g_tls_template;
+
 GuestThread* GetCurrentGuestThread() {
     return g_current_guest_thread;
 }
 
 void SetCurrentGuestThread(GuestThread* thread) {
     g_current_guest_thread = thread;
+}
+
+void SetTlsTemplateInfo(GuestAddr raw_data_address, u32 data_size, u32 slot_count) {
+    g_tls_template.raw_data_address = raw_data_address;
+    g_tls_template.data_size = data_size;
+    g_tls_template.slot_count = slot_count;
+    g_tls_template.initialized = true;
+    LOGI("TLS template configured: addr=0x%08X, size=%u, slots=%u",
+         raw_data_address, data_size, slot_count);
 }
 
 ThreadScheduler::ThreadScheduler() {
@@ -183,29 +203,172 @@ GuestThread* ThreadScheduler::create_thread(GuestAddr entry_point, GuestAddr par
                       MemoryRegion::Read | MemoryRegion::Write);
     
     // Allocate Thread Local Storage (TLS) 
-    // Xbox 360 games expect r13 to point to thread-local storage area.
-    // TLS is typically at 0x00800000+ like XThread does.
-    static constexpr u32 TLS_SIZE = 64 * 4;  // 64 slots * 4 bytes each = 256 bytes
-    static std::atomic<GuestAddr> next_tls{0x00800000};
-    GuestAddr tls_address = next_tls.fetch_add(TLS_SIZE, std::memory_order_relaxed);
-    memory_->allocate(tls_address, TLS_SIZE, MemoryRegion::Read | MemoryRegion::Write);
-    
-    // Zero-initialize TLS
-    for (u32 i = 0; i < TLS_SIZE / 4; i++) {
-        memory_->write_u32(tls_address + i * 4, 0);
+    // TLS area must be large enough for the template data plus extra slots.
+    // The XEX TLS info tells us the size needed.
+    u32 tls_size = 256;  // Default: 64 slots * 4 bytes
+    if (g_tls_template.initialized && g_tls_template.data_size > 0) {
+        // Use the larger of template size or 256 bytes
+        tls_size = std::max(tls_size, g_tls_template.data_size);
+        // Round up to 256-byte boundary for alignment
+        tls_size = (tls_size + 255) & ~255u;
     }
     
-    LOGI("Allocated TLS for thread at 0x%08X", tls_address);
+    static std::atomic<GuestAddr> next_tls{0x00800000};
+    GuestAddr tls_address = next_tls.fetch_add(tls_size, std::memory_order_relaxed);
+    memory_->allocate(tls_address, tls_size, MemoryRegion::Read | MemoryRegion::Write);
+    
+    // Initialize TLS with template data from XEX, or zero if no template
+    if (g_tls_template.initialized && g_tls_template.raw_data_address != 0 && g_tls_template.data_size > 0) {
+        // Copy TLS template data from XEX to thread's TLS area
+        for (u32 i = 0; i < g_tls_template.data_size; i += 4) {
+            u32 value = memory_->read_u32(g_tls_template.raw_data_address + i);
+            memory_->write_u32(tls_address + i, value);
+        }
+        // Zero the remaining TLS area
+        for (u32 i = g_tls_template.data_size; i < tls_size; i += 4) {
+            memory_->write_u32(tls_address + i, 0);
+        }
+        LOGI("Allocated TLS at 0x%08X (copied %u bytes from template 0x%08X)",
+             tls_address, g_tls_template.data_size, g_tls_template.raw_data_address);
+    } else {
+        // Zero-initialize TLS
+        for (u32 i = 0; i < tls_size; i += 4) {
+            memory_->write_u32(tls_address + i, 0);
+        }
+        LOGI("Allocated TLS at 0x%08X (zero-initialized, no template)", tls_address);
+    }
+    
+    // Allocate per-thread PCR (Processor Control Region)
+    // In Xenia, each thread has its own PCR and r13 points to PCR, not TLS!
+    // PCR layout (from Xenia's X_KPCR):
+    //   0x00: tls_ptr
+    //   0x30: pcr_ptr (self)
+    //   0x70: stack_base_ptr
+    //   0x74: stack_end_ptr
+    //   0x100: current_thread (KTHREAD)
+    //   0x10C: current_cpu
+    //   0x150: dpc_active
+    static std::atomic<GuestAddr> next_pcr{0x00900000};
+    constexpr u32 PCR_SIZE = 0x2D8;  // Same as Xenia
+    GuestAddr pcr_address = next_pcr.fetch_add(PCR_SIZE, std::memory_order_relaxed);
+    memory_->allocate(pcr_address, PCR_SIZE, MemoryRegion::Read | MemoryRegion::Write);
+    
+    // Zero PCR first
+    for (u32 i = 0; i < PCR_SIZE; i += 4) {
+        memory_->write_u32(pcr_address + i, 0);
+    }
+    
+    // Store PCR address in thread for later KTHREAD setup
+    thread->pcr_address = pcr_address;
     
     // Setup initial context
+    // r13 = TLS data address directly (games write to r13-relative addresses)
+    // The PCR model doesn't work because games zero their TLS area through r13
     thread->context.pc = entry_point;
     thread->context.gpr[1] = thread->stack_limit - 0x100;  // Stack pointer (r1)
     thread->context.gpr[3] = param;                         // First argument (r3)
-    thread->context.gpr[13] = tls_address;                  // TLS pointer (r13)
+    thread->context.gpr[13] = tls_address;                  // TLS data directly (NOT PCR!)
     thread->context.lr = 0;                                 // Return to kernel on exit
     thread->context.running = false;
     thread->context.thread_id = thread->thread_id;
     thread->context.memory = memory_;  // For MMIO access
+    
+    // Initialize KTHREAD structure in guest memory
+    GuestAddr kthread_addr = 0x80070000 + (thread->handle & 0xFFFF) * 0x200;
+    constexpr u32 KTHREAD_SIZE = 0x200;  // Larger to cover all fields
+    
+    // Allocate and zero the KTHREAD area
+    memory_->allocate(kthread_addr, KTHREAD_SIZE, MemoryRegion::Read | MemoryRegion::Write);
+    for (u32 i = 0; i < KTHREAD_SIZE; i += 4) {
+        memory_->write_u32(kthread_addr + i, 0);
+    }
+    
+    // Initialize KTHREAD fields exactly like Xenia's InitializeGuestObject()
+    // Type = ThreadObject (6)
+    memory_->write_u8(kthread_addr + 0x00, 6);
+    memory_->write_u8(kthread_addr + 0x02, 0x50);  // Size in dwords
+    memory_->write_u32(kthread_addr + 0x04, 0);    // SignalState
+    
+    // LIST_ENTRY structures must point to themselves (empty list)
+    // 0x010-0x014: Timer wait list (Flink/Blink point to 0x010)
+    memory_->write_u32(kthread_addr + 0x010, kthread_addr + 0x010);
+    memory_->write_u32(kthread_addr + 0x014, kthread_addr + 0x010);
+    
+    // 0x040-0x04C: More list entries
+    memory_->write_u32(kthread_addr + 0x040, kthread_addr + 0x018 + 8);
+    memory_->write_u32(kthread_addr + 0x044, kthread_addr + 0x018 + 8);
+    memory_->write_u32(kthread_addr + 0x048, kthread_addr);
+    memory_->write_u32(kthread_addr + 0x04C, kthread_addr + 0x018);
+    
+    // 0x054-0x056: Flags
+    memory_->write_u16(kthread_addr + 0x054, 0x102);
+    memory_->write_u16(kthread_addr + 0x056, 1);
+    
+    // Stack info
+    memory_->write_u32(kthread_addr + 0x05C, thread->stack_base);   // stack_base
+    memory_->write_u32(kthread_addr + 0x060, thread->stack_limit);  // stack_limit
+    memory_->write_u32(kthread_addr + 0x068, tls_address);          // tls_address
+    memory_->write_u8(kthread_addr + 0x06C, 0);
+    
+    // 0x074-0x080: More list entries (point to themselves)
+    memory_->write_u32(kthread_addr + 0x074, kthread_addr + 0x074);
+    memory_->write_u32(kthread_addr + 0x078, kthread_addr + 0x074);
+    memory_->write_u32(kthread_addr + 0x07C, kthread_addr + 0x07C);
+    memory_->write_u32(kthread_addr + 0x080, kthread_addr + 0x07C);
+    
+    // 0x084: process_info_block (we don't have this, use 0)
+    memory_->write_u32(kthread_addr + 0x084, 0);
+    memory_->write_u8(kthread_addr + 0x08B, 1);
+    
+    // 0x09C: Flags
+    memory_->write_u32(kthread_addr + 0x09C, 0xFDFFD7FF);
+    
+    memory_->write_u8(kthread_addr + 0xBF, thread->thread_id % 6); // current_cpu
+    memory_->write_u32(kthread_addr + 0xD0, thread->stack_base);   // stack_alloc_base
+    
+    // 0x130: create_time
+    memory_->write_u64(kthread_addr + 0x130, 0);  // TODO: proper time
+    
+    // 0x144-0x148: More list entries
+    memory_->write_u32(kthread_addr + 0x144, kthread_addr + 0x144);
+    memory_->write_u32(kthread_addr + 0x148, kthread_addr + 0x144);
+    
+    memory_->write_u32(kthread_addr + 0x14C, thread->thread_id);   // thread_id
+    memory_->write_u32(kthread_addr + 0x150, entry_point);         // start_address
+    
+    // 0x154-0x158: More list entries
+    memory_->write_u32(kthread_addr + 0x154, kthread_addr + 0x154);
+    memory_->write_u32(kthread_addr + 0x158, kthread_addr + 0x154);
+    
+    memory_->write_u32(kthread_addr + 0x160, 0);                   // last_error
+    memory_->write_u32(kthread_addr + 0x16C, creation_flags);      // creation_flags
+    memory_->write_u32(kthread_addr + 0x17C, 1);
+    
+    // Store addresses in thread struct
+    thread->tls_address = tls_address;
+    
+    // Now initialize the PCR structure
+    // PCR layout (from Xenia's X_KPCR):
+    //   0x00: tls_ptr - games read TLS pointer from here via r13+0
+    //   0x30: pcr_ptr (self)
+    //   0x70: stack_base_ptr
+    //   0x74: stack_end_ptr
+    //   0x100: current_thread (KTHREAD pointer)
+    //   0x10C: current_cpu
+    //   0x150: dpc_active
+    GuestAddr pcr = thread->pcr_address;
+    memory_->write_u32(pcr + 0x00, tls_address);          // tls_ptr - CRITICAL!
+    memory_->write_u32(pcr + 0x30, pcr);                  // pcr_ptr (self)
+    memory_->write_u32(pcr + 0x70, thread->stack_base);   // stack_base_ptr
+    memory_->write_u32(pcr + 0x74, thread->stack_limit);  // stack_end_ptr
+    memory_->write_u32(pcr + 0x100, kthread_addr);        // current_thread
+    memory_->write_u8(pcr + 0x10C, thread->thread_id % 6); // current_cpu
+    memory_->write_u32(pcr + 0x150, 0);                   // dpc_active
+    
+    // VERIFY the write worked
+    u32 verify_tls = memory_->read_u32(pcr + 0x00);
+    LOGI("Initialized PCR at 0x%08X, KTHREAD at 0x%08X for thread %u (TLS=0x%08X, verify_pcr[0]=0x%08X)",
+         pcr, kthread_addr, thread->thread_id, tls_address, verify_tls);
     
     // Check creation flags
     bool start_suspended = (creation_flags & 0x04) != 0;  // CREATE_SUSPENDED
@@ -241,6 +404,26 @@ GuestThread* ThreadScheduler::create_thread(GuestAddr entry_point, GuestAddr par
                  ptr->thread_id, (u32)ptr->context.pc);
             
             ptr->is_running.store(true);
+            
+            // Update KPCR's current thread pointer to this thread's KTHREAD
+            // This is crucial for game code that reads current thread directly from KPCR
+            {
+                u32 cpu_id = ptr->thread_id % 6;  // Assign to a processor
+                GuestAddr kpcr = 0x00010000 + (cpu_id * 0x1000);  // KPCR base from xkernel
+                GuestAddr kthread = 0x80070000 + (ptr->handle & 0xFFFF) * 0x200;  // This thread's KTHREAD
+                GuestAddr tls = ptr->tls_address;  // TLS data address (NOT r13, which is PCR!)
+                
+                // KPCR fields based on Xenia's X_KPCR
+                memory->write_u32(kpcr + 0x00, tls);      // KPCR + 0x0 = tls_ptr
+                memory->write_u32(kpcr + 0x30, kpcr);     // KPCR + 0x30 = pcr_ptr (self)
+                memory->write_u32(kpcr + 0x70, ptr->stack_base);   // stack_base_ptr
+                memory->write_u32(kpcr + 0x74, ptr->stack_limit);  // stack_end_ptr
+                memory->write_u32(kpcr + 0x100, kthread); // KPCR + 0x100 = current_thread
+                memory->write_u8(kpcr + 0x10C, cpu_id);   // KPCR + 0x10C = current_cpu
+                
+                LOGI("Updated KPCR[%u]: tls=0x%08X, kthread=0x%08X, stack=0x%08X-0x%08X, pcr=0x%08X",
+                     cpu_id, tls, kthread, ptr->stack_base, ptr->stack_limit, ptr->pcr_address);
+            }
             
             // Wait until we should run (handles CREATE_SUSPENDED)
             {

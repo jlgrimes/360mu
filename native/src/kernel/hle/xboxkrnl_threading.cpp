@@ -160,9 +160,25 @@ static void HLE_KeGetCurrentProcessorNumber(Cpu* cpu, Memory* memory, u64* args,
  * Ordinal: 51
  */
 static void HLE_KeGetCurrentThread(Cpu* cpu, Memory* memory, u64* args, u64* result) {
-    u32 handle = g_ktm ? g_ktm->get_current_thread_handle() : 0x80000001;
+    // Use GetCurrentGuestThread() to get the actual thread handle
+    GuestThread* guest = GetCurrentGuestThread();
+    u32 handle = 0x80000001;  // Default fallback
+    
+    if (guest) {
+        handle = guest->handle;
+    } else if (g_ktm) {
+        handle = g_ktm->get_current_thread_handle();
+    }
+    
     // Return a pseudo-KTHREAD pointer based on handle
-    *result = 0x80070000 + (handle & 0xFFFF) * 0x100;
+    // KTHREAD is at 0x80070000 + (handle & 0xFFFF) * 0x200
+    *result = 0x80070000 + (handle & 0xFFFF) * 0x200;
+    
+    static int log_count = 0;
+    if (log_count++ < 5) {
+        LOGI("KeGetCurrentThread (threading): guest=%p, handle=0x%X, result=0x%llX",
+             guest, handle, *result);
+    }
 }
 
 /**
