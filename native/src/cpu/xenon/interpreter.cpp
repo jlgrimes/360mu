@@ -139,20 +139,7 @@ u32 Interpreter::execute_one(ThreadContext& ctx) {
 }
 
 void Interpreter::execute(ThreadContext& ctx, u64 cycles) {
-    // #region agent log - HYPOTHESIS J: Check if interpreter is being used
-    static int interp_log = 0;
-    if (interp_log++ < 20) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"J\",\"location\":\"interpreter.cpp:execute\",\"message\":\"INTERPRETER FALLBACK\",\"data\":{\"call\":%d,\"pc\":%u,\"cycles\":%llu}}\n", interp_log, (u32)ctx.pc, (unsigned long long)cycles); fclose(f); }
-    }
-    // #endregion
-    
     u64 executed = 0;
-    
-    // #region agent log - HYPOTHESIS K: Track spin loop addresses
-    static GuestAddr last_pc = 0;
-    static int same_pc_count = 0;
-    // #endregion
     
     while (executed < cycles && ctx.running && !ctx.interrupted) {
         // Check for PC=0 termination (used for DPC return)
@@ -161,19 +148,6 @@ void Interpreter::execute(ThreadContext& ctx, u64 cycles) {
             ctx.running = false;
             break;
         }
-        
-        // #region agent log - HYPOTHESIS K: Detect spin loop
-        if (ctx.pc == last_pc) {
-            same_pc_count++;
-            if (same_pc_count == 100 || same_pc_count == 1000) {
-                FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-                if (f) { fprintf(f, "{\"hypothesisId\":\"K\",\"location\":\"interpreter.cpp:execute\",\"message\":\"SPIN LOOP DETECTED\",\"data\":{\"pc\":%u,\"count\":%d,\"r3\":%llu,\"r4\":%llu}}\n", (u32)ctx.pc, same_pc_count, ctx.gpr[3], ctx.gpr[4]); fclose(f); }
-            }
-        } else {
-            same_pc_count = 0;
-        }
-        last_pc = ctx.pc;
-        // #endregion
         
         executed += execute_one(ctx);
     }

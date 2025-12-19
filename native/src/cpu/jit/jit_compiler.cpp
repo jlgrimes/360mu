@@ -61,68 +61,8 @@ extern "C" void jit_trace_store(GuestAddr addr) {
     }
 }
 
-// #region agent log - Hypothesis AA: Track JIT writes to event addresses
-// Returns 1 if this write should be SKIPPED (blocked), 0 otherwise
-extern "C" int jit_trace_event_store(GuestAddr addr, u32 value) {
-    // Track writes to our problematic event addresses (both virtual and physical)
-    GuestAddr phys = addr;
-    if (addr >= 0x80000000 && addr < 0xA0000000) {
-        phys = addr & 0x1FFFFFFF;
-    }
-    
-    // Check if in event range for logging
-    bool is_event_range = (phys >= 0x1FFEFC20 && phys <= 0x1FFEFC60);
-    
-    // Only block zero writes to SIGNAL_STATE fields (offset +4 from event base)
-    // Known signal_state addresses: 0x1FFEFC30, 0x1FFEFC44, 0x1FFEFC48, 0x1FFEFC4C
-    bool is_signal_state = (phys == 0x1FFEFC30 || phys == 0x1FFEFC44 || 
-                            phys == 0x1FFEFC48 || phys == 0x1FFEFC4C ||
-                            phys == 0x1FFEFC50 || phys == 0x1FFEFC54);
-    
-    if (is_event_range) {
-        static int event_store_log = 0;
-        bool should_block = (is_signal_state && value == 0);
-        if (event_store_log++ < 200) {
-            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-            if (f) { 
-                fprintf(f, "{\"hypothesisId\":\"AA\",\"location\":\"jit_trace_event_store\",\"message\":\"JIT_EVENT_STORE\",\"data\":{\"virt\":\"%08X\",\"phys\":\"%08X\",\"value\":%u,\"call\":%d,\"is_signal\":%d,\"blocked\":%d}}\n", 
-                    (u32)addr, (u32)phys, value, event_store_log, is_signal_state ? 1 : 0, should_block ? 1 : 0); 
-                fclose(f); 
-            }
-        }
-        
-        // FIX: Block zero writes ONLY to signal_state fields
-        if (should_block) {
-            return 1;  // Skip this write
-        }
-    }
-    return 0;  // Allow write
-}
-// #endregion
-
 extern "C" void jit_mmio_write_u32(void* mem, GuestAddr addr, u32 value) {
     static int call_count = 0;
-    
-    // #region agent log - Hypothesis M: Track MMIO addresses and ring buffer writes
-    // Ring buffer registers are at offset 0x0700-0x070F (addr 0x7FC01C00-0x7FC01C3F)
-    static int mmio_log_count = 0;
-    GuestAddr phys_addr = addr;
-    if (addr >= 0x80000000 && addr < 0xA0000000) {
-        phys_addr = addr & 0x1FFFFFFF;  // Translate to physical
-    }
-    u32 gpu_offset = (phys_addr >= 0x7FC00000) ? (phys_addr - 0x7FC00000) / 4 : 0;
-    
-    // Log ring buffer writes specifically (offset 0x700-0x70F)
-    if (gpu_offset >= 0x700 && gpu_offset <= 0x70F) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"M\",\"location\":\"jit_mmio_write_u32\",\"message\":\"RING BUFFER WRITE\",\"data\":{\"virt_addr\":\"%08X\",\"phys_addr\":\"%08X\",\"offset\":%u,\"value\":%u}}\n", addr, phys_addr, gpu_offset, value); fclose(f); }
-    }
-    // Log first 50 MMIO writes for debugging
-    else if (mmio_log_count++ < 50) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"M\",\"location\":\"jit_mmio_write_u32\",\"message\":\"MMIO write\",\"data\":{\"virt_addr\":\"%08X\",\"phys_addr\":\"%08X\",\"offset\":%u,\"value\":%u}}\n", addr, phys_addr, gpu_offset, value); fclose(f); }
-    }
-    // #endregion
     
     if (call_count < 10) {
         LOGI("MMIO write_u32: addr=0x%08X value=0x%08X", addr, value);
@@ -144,29 +84,7 @@ extern "C" u16 jit_mmio_read_u16(void* mem, GuestAddr addr) {
 }
 
 extern "C" u32 jit_mmio_read_u32(void* mem, GuestAddr addr) {
-    u32 value = static_cast<Memory*>(mem)->read_u32(addr);
-    
-    // SPIN LOOP ANALYSIS: Track frequent reads to detect polling
-    static std::unordered_map<GuestAddr, u32> read_counts;
-    static int total_reads = 0;
-    static int logged_addrs = 0;
-    
-    read_counts[addr]++;
-    total_reads++;
-    
-    // Log addresses being read more than 100 times (likely polling)
-    if (read_counts[addr] == 100 && logged_addrs < 20) {
-        logged_addrs++;
-        LOGI("POLL DETECTED: addr=0x%08X read 100+ times, value=0x%08X", (u32)addr, value);
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { 
-            fprintf(f, "{\"hypothesisId\":\"POLL\",\"message\":\"POLLING_ADDR\",\"data\":{\"addr\":\"%08X\",\"value\":\"%08X\",\"count\":100}}\n", 
-                    (u32)addr, value); 
-            fclose(f); 
-        }
-    }
-    
-    return value;
+    return static_cast<Memory*>(mem)->read_u32(addr);
 }
 
 extern "C" u64 jit_mmio_read_u64(void* mem, GuestAddr addr) {
@@ -320,24 +238,9 @@ u8* JitCompiler::get_memory_base() const {
 u64 JitCompiler::execute(ThreadContext& ctx, u64 cycles) {
     u64 cycles_executed = 0;
     
-    // #region agent log - NEW HYPOTHESIS I: Check JIT execution path
-    static int jit_exec_log = 0;
-    if (jit_exec_log++ < 30) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"I\",\"location\":\"jit_compiler.cpp:execute\",\"message\":\"JIT execute entry\",\"data\":{\"call\":%d,\"fastmem_enabled\":%d,\"has_dispatcher\":%d,\"pc_before\":%u}}\n", jit_exec_log, fastmem_enabled_, dispatcher_!=nullptr, (u32)ctx.pc); fclose(f); }
-    }
-    // #endregion
-    
 #ifdef __aarch64__
     // JIT requires fastmem to be enabled - without it, memory accesses will crash
     if (!fastmem_enabled_) {
-        // #region agent log - Hypothesis I: fastmem not enabled
-        static int no_fastmem_log = 0;
-        if (no_fastmem_log++ < 5) {
-            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-            if (f) { fprintf(f, "{\"hypothesisId\":\"I\",\"location\":\"jit_compiler.cpp:execute\",\"message\":\"FASTMEM NOT ENABLED - falling back\",\"data\":{}}\n"); fclose(f); }
-        }
-        // #endregion
         // Return 0 to signal CPU should fall back to interpreter
         // Don't set interrupted - that's for syscalls
         return 0;
@@ -347,11 +250,6 @@ u64 JitCompiler::execute(ThreadContext& ctx, u64 cycles) {
     if (dispatcher_) {
         ctx.running = true;
         ctx.interrupted = false;
-        
-        // #region agent log - Hypothesis I: About to enter block loop
-        static int loop_entry_log = 0;
-        GuestAddr start_pc = ctx.pc;
-        // #endregion
         
         // Store cycle limit in context or use register
         while (ctx.running && !ctx.interrupted && cycles_executed < cycles) {
@@ -370,52 +268,12 @@ u64 JitCompiler::execute(ThreadContext& ctx, u64 cycles) {
                 break;
             }
             
-            // #region agent log - Hypothesis I: Block compiled, about to execute
-            static int block_exec_log = 0;
-            GuestAddr pc_before = ctx.pc;
-            if (block_exec_log++ < 20) {
-                FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-                if (f) { fprintf(f, "{\"hypothesisId\":\"I\",\"location\":\"jit_compiler.cpp:execute\",\"message\":\"executing block\",\"data\":{\"block_num\":%d,\"pc\":%u,\"block_size\":%u}}\n", block_exec_log, (u32)ctx.pc, block->size); fclose(f); }
-            }
-            // #endregion
-            
             // Execute the block
             using BlockFn = void(*)(ThreadContext*, u8*);
             BlockFn fn = reinterpret_cast<BlockFn>(block->code);
             
             // Execute the block (fastmem_base is now embedded in block code)
             fn(&ctx, nullptr);
-            
-            // #region agent log - Hypothesis I: After block execution
-            if (block_exec_log <= 20) {
-                FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-                if (f) { fprintf(f, "{\"hypothesisId\":\"I\",\"location\":\"jit_compiler.cpp:execute\",\"message\":\"after block\",\"data\":{\"pc_before\":%u,\"pc_after\":%u,\"running\":%d,\"interrupted\":%d}}\n", (u32)pc_before, (u32)ctx.pc, ctx.running, ctx.interrupted); fclose(f); }
-            }
-            // #endregion
-            
-            // #region agent log - Hypothesis K: Detect and BREAK spin loops in JIT
-            static GuestAddr jit_last_pc = 0;
-            static int jit_spin_count = 0;
-            if (ctx.pc == pc_before) {
-                jit_spin_count++;
-                if (jit_spin_count == 50 || jit_spin_count == 500 || jit_spin_count == 5000) {
-                    FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-                    if (f) { fprintf(f, "{\"hypothesisId\":\"K\",\"location\":\"jit_compiler.cpp:execute\",\"message\":\"JIT SPIN LOOP\",\"data\":{\"pc\":%u,\"count\":%d,\"r3\":%llu,\"r4\":%llu,\"r5\":%llu}}\n", (u32)ctx.pc, jit_spin_count, ctx.gpr[3], ctx.gpr[4], ctx.gpr[5]); fclose(f); }
-                }
-                
-                // DISABLED: Breaking spin loops by advancing PC causes bad branches
-                // Instead, rely on event signaling to naturally break loops
-                // The game will spin but our event faking should eventually let it proceed
-                if (jit_spin_count >= 10000) {
-                    // Just yield to let other threads run and our worker set events
-                    std::this_thread::yield();
-                    jit_spin_count = 0;  // Reset counter but don't break the loop
-                }
-            } else {
-                jit_spin_count = 0;
-            }
-            jit_last_pc = ctx.pc;
-            // #endregion
             
             cycles_executed += block->size;
             block->execution_count++;
@@ -1374,17 +1232,51 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
     // Save original virtual address for MMIO path (X2 = original EA)
     emit.ORR(arm64::X2, arm64::XZR, arm64::X0);
     
-    // === FIX v2: Proper MMIO detection with correct virtual address handling ===
-    // Virtual addresses 0x80000000-0x9FFFFFFF map to physical by &0x1FFFFFFF
-    // Addresses >= 0xA0000000 are kernel/other and should NOT go to GPU MMIO
+    // === FIX v3: Proper MMIO detection including GPU virtual address ranges ===
+    // GPU MMIO can be accessed via:
+    // 1. Direct physical: 0x7FC00000-0x7FFFFFFF
+    // 2. Virtual mapping: 0xC0000000-0xC3FFFFFF -> 0x7FC00000+
+    // 3. Alternate virtual: 0xEC800000-0xECFFFFFF -> 0x7FC00000+
+    // 4. Usermode virtual: 0x80000000-0x9FFFFFFF -> physical via &0x1FFFFFFF
     
-    // First check: if addr >= 0xA0000000, it's NOT MMIO (kernel space)
+    // First, check for GPU MMIO virtual addresses (0xC0000000-0xC3FFFFFF)
+    // These map directly to GPU registers and MUST go to MMIO path
+    emit.MOV_imm(arm64::X16, 0xC0000000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* below_gpu_virt = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch if addr < 0xC0000000
+    
+    emit.MOV_imm(arm64::X16, 0xC4000000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* is_gpu_virt = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch to MMIO path if addr < 0xC4000000 (in GPU virtual range)
+    
+    // Not in primary GPU virtual range, continue checking other ranges
+    emit.patch_branch(reinterpret_cast<u32*>(below_gpu_virt), emit.current());
+    
+    // Check alternate GPU virtual range (0xEC800000-0xECFFFFFF)
+    emit.MOV_imm(arm64::X16, 0xEC800000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* below_alt_gpu = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch if addr < 0xEC800000
+    
+    emit.MOV_imm(arm64::X16, 0xED000000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* is_alt_gpu = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch to MMIO path if addr < 0xED000000 (in alt GPU range)
+    
+    // Not in alternate GPU range either
+    emit.patch_branch(reinterpret_cast<u32*>(below_alt_gpu), emit.current());
+    
+    // Now check for non-MMIO kernel space (addresses that are NOT GPU virtual)
+    // Skip to fastmem for addresses >= 0xA0000000 that are NOT GPU virtual
+    // (we already checked and excluded GPU virtual ranges above)
     emit.MOV_imm(arm64::X16, 0xA0000000ULL);
     emit.CMP(arm64::X0, arm64::X16);
     u8* kernel_space = emit.current();
     emit.B_cond(arm64_cond::CS, 0);  // Branch if addr >= 0xA0000000 (kernel, not MMIO)
     
-    // Check if virtual (0x80000000-0x9FFFFFFF)
+    // Check if usermode virtual (0x80000000-0x9FFFFFFF)
     emit.MOV_imm(arm64::X16, 0x80000000ULL);
     emit.CMP(arm64::X0, arm64::X16);
     u8* is_physical = emit.current();
@@ -1410,6 +1302,11 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
     emit.B_cond(arm64_cond::CS, 0);  // Branch if phys >= 0x80000000 (not in GPU range)
     
     // === MMIO PATH ===
+    // All GPU virtual and physical addresses land here
+    // Patch GPU virtual address branches to here
+    emit.patch_branch(reinterpret_cast<u32*>(is_gpu_virt), emit.current());
+    emit.patch_branch(reinterpret_cast<u32*>(is_alt_gpu), emit.current());
+    
     // Call helper function with ORIGINAL virtual address (X2)
     // jit_mmio_write_XX(memory, addr, value) - Memory class will handle MMIO routing
     
@@ -1467,66 +1364,6 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
     emit.ORR(arm64::X0, arm64::XZR, arm64::X2);  // Restore original EA from X2
     load_gpr(emit, arm64::X1, inst.rs);
     
-    // #region agent log - Hypothesis AB: Check for event address writes in fastmem
-    // Check if this is a write to our problematic event addresses (before translation)
-    // Only for 32-bit stores (stw/stwu/stwx)
-    u8* skip_store_label = nullptr;
-    if (inst.opcode == 36 || inst.opcode == 37 || (inst.opcode == 31 && inst.xo == 151)) {
-        // Check if addr is in our event range (0x9FFEFC40-0x9FFEFC50 or physical equivalents)
-        // We check by masking to get physical address and comparing
-        // Physical range: 0x1FFEFC40 - 0x1FFEFC50
-        
-        // Save original address and value
-        emit.ORR(arm64::X17, arm64::XZR, arm64::X0);
-        emit.ORR(arm64::X18, arm64::XZR, arm64::X1);
-        
-        // Compute physical: if >= 0x80000000, mask with 0x1FFFFFFF
-        emit.MOV_imm(arm64::X16, 0x80000000ULL);
-        emit.CMP(arm64::X0, arm64::X16);
-        u8* already_phys = emit.current();
-        emit.B_cond(arm64_cond::CC, 0);  // If < 0x80000000, skip masking
-        emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
-        emit.AND(arm64::X0, arm64::X0, arm64::X16);
-        emit.patch_branch(reinterpret_cast<u32*>(already_phys), emit.current());
-        
-        // Check if in range 0x1FFEFC20 - 0x1FFEFC64 (expanded to cover all init events)
-        emit.MOV_imm(arm64::X16, 0x1FFEFC20ULL);
-        emit.CMP(arm64::X0, arm64::X16);
-        u8* below_range = emit.current();
-        emit.B_cond(arm64_cond::CC, 0);  // Below range
-        
-        emit.MOV_imm(arm64::X16, 0x1FFEFC64ULL);
-        emit.CMP(arm64::X0, arm64::X16);
-        u8* above_range = emit.current();
-        emit.B_cond(arm64_cond::CS, 0);  // Above range
-        
-        // In range - call trace/block function with original virtual addr (X17) and value (X18)
-        emit.STP(arm64::X17, arm64::X18, arm64::SP, -16);
-        emit.STP(arm64::X2, arm64::X30, arm64::SP, -32);
-        emit.SUB_imm(arm64::SP, arm64::SP, 32);
-        emit.ORR(arm64::X0, arm64::XZR, arm64::X17);  // addr = original virtual
-        emit.ORR(arm64::X1, arm64::XZR, arm64::X18);  // value
-        emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(&jit_trace_event_store));
-        emit.BLR(arm64::X16);
-        // X0 now contains: 1 if write should be blocked, 0 otherwise
-        emit.ORR(arm64::X4, arm64::XZR, arm64::X0);  // Save result
-        emit.ADD_imm(arm64::SP, arm64::SP, 32);
-        emit.LDP(arm64::X2, arm64::X30, arm64::SP, -32);
-        emit.LDP(arm64::X17, arm64::X18, arm64::SP, -16);
-        
-        // If X4 == 1, skip the store entirely
-        emit.CBNZ(arm64::X4, 0);
-        skip_store_label = emit.current() - 4;
-        
-        emit.patch_branch(reinterpret_cast<u32*>(below_range), emit.current());
-        emit.patch_branch(reinterpret_cast<u32*>(above_range), emit.current());
-        
-        // Restore original address and value
-        emit.ORR(arm64::X0, arm64::XZR, arm64::X17);
-        emit.ORR(arm64::X1, arm64::XZR, arm64::X18);
-    }
-    // #endregion
-    
     // Translate virtual address to physical and add fastmem base
     emit_translate_address(emit, arm64::X0);
     
@@ -1582,12 +1419,6 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
     // Patch skip_fastmem branch to here
     emit.patch_branch(reinterpret_cast<u32*>(skip_fastmem), emit.current());
     
-    // Patch skip_store_label (if set) to skip the entire store for blocked event writes
-    if (skip_store_label) {
-        s64 skip_offset = emit.current() - skip_store_label;
-        *reinterpret_cast<u32*>(skip_store_label) = 0xB5000000 | ((skip_offset >> 2) << 5) | arm64::X4;
-    }
-    
     // Update RA for update forms (use saved EA from X3)
     if (is_update && inst.ra != 0) {
         store_gpr(emit, inst.ra, arm64::X3);
@@ -1607,52 +1438,6 @@ void JitCompiler::compile_load_multiple(ARM64Emitter& emit, const DecodedInst& i
 
 void JitCompiler::compile_store_multiple(ARM64Emitter& emit, const DecodedInst& inst) {
     calc_ea(emit, arm64::X0, inst.ra, inst.simm);
-    
-    // #region agent log - Hypothesis AD: Trace store multiple to event range
-    // Save base address before translation for checking
-    emit.ORR(arm64::X17, arm64::XZR, arm64::X0);
-    
-    // Compute physical address
-    emit.MOV_imm(arm64::X16, 0x80000000ULL);
-    emit.CMP(arm64::X0, arm64::X16);
-    u8* stm_phys = emit.current();
-    emit.B_cond(arm64_cond::CC, 0);
-    emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
-    emit.AND(arm64::X0, arm64::X0, arm64::X16);
-    emit.patch_branch(reinterpret_cast<u32*>(stm_phys), emit.current());
-    
-    // Calculate end address: base + (32 - rs) * 4
-    u32 num_regs = 32 - inst.rs;
-    emit.ADD_imm(arm64::X16, arm64::X0, num_regs * 4);
-    
-    // Check if range overlaps with 0x1FFEFC40-0x1FFEFC54
-    emit.MOV_imm(arm64::X15, 0x1FFEFC54ULL);
-    emit.CMP(arm64::X0, arm64::X15);
-    u8* stm_above = emit.current();
-    emit.B_cond(arm64_cond::CS, 0);  // start >= end of event range
-    
-    emit.MOV_imm(arm64::X15, 0x1FFEFC40ULL);
-    emit.CMP(arm64::X16, arm64::X15);
-    u8* stm_below = emit.current();
-    emit.B_cond(arm64_cond::CC, 0);  // end <= start of event range
-    
-    // Overlaps! Log it
-    emit.STP(arm64::X17, arm64::X0, arm64::SP, -16);
-    emit.STP(arm64::X2, arm64::X30, arm64::SP, -32);
-    emit.SUB_imm(arm64::SP, arm64::SP, 32);
-    emit.ORR(arm64::X0, arm64::XZR, arm64::X17);  // virtual addr
-    emit.MOV_imm(arm64::X1, 0xFFFFFFFF);  // special value to indicate stmw
-    emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(&jit_trace_event_store));
-    emit.BLR(arm64::X16);
-    emit.ADD_imm(arm64::SP, arm64::SP, 32);
-    emit.LDP(arm64::X2, arm64::X30, arm64::SP, -32);
-    emit.LDP(arm64::X17, arm64::X0, arm64::SP, -16);
-    
-    emit.patch_branch(reinterpret_cast<u32*>(stm_above), emit.current());
-    emit.patch_branch(reinterpret_cast<u32*>(stm_below), emit.current());
-    
-    emit.ORR(arm64::X0, arm64::XZR, arm64::X17);  // Restore original
-    // #endregion
     
     emit_translate_address(emit, arm64::X0);
     
@@ -1694,47 +1479,6 @@ void JitCompiler::compile_atomic_load(ARM64Emitter& emit, const DecodedInst& ins
 void JitCompiler::compile_atomic_store(ARM64Emitter& emit, const DecodedInst& inst) {
     // stwcx. rS, rA, rB - Store Word Conditional Indexed
     calc_ea_indexed(emit, arm64::X0, inst.ra, inst.rb);
-    
-    // #region agent log - Hypothesis AC: Trace atomic stores to event addresses
-    // Save address for tracing
-    emit.ORR(arm64::X17, arm64::XZR, arm64::X0);
-    load_gpr(emit, arm64::X4, inst.rs);  // Value being stored
-    
-    // Check if in event range (physical 0x1FFEFC40-0x1FFEFC54)
-    emit.MOV_imm(arm64::X16, 0x80000000ULL);
-    emit.CMP(arm64::X0, arm64::X16);
-    u8* atomic_phys = emit.current();
-    emit.B_cond(arm64_cond::CC, 0);
-    emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
-    emit.AND(arm64::X0, arm64::X0, arm64::X16);
-    emit.patch_branch(reinterpret_cast<u32*>(atomic_phys), emit.current());
-    
-    emit.MOV_imm(arm64::X16, 0x1FFEFC40ULL);
-    emit.CMP(arm64::X0, arm64::X16);
-    u8* atomic_below = emit.current();
-    emit.B_cond(arm64_cond::CC, 0);
-    
-    emit.MOV_imm(arm64::X16, 0x1FFEFC54ULL);
-    emit.CMP(arm64::X0, arm64::X16);
-    u8* atomic_above = emit.current();
-    emit.B_cond(arm64_cond::CS, 0);
-    
-    // In range - call trace
-    emit.STP(arm64::X17, arm64::X4, arm64::SP, -16);
-    emit.STP(arm64::X2, arm64::X30, arm64::SP, -32);
-    emit.SUB_imm(arm64::SP, arm64::SP, 32);
-    emit.ORR(arm64::X0, arm64::XZR, arm64::X17);
-    emit.ORR(arm64::X1, arm64::XZR, arm64::X4);
-    emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(&jit_trace_event_store));
-    emit.BLR(arm64::X16);
-    emit.ADD_imm(arm64::SP, arm64::SP, 32);
-    emit.LDP(arm64::X2, arm64::X30, arm64::SP, -32);
-    emit.LDP(arm64::X17, arm64::X4, arm64::SP, -16);
-    
-    emit.patch_branch(reinterpret_cast<u32*>(atomic_below), emit.current());
-    emit.patch_branch(reinterpret_cast<u32*>(atomic_above), emit.current());
-    emit.ORR(arm64::X0, arm64::XZR, arm64::X17);  // Restore address
-    // #endregion
     
     // Check if reservation is valid
     emit.LDRB(arm64::X3, arm64::CTX_REG, offsetof(ThreadContext, has_reservation));
@@ -1801,49 +1545,6 @@ void JitCompiler::compile_dcbz(ARM64Emitter& emit, const DecodedInst& inst) {
     // Align to 32 bytes (clear lower 5 bits)
     emit.MOV_imm(arm64::X16, ~31ULL);
     emit.AND(arm64::X0, arm64::X0, arm64::X16);
-    
-    // #region agent log - Hypothesis AE: Trace DCBZ operations
-    // Check if in event range (physical 0x1FFEFC40-0x1FFEFC60 considering 32-byte block)
-    emit.ORR(arm64::X17, arm64::XZR, arm64::X0);  // Save for later
-    
-    // Compute physical
-    emit.MOV_imm(arm64::X16, 0x80000000ULL);
-    emit.CMP(arm64::X0, arm64::X16);
-    u8* dcbz_phys = emit.current();
-    emit.B_cond(arm64_cond::CC, 0);
-    emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
-    emit.AND(arm64::X0, arm64::X0, arm64::X16);
-    emit.patch_branch(reinterpret_cast<u32*>(dcbz_phys), emit.current());
-    
-    // Check if overlaps 0x1FFEFC40-0x1FFEFC60 (32 bytes from 0x40 could go to 0x60)
-    emit.ADD_imm(arm64::X16, arm64::X0, 32);  // end of block
-    emit.MOV_imm(arm64::X15, 0x1FFEFC40ULL);
-    emit.CMP(arm64::X16, arm64::X15);
-    u8* dcbz_below = emit.current();
-    emit.B_cond(arm64_cond::CC, 0);  // end <= 0x1FFEFC40
-    
-    emit.MOV_imm(arm64::X15, 0x1FFEFC60ULL);
-    emit.CMP(arm64::X0, arm64::X15);
-    u8* dcbz_above = emit.current();
-    emit.B_cond(arm64_cond::CS, 0);  // start >= 0x1FFEFC60
-    
-    // Overlaps! Log it
-    emit.STP(arm64::X17, arm64::X0, arm64::SP, -16);
-    emit.STP(arm64::X2, arm64::X30, arm64::SP, -32);
-    emit.SUB_imm(arm64::SP, arm64::SP, 32);
-    emit.ORR(arm64::X0, arm64::XZR, arm64::X17);  // virtual addr
-    emit.MOV_imm(arm64::X1, 0xDCB20000);  // special marker for dcbz
-    emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(&jit_trace_event_store));
-    emit.BLR(arm64::X16);
-    emit.ADD_imm(arm64::SP, arm64::SP, 32);
-    emit.LDP(arm64::X2, arm64::X30, arm64::SP, -32);
-    emit.LDP(arm64::X17, arm64::X0, arm64::SP, -16);
-    
-    emit.patch_branch(reinterpret_cast<u32*>(dcbz_below), emit.current());
-    emit.patch_branch(reinterpret_cast<u32*>(dcbz_above), emit.current());
-    
-    emit.ORR(arm64::X0, arm64::XZR, arm64::X17);  // Restore original
-    // #endregion
     
     // Translate address and zero 32 bytes
     emit_translate_address(emit, arm64::X0);

@@ -293,14 +293,6 @@ GuestThread* ThreadScheduler::create_thread(GuestAddr entry_point, GuestAddr par
         LOGI("Thread %u has entry=0, no host thread spawned", thread->thread_id);
     }
     
-    // #region agent log - Hypothesis N: Track thread creation
-    static int thread_create_log = 0;
-    if (thread_create_log++ < 30) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"N\",\"location\":\"threading.cpp:create_thread\",\"message\":\"THREAD CREATED\",\"data\":{\"id\":%u,\"entry\":%u,\"state\":%d,\"suspended\":%d,\"has_host_thread\":%d}}\n", ptr->thread_id, (u32)entry_point, (int)ptr->state, start_suspended ? 1 : 0, ptr->host_thread ? 1 : 0); fclose(f); }
-    }
-    // #endregion
-    
     stats_.total_threads_created++;
     
     threads_.push_back(std::move(thread));
@@ -765,13 +757,6 @@ void ThreadScheduler::hw_thread_main(u32 hw_thread_id) {
             // Execute for a time slice using the real CPU
             // Use execute_with_context for proper context synchronization and thread safety
             if (cpu_) {
-                // #region agent log - Hypothesis N: Track host thread execution
-                static int hw_exec_log = 0;
-                if (hw_exec_log++ < 20) {
-                    FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-                    if (f) { fprintf(f, "{\"hypothesisId\":\"N\",\"location\":\"threading.cpp:hw_thread_main\",\"message\":\"HOST THREAD EXECUTING\",\"data\":{\"hw_id\":%u,\"guest_id\":%u,\"pc\":%u}}\n", hw_thread_id, thread->thread_id, (u32)thread->context.pc); fclose(f); }
-                }
-                // #endregion
                 cpu_->execute_with_context(cpu_thread_id, thread->context, TIME_SLICE);
                 thread->execution_time += TIME_SLICE;
             }

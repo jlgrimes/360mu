@@ -113,14 +113,6 @@ void Cpu::execute(u64 cycles) {
 void Cpu::execute_thread(u32 thread_id, u64 cycles) {
     ThreadContext& ctx = contexts_[thread_id];
     
-    // #region agent log - NEW HYPOTHESIS H: Check if CPU is executing
-    static int exec_log = 0;
-    if (exec_log++ < 20) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"H\",\"location\":\"cpu.cpp:execute_thread\",\"message\":\"execute_thread called\",\"data\":{\"call\":%d,\"thread_id\":%u,\"running\":%d,\"pc\":%u,\"cycles\":%llu}}\n", exec_log, thread_id, ctx.running, (u32)ctx.pc, (unsigned long long)cycles); fclose(f); }
-    }
-    // #endregion
-    
     if (!ctx.running) {
         return;
     }
@@ -161,30 +153,6 @@ void Cpu::dispatch_syscall(ThreadContext& ctx) {
     // This encoding is set up by the import thunks (Task A.4)
     u32 ordinal = ctx.gpr[0] & 0xFFFF;
     u32 module = (ctx.gpr[0] >> 16) & 0xFF;
-    
-    // #region agent log - HYPOTHESIS L: Check syscalls being made
-    static int syscall_log = 0;
-    // Log first 200 syscalls, plus always log ExCreateThread (ordinal 14)
-    if (syscall_log++ < 200 || ordinal == 14 || (ordinal != 2168 && syscall_log < 500)) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"L\",\"location\":\"cpu.cpp:dispatch_syscall\",\"message\":\"SYSCALL\",\"data\":{\"call\":%d,\"r0\":%llu,\"module\":%u,\"ordinal\":%u,\"pc\":%u,\"lr\":%u}}\n", syscall_log, ctx.gpr[0], module, ordinal, (u32)ctx.pc, (u32)ctx.lr); fclose(f); }
-    }
-    // #endregion
-    
-    // SPIN LOOP ANALYSIS: Log LR for ordinal 2168 (KeSetEventBoostPriority)
-    // This tells us where the spin loop is calling from
-    // CRITICAL: Log r11 (the register the game loaded the flag into BEFORE calling us)
-    static int spin_log = 0;
-    if (ordinal == 2168 && spin_log++ < 10) {
-        GuestAddr r11 = ctx.gpr[11];  // Game loaded flag into r11 BEFORE calling KeSetEventBoostPriority
-        GuestAddr flag_addr = ctx.gpr[31] + 0x14C;
-        
-        // Read current memory value at flag address to compare
-        u32 mem_val = memory_ ? memory_->read_u32(flag_addr) : 0xBADBAD;
-        
-        LOGI("SPIN DEBUG: r11=0x%08X, mem[0x%08X]=0x%08X, r11==mem?=%d",
-             (u32)r11, (u32)flag_addr, mem_val, ((u32)r11 == mem_val));
-    }
     
     // Debug: Log syscall dispatch
     static int dispatch_count = 0;

@@ -176,19 +176,6 @@ void Gpu::resize(u32 width, u32 height) {
 }
 
 void Gpu::process_commands() {
-    // #region agent log - Hypothesis A: Check if process_commands called with valid state
-    static int process_log_count = 0;
-    process_log_count++;
-    if (process_log_count <= 20) {
-        GuestAddr rb_base = ring_buffer_base_.load(std::memory_order_acquire);
-        u32 rb_size = ring_buffer_size_.load(std::memory_order_acquire);
-        u32 rp = read_ptr_.load(std::memory_order_acquire);
-        u32 wp = write_ptr_.load(std::memory_order_acquire);
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"A\",\"location\":\"gpu.cpp:process_commands\",\"message\":\"process_commands entry\",\"data\":{\"call\":%d,\"rb_base\":%u,\"rb_size\":%u,\"read_ptr\":%u,\"write_ptr\":%u,\"has_commands\":%d}}\n", process_log_count, rb_base, rb_size, rp, wp, (rp != wp)); fclose(f); }
-    }
-    // #endregion
-    
     if (!command_processor_ || !memory_) return;
     
     // Load ring buffer state atomically (acquire to see CPU's writes)
@@ -197,13 +184,6 @@ void Gpu::process_commands() {
     
     // Check if we have commands to process
     if (rb_base == 0 || rb_size == 0) {
-        // #region agent log - Hypothesis A: Ring buffer not initialized
-        static int no_rb_count = 0;
-        if (no_rb_count++ < 5) {
-            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-            if (f) { fprintf(f, "{\"hypothesisId\":\"A\",\"location\":\"gpu.cpp:process_commands\",\"message\":\"NO RING BUFFER - early exit\",\"data\":{\"rb_base\":%u,\"rb_size\":%u}}\n", rb_base, rb_size); fclose(f); }
-        }
-        // #endregion
         return;
     }
     
@@ -211,24 +191,8 @@ void Gpu::process_commands() {
     u32 rp = read_ptr_.load(std::memory_order_acquire);
     u32 wp = write_ptr_.load(std::memory_order_acquire);
     
-    // #region agent log - Hypothesis A: Check if read_ptr == write_ptr (no commands)
-    static int ptr_log_count = 0;
-    if (ptr_log_count++ < 20 || (rp != wp && ptr_log_count < 100)) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"A\",\"location\":\"gpu.cpp:before_process\",\"message\":\"about to process\",\"data\":{\"read_ptr\":%u,\"write_ptr\":%u,\"has_work\":%d}}\n", rp, wp, (rp != wp)); fclose(f); }
-    }
-    // #endregion
-    
     // Let the command processor handle the ring buffer
     bool frame_done = command_processor_->process(rb_base, rb_size, rp, wp);
-    
-    // #region agent log - Hypothesis C: Check if frame_done was set
-    static int frame_done_log = 0;
-    if (frame_done_log++ < 10 || frame_done) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"C\",\"location\":\"gpu.cpp:after_process\",\"message\":\"process returned\",\"data\":{\"frame_done\":%d,\"new_read_ptr\":%u}}\n", frame_done, rp); fclose(f); }
-    }
-    // #endregion
     
     // Store updated read pointer with release semantics
     read_ptr_.store(rp, std::memory_order_release);
@@ -249,13 +213,6 @@ void Gpu::process_commands() {
 void Gpu::present() {
     static u64 present_count = 0;
     present_count++;
-    
-    // #region agent log - Hypothesis E: Check if present is being called
-    if (present_count <= 20) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"E\",\"location\":\"gpu.cpp:present\",\"message\":\"present called\",\"data\":{\"frame\":%llu,\"in_frame\":%d,\"vulkan_valid\":%d,\"frame_complete\":%d}}\n", present_count, in_frame_, vulkan_!=nullptr, frame_complete_); fclose(f); }
-    }
-    // #endregion
     
     // Log every 60 frames (roughly every second at 60fps)
     if (present_count % 60 == 1) {
@@ -297,14 +254,6 @@ u32 Gpu::read_register(u32 offset) {
 }
 
 void Gpu::write_register(u32 offset, u32 value) {
-    // #region agent log - NEW HYPOTHESIS F: Check if GPU register writes are happening at all
-    static int gpu_write_log = 0;
-    if (gpu_write_log++ < 30) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"F\",\"location\":\"gpu.cpp:write_register\",\"message\":\"GPU reg write\",\"data\":{\"call\":%d,\"offset\":%u,\"value\":%u}}\n", gpu_write_log, offset, value); fclose(f); }
-    }
-    // #endregion
-    
     // Log ALL register writes for debugging
     static int write_count = 0;
     write_count++;
@@ -321,9 +270,6 @@ void Gpu::write_register(u32 offset, u32 value) {
                 // Use release to ensure command buffer writes are visible before base is set
                 ring_buffer_base_.store(value, std::memory_order_release);
                 LOGI("Ring buffer base set: 0x%08X", value);
-                // #region agent log
-                { FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a"); if (f) { fprintf(f, "{\"hypothesisId\":\"C\",\"location\":\"gpu.cpp:write_register\",\"message\":\"ring buffer base set\",\"data\":{\"base\":\"0x%08X\"}}\n", value); fclose(f); } }
-                // #endregion
                 break;
                 
             case xenos_reg::CP_RB_CNTL:
@@ -332,9 +278,6 @@ void Gpu::write_register(u32 offset, u32 value) {
                     u32 rb_size = 1 << ((value & 0x3F) + 1);
                     ring_buffer_size_.store(rb_size, std::memory_order_release);
                     LOGD("Ring buffer size: %u bytes", rb_size);
-                    // #region agent log
-                    { FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a"); if (f) { fprintf(f, "{\"hypothesisId\":\"C\",\"location\":\"gpu.cpp:write_register\",\"message\":\"ring buffer size set\",\"data\":{\"size\":%u}}\n", rb_size); fclose(f); } }
-                    // #endregion
                 }
                 break;
                 

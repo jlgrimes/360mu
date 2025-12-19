@@ -626,14 +626,6 @@ VkResult VulkanBackend::create_edram_resources() {
 //=============================================================================
 
 Status VulkanBackend::begin_frame() {
-    // #region agent log - Hypothesis D: Check Vulkan begin_frame
-    static int begin_frame_log = 0;
-    if (begin_frame_log++ < 20) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"D\",\"location\":\"vulkan_backend.cpp:begin_frame\",\"message\":\"begin_frame called\",\"data\":{\"call\":%d,\"device_valid\":%d,\"swapchain_valid\":%d}}\n", begin_frame_log, device_!=VK_NULL_HANDLE, swapchain_!=VK_NULL_HANDLE); fclose(f); }
-    }
-    // #endregion
-    
     // Wait for previous frame
     vkWaitForFences(device_, 1, &in_flight_fences_[current_frame_], VK_TRUE, UINT64_MAX);
     
@@ -643,10 +635,6 @@ Status VulkanBackend::begin_frame() {
                                             VK_NULL_HANDLE, &current_image_index_);
     
     if (result == VK_ERROR_OUT_OF_DATE_KHR) {
-        // #region agent log - Hypothesis D: Swapchain out of date
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"D\",\"location\":\"vulkan_backend.cpp:begin_frame\",\"message\":\"SWAPCHAIN OUT OF DATE\",\"data\":{}}\n"); fclose(f); }
-        // #endregion
         // Need to recreate swapchain
         return Status::ErrorSwapchain;
     }

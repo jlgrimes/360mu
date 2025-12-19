@@ -346,14 +346,6 @@ static void HLE_ExCreateThread(Cpu* cpu, Memory* memory, u64* args, u64* result)
     //   DWORD CreationFlags       // arg[6]
     // );
     
-    // #region agent log - Track ExCreateThread calls
-    static int create_log = 0;
-    if (create_log++ < 30) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"Y\",\"location\":\"HLE_ExCreateThread\",\"message\":\"EXCREATETHREAD_CALLED\",\"data\":{\"call\":%d,\"entry\":\"%08X\",\"routine\":\"%08X\",\"flags\":%u}}\n", create_log, (u32)args[3], (u32)args[4], (u32)args[6]); fclose(f); }
-    }
-    // #endregion
-    
     GuestAddr handle_ptr = static_cast<GuestAddr>(args[0]);
     u32 stack_size = static_cast<u32>(args[1]);
     GuestAddr thread_id_ptr = static_cast<GuestAddr>(args[2]);
@@ -1803,16 +1795,6 @@ void Kernel::register_xboxkrnl_extended() {
             return;
         }
         
-        // #region agent log - Hypothesis X: Check raw memory at syscall entry
-        static int entry_log = 0;
-        if (entry_log++ < 30) {
-            // Read raw value at event+4 (signal_state location)
-            u32 raw_check = memory->read_u32(event + 4);
-            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-            if (f) { fprintf(f, "{\"hypothesisId\":\"X\",\"location\":\"KeSetEventBoostPriority\",\"message\":\"ENTRY_CHECK\",\"data\":{\"event\":\"%08X\",\"signal_addr\":\"%08X\",\"raw_value\":%u,\"call\":%u}}\n", (u32)event, (u32)(event+4), raw_check, boost_call_count); fclose(f); }
-        }
-        // #endregion
-        
         // Read previous signal state from dispatcher header (+4)
         s32 prev_state = static_cast<s32>(memory->read_u32(event + 4));
         
@@ -1894,48 +1876,10 @@ void Kernel::register_xboxkrnl_extended() {
         // DPC completion that never happens.
         KernelState::instance().process_dpcs();
         
-        // #region agent log - Hypothesis S: Verify write took effect
-        static int verify_log = 0;
-        if (verify_log++ < 20) {
-            u32 readback = memory->read_u32(event + 4);
-            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-            if (f) { fprintf(f, "{\"hypothesisId\":\"S\",\"location\":\"KeSetEventBoostPriority\",\"message\":\"VERIFY_WRITE\",\"data\":{\"event\":\"%08X\",\"wrote\":1,\"readback\":%u}}\n", (u32)event, readback); fclose(f); }
-        }
-        // #endregion
-        
         // Wake any threads waiting on this event
         if (g_scheduler) {
             g_scheduler->signal_object(event);
         }
-        
-        // #region agent log - Hypothesis T: Log return value
-        static int ret_log = 0;
-        if (ret_log++ < 20) {
-            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-            if (f) { fprintf(f, "{\"hypothesisId\":\"T\",\"location\":\"KeSetEventBoostPriority\",\"message\":\"RETURN_VALUE\",\"data\":{\"event\":\"%08X\",\"prev_state\":%d,\"call\":%u}}\n", (u32)event, prev_state, boost_call_count); fclose(f); }
-        }
-        // #endregion
-        
-        // Log the event structure to understand what the game checks
-        // #region agent log - Hypothesis Z: Dump event structure
-        static int dump_log = 0;
-        if (dump_log++ < 10) {
-            // Read the full DISPATCHER_HEADER and surrounding data
-            u8 type = memory->read_u8(event);
-            u8 absolute = memory->read_u8(event + 1);
-            u8 size = memory->read_u8(event + 2);
-            u8 inserted = memory->read_u8(event + 3);
-            u32 signal_state = memory->read_u32(event + 4);
-            u32 wait_list_flink = memory->read_u32(event + 8);
-            u32 wait_list_blink = memory->read_u32(event + 12);
-            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-            if (f) { 
-                fprintf(f, "{\"hypothesisId\":\"Z\",\"location\":\"KeSetEventBoostPriority\",\"message\":\"EVENT_DUMP\",\"data\":{\"event\":\"%08X\",\"type\":%u,\"absolute\":%u,\"size\":%u,\"inserted\":%u,\"signal\":%u,\"flink\":\"%08X\",\"blink\":\"%08X\"}}\n", 
-                    (u32)event, type, absolute, size, inserted, signal_state, wait_list_flink, wait_list_blink); 
-                fclose(f); 
-            }
-        }
-        // #endregion
         
         *result = prev_state;
     };
@@ -1959,14 +1903,6 @@ void Kernel::register_xboxkrnl_extended() {
         } else if (arg1 >= 0x70000000 && arg1 < 0xA0000000) {
             object_ptr_addr = arg1;
         }
-        
-        // #region agent log - Hypothesis P: Track ObReferenceObjectByHandle
-        static int ob_ref_log = 0;
-        if (ob_ref_log++ < 30) {
-            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-            if (f) { fprintf(f, "{\"hypothesisId\":\"P\",\"location\":\"xboxkrnl_extended.cpp:ObReferenceObjectByHandle\",\"message\":\"OB_REF_BY_HANDLE\",\"data\":{\"handle\":\"%08X\",\"arg1\":\"%08X\",\"arg2\":\"%08X\",\"arg3\":\"%08X\",\"out\":\"%08X\"}}\n", (u32)handle, (u32)arg1, (u32)arg2, (u32)arg3, (u32)object_ptr_addr); fclose(f); }
-        }
-        // #endregion
         
         // Create a fake object address based on handle
         GuestAddr fake_object = 0xA0000000 + (handle * 0x100);
@@ -2079,18 +2015,6 @@ void Kernel::register_xboxkrnl_extended() {
         if (handle_out) {
             memory->write_u32(handle_out, fake_handle);
         }
-        
-        // #region agent log - Hypothesis AI: Track XexGetModuleHandle
-        static int xmh_log = 0;
-        if (xmh_log++ < 20) {
-            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-            if (f) { 
-                fprintf(f, "{\"hypothesisId\":\"AI\",\"location\":\"xboxkrnl_extended.cpp\",\"message\":\"XexGetModuleHandle\",\"data\":{\"name\":\"%s\",\"handle\":\"%08X\"}}\n", 
-                    name, fake_handle); 
-                fclose(f); 
-            }
-        }
-        // #endregion
         
         *result = 0;  // STATUS_SUCCESS
     };

@@ -240,25 +240,47 @@ bool Memory::handle_fault(void* fault_addr) {
 // 0x00000000-0x1FFFFFFF: Physical memory (512 MB)
 // 0x20000000-0x3FFFFFFF: Physical (uncached?) - also 512MB mirrored
 // 0x40000000-0x7FFFFFFF: Physical (more mirrors/modes) 
-// 0x80000000-0x9FFFFFFF: Virtual usermode (maps to physical)
-// 0xA0000000+: Various system regions
+// 0x7FC00000-0x7FFFFFFF: GPU MMIO registers (physical)
+// 0x80000000-0x9FFFFFFF: Virtual usermode (maps to physical via &0x1FFFFFFF)
+// 0xA0000000-0xBFFFFFFF: Various system regions
+// 0xC0000000-0xCFFFFFFF: GPU MMIO virtual mapping (kernel-mapped)
+// 0xD0000000+: Other system regions
 //
-// CRITICAL: The JIT uses addr & 0x1FFFFFFF for ALL addresses.
-// We must match that behavior to ensure consistency between JIT and HLE code.
+// GPU registers are at PHYSICAL address 0x7FC00000-0x7FFFFFFF.
+// Games access them through:
+// 1. Direct physical access (rare, kernel mode)
+// 2. Virtual mapping at 0xC0000000-0xC3FFFFFF -> 0x7FC00000-0x7FFFFFFF
+// 3. Virtual mapping at 0xEC800000-0xECFFFFFF -> 0x7FC00000-0x7FFFFFFF (alternate)
 GuestAddr Memory::translate_address(GuestAddr addr) {
-    // IMPORTANT: Mask ALL addresses to 29 bits, just like the JIT does.
-    // This ensures HLE writes go to the same physical location the JIT reads.
-    // The Xbox 360's address space has multiple mappings that all map to
-    // the same 512MB of physical RAM.
+    // GPU MMIO virtual mapping: 0xC0000000-0xC3FFFFFF -> 0x7FC00000-0x7FFFFFFF
+    // Common mapping used by Xbox 360 kernel for GPU register access
+    if (addr >= 0xC0000000 && addr < 0xC4000000) {
+        return 0x7FC00000 + (addr - 0xC0000000);
+    }
+    
+    // Alternate GPU MMIO mapping: 0xEC800000+ -> 0x7FC00000+
+    // Used by some games/engines
+    if (addr >= 0xEC800000 && addr < 0xED000000) {
+        return 0x7FC00000 + (addr - 0xEC800000);
+    }
+    
+    // Direct physical GPU MMIO access (already in range)
+    if (addr >= 0x7FC00000 && addr < 0x80000000) {
+        return addr;  // Already a physical GPU address
+    }
+    
+    // Standard translation for normal memory
+    // Mask to 29 bits to get physical address within 512MB RAM
     return addr & 0x1FFFFFFF;
 }
 
 // Memory access with byte swapping (Xbox 360 is big-endian)
 u8 Memory::read_u8(GuestAddr addr) {
     if (is_mmio(addr)) {
-        auto* handler = find_mmio(addr);
+        GuestAddr phys_addr = translate_address(addr);
+        auto* handler = find_mmio(phys_addr);
         if (handler) {
-            return static_cast<u8>(handler->read(addr));
+            return static_cast<u8>(handler->read(phys_addr));
         }
         return 0;
     }
@@ -270,9 +292,10 @@ u8 Memory::read_u8(GuestAddr addr) {
 
 u16 Memory::read_u16(GuestAddr addr) {
     if (is_mmio(addr)) {
-        auto* handler = find_mmio(addr);
+        GuestAddr phys_addr = translate_address(addr);
+        auto* handler = find_mmio(phys_addr);
         if (handler) {
-            return static_cast<u16>(handler->read(addr));
+            return static_cast<u16>(handler->read(phys_addr));
         }
         return 0;
     }
@@ -286,9 +309,10 @@ u16 Memory::read_u16(GuestAddr addr) {
 
 u32 Memory::read_u32(GuestAddr addr) {
     if (is_mmio(addr)) {
-        auto* handler = find_mmio(addr);
+        GuestAddr phys_addr = translate_address(addr);
+        auto* handler = find_mmio(phys_addr);
         if (handler) {
-            return handler->read(addr);
+            return handler->read(phys_addr);
         }
         return 0;
     }
@@ -299,30 +323,16 @@ u32 Memory::read_u32(GuestAddr addr) {
     memcpy(&value, static_cast<u8*>(main_memory_) + phys_addr, sizeof(u32));
     value = byte_swap(value);
     
-    // CRITICAL DEBUG: Trace flag address 0x7003FC3C (phys 0x1003FC3C)
-    static int flag_read_log = 0;
-    if ((phys_addr == 0x1003FC3C || addr == 0x7003FC3C) && flag_read_log++ < 20) {
-        LOGI("MEM READ: addr=0x%08X phys=0x%08X value=0x%08X", (u32)addr, (u32)phys_addr, value);
-    }
-    
-    // #region agent log - Hypothesis U: Track ALL reads to event addresses with phys addr
-    static int event_read_log = 0;
-    bool is_event_addr = (addr == 0x9FFEFC44 || addr == 0x9FFEFC48);
-    if (is_event_addr && event_read_log++ < 50) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"U\",\"location\":\"memory.cpp:read_u32\",\"message\":\"EVENT_READ\",\"data\":{\"virt\":\"%08X\",\"phys\":\"%08X\",\"value\":\"%08X\",\"call\":%d}}\n", (u32)addr, (u32)phys_addr, value, event_read_log); fclose(f); }
-    }
-    // #endregion
-    
     return value;
 }
 
 u64 Memory::read_u64(GuestAddr addr) {
     if (is_mmio(addr)) {
-        auto* handler = find_mmio(addr);
+        GuestAddr phys_addr = translate_address(addr);
+        auto* handler = find_mmio(phys_addr);
         if (handler) {
-            u64 lo = handler->read(addr);
-            u64 hi = handler->read(addr + 4);
+            u64 lo = handler->read(phys_addr);
+            u64 hi = handler->read(phys_addr + 4);
             return (hi << 32) | lo;
         }
         return 0;
@@ -337,9 +347,10 @@ u64 Memory::read_u64(GuestAddr addr) {
 
 void Memory::write_u8(GuestAddr addr, u8 value) {
     if (is_mmio(addr)) {
-        auto* handler = find_mmio(addr);
+        GuestAddr phys_addr = translate_address(addr);
+        auto* handler = find_mmio(phys_addr);
         if (handler) {
-            handler->write(addr, value);
+            handler->write(phys_addr, value);
         }
         return;
     }
@@ -353,9 +364,10 @@ void Memory::write_u8(GuestAddr addr, u8 value) {
 
 void Memory::write_u16(GuestAddr addr, u16 value) {
     if (is_mmio(addr)) {
-        auto* handler = find_mmio(addr);
+        GuestAddr phys_addr = translate_address(addr);
+        auto* handler = find_mmio(phys_addr);
         if (handler) {
-            handler->write(addr, byte_swap(value));
+            handler->write(phys_addr, byte_swap(value));
         }
         return;
     }
@@ -368,65 +380,35 @@ void Memory::write_u16(GuestAddr addr, u16 value) {
 }
 
 void Memory::write_u32(GuestAddr addr, u32 value) {
+    // Check if this is an MMIO address (could be virtual or physical)
     if (is_mmio(addr)) {
-        auto* handler = find_mmio(addr);
+        // Translate to physical address for handler lookup and dispatch
+        // This handles virtual GPU addresses (0xC0000000+) -> physical (0x7FC00000+)
+        GuestAddr phys_addr = translate_address(addr);
+        auto* handler = find_mmio(phys_addr);
         if (handler) {
-            handler->write(addr, value);
-        } else {
-            // #region agent log - Hypothesis O: Track MMIO writes without handler
-            static int mmio_no_handler_log = 0;
-            if (mmio_no_handler_log++ < 30) {
-                GuestAddr phys = translate_address(addr);
-                FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-                if (f) { fprintf(f, "{\"hypothesisId\":\"O\",\"location\":\"memory.cpp:write_u32\",\"message\":\"MMIO NO HANDLER\",\"data\":{\"addr\":\"%08X\",\"phys\":\"%08X\",\"value\":%u}}\n", (u32)addr, (u32)phys, value); fclose(f); }
-            }
-            // #endregion
+            // Pass the physical address to the handler
+            handler->write(phys_addr, value);
         }
         return;
     }
     
     GuestAddr phys_addr = translate_address(addr);
     
-    // #region agent log - Hypothesis U: Track ALL writes to event addresses - especially zeros!
-    static int event_write_log = 0;
-    bool is_event_addr = (addr == 0x9FFEFC44 || addr == 0x9FFEFC48);
-    if (is_event_addr && event_write_log++ < 100) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"U\",\"location\":\"memory.cpp:write_u32\",\"message\":\"EVENT_WRITE\",\"data\":{\"virt\":\"%08X\",\"phys\":\"%08X\",\"value\":\"%08X\",\"call\":%d,\"is_zero\":%d}}\n", (u32)addr, (u32)phys_addr, value, event_write_log, (value == 0)); fclose(f); }
-    }
-    // #endregion
-    
-    // #region agent log - Hypothesis O: Track writes to GPU physical range
-    static int gpu_phys_write_log = 0;
-    if (phys_addr >= 0x7FC00000 && phys_addr <= 0x7FFFFFFF && gpu_phys_write_log++ < 30) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"O\",\"location\":\"memory.cpp:write_u32\",\"message\":\"GPU PHYS WRITE MISSED\",\"data\":{\"addr\":\"%08X\",\"phys\":\"%08X\",\"value\":%u}}\n", (u32)addr, (u32)phys_addr, value); fclose(f); }
-    }
-    // #endregion
-    
     if (phys_addr + 3 >= main_memory_size_) return;
     value = byte_swap(value);
     memcpy(static_cast<u8*>(main_memory_) + phys_addr, &value, sizeof(u32));
-    
-    // #region agent log - Hypothesis V: Verify write immediately after
-    if (is_event_addr && event_write_log <= 50) {
-        u32 readback;
-        memcpy(&readback, static_cast<u8*>(main_memory_) + phys_addr, sizeof(u32));
-        readback = byte_swap(readback);
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"V\",\"location\":\"memory.cpp:write_u32\",\"message\":\"WRITE_VERIFY\",\"data\":{\"phys\":\"%08X\",\"expected\":\"%08X\",\"readback\":\"%08X\",\"match\":%d}}\n", (u32)phys_addr, byte_swap(value), readback, (byte_swap(value) == readback)); fclose(f); }
-    }
-    // #endregion
     
     notify_write(addr, 4);
 }
 
 void Memory::write_u64(GuestAddr addr, u64 value) {
     if (is_mmio(addr)) {
-        auto* handler = find_mmio(addr);
+        GuestAddr phys_addr = translate_address(addr);
+        auto* handler = find_mmio(phys_addr);
         if (handler) {
-            handler->write(addr, static_cast<u32>(value >> 32));
-            handler->write(addr + 4, static_cast<u32>(value));
+            handler->write(phys_addr, static_cast<u32>(value >> 32));
+            handler->write(phys_addr + 4, static_cast<u32>(value));
         }
         return;
     }
@@ -602,8 +584,19 @@ void Memory::unregister_mmio(GuestAddr base) {
 }
 
 bool Memory::is_mmio(GuestAddr addr) const {
-    // GPU registers
+    // GPU registers at physical address 0x7FC00000-0x7FFFFFFF
     if (addr >= memory::GPU_REGS_BASE && addr <= memory::GPU_REGS_END) {
+        return true;
+    }
+    
+    // GPU MMIO virtual mapping: 0xC0000000-0xC3FFFFFF
+    // Kernel maps GPU registers here for usermode access
+    if (addr >= 0xC0000000 && addr < 0xC4000000) {
+        return true;
+    }
+    
+    // Alternate GPU MMIO virtual mapping: 0xEC800000-0xECFFFFFF
+    if (addr >= 0xEC800000 && addr < 0xED000000) {
         return true;
     }
     

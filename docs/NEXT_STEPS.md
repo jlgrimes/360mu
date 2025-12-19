@@ -1,72 +1,71 @@
 # 360μ Next Steps
 
-## Current State (December 2024)
+## Current State (January 2025)
 
 The emulator has made significant progress:
 
 ### ✅ Completed
 
-| Component       | Status                               |
-| --------------- | ------------------------------------ |
-| Memory System   | 512MB RAM + fastmem working          |
-| XEX Loader      | Encryption, compression, imports     |
-| CPU Interpreter | Full PowerPC instruction set         |
-| CPU JIT         | ARM64 translation, ~80% coverage     |
-| Threading       | 1:1 model with TLS, context sync     |
-| Syscalls        | ~60 implemented, no unhandled errors |
-| VFS             | ISO mounting, file access            |
-| GPU Init        | Vulkan backend, test rendering       |
+| Component       | Status                                      |
+| --------------- | ------------------------------------------- |
+| Memory System   | 512MB RAM + fastmem working                 |
+| XEX Loader      | Encryption, compression (LZX via libmspack) |
+| CPU Interpreter | Full PowerPC instruction set + time_base    |
+| CPU JIT         | ARM64 translation, ~80% coverage            |
+| Threading       | 1:1 model with TLS, APCs, alertable waits   |
+| Syscalls        | ~60 implemented, no unhandled errors        |
+| VFS             | ISO mounting, file access                   |
+| GPU Init        | Vulkan backend, test rendering              |
+| GPU MMIO        | Virtual address routing fixed (see below)   |
+| Shader Loops    | LOOP_START/LOOP_END/COND_EXEC implemented   |
 
-### 🔄 Current Blocker
+### ✅ Recently Fixed: GPU MMIO Virtual Address Routing
 
-**GPU Ring Buffer Not Receiving Commands**
+**Previously:** GPU ring buffer registers were never being set (`rb_base=0, rb_size=0`).
 
-The game initializes but the GPU command processor never receives ring buffer commands:
+**Root Cause:** Games write to GPU registers via virtual addresses (0xC0000000+), which must be translated to physical GPU MMIO space (0x7FC00000+). The code was incorrectly treating these as "kernel space" and bypassing MMIO handlers.
 
-- `rb_base=0, rb_size=0` in every `process_commands()` call
-- Game is stuck in a secondary polling loop at PC `0x825FB308`
-- VBlanks and frames are being presented (purple test color)
+**Fix Applied (January 2025):**
+1. `memory.cpp` - Updated `translate_address()` to handle GPU virtual mappings:
+   - 0xC0000000-0xC3FFFFFF → 0x7FC00000+ (GPU MMIO)
+   - 0xEC800000-0xECFFFFFF → 0x7FC00000+ (alternate mapping)
+2. `memory.cpp` - Updated `is_mmio()` to recognize GPU virtual address ranges
+3. `memory.cpp` - All read/write functions now translate address before MMIO lookup
+4. `jit_compiler.cpp` - `compile_store()` now checks GPU virtual ranges before kernel space exclusion
+
+### 🔄 Current Status: Needs Testing
+
+The GPU MMIO fix should allow the ring buffer to receive configuration commands. The emulator needs to be rebuilt and tested with Call of Duty: Black Ops to verify the game progresses past the purple screen.
 
 ---
 
-## Priority 1: GPU Command Processing
+## Priority 1: Verify GPU Command Processing
 
-### Task 1.1: Debug Ring Buffer Setup
+### Task 1.1: Build and Test
 
-The game should write to GPU MMIO registers to configure the ring buffer:
+1. Build the native library with the GPU MMIO fix
+2. Install APK on device
+3. Launch Call of Duty: Black Ops
+4. Check logs for ring buffer activity:
 
-- `CP_RB_BASE` (0x0700) - Ring buffer base address
-- `CP_RB_CNTL` (0x0701) - Ring buffer size/control
-- `CP_RB_WPTR` (0x070E) - Write pointer
+```bash
+adb logcat -s 360mu:* 360mu-gpu:* | grep "rb_base\|ring buffer\|write_register"
+```
 
-**Investigation needed:**
+**Expected:** Ring buffer registers should now show non-zero values.
 
-1. Is the game writing to GPU MMIO addresses (0x7FC00000+)?
-2. Are MMIO writes being routed through the JIT MMIO helper?
-3. Is the GPU MMIO handler receiving these writes?
+### Task 1.2: Command Processor Implementation
 
-**Files:**
-
-- `native/src/gpu/xenos/gpu.cpp` - `write_register()` handles MMIO
-- `native/src/cpu/jit/jit_compiler.cpp` - MMIO write routing
-- `native/src/memory/memory.cpp` - MMIO handler registration
-
-### Task 1.2: Trace Game Initialization
-
-Add logging to understand what the game is doing before it gets stuck:
-
-- What syscalls are being made?
-- What memory addresses are being polled?
-- Is there another event the game is waiting for?
-
-### Task 1.3: Implement Command Processor
-
-Once ring buffer is configured:
+If ring buffer is now configured, implement PM4 command parsing:
 
 1. Parse PM4 command packets
 2. Execute draw commands
 3. Manage render targets
 4. Handle synchronization primitives
+
+**Files:**
+- `native/src/gpu/xenos/gpu.cpp` - Command processing
+- `native/src/gpu/vulkan/vulkan_backend.cpp` - Vulkan rendering
 
 ---
 
@@ -165,7 +164,7 @@ For games that support it:
 
 ### Cleanup Tasks
 
-1. **Remove debug logging** - Many hypothesis logs are still in code
+1. ~~**Remove debug logging** - Many hypothesis logs are still in code~~ ✅ Completed
 2. **Code organization** - Some fixes are inline, should be refactored
 3. **Error handling** - Add proper error messages and recovery
 4. **Performance profiling** - Identify bottlenecks
@@ -186,10 +185,10 @@ For games that support it:
 
 Test with multiple games to find common issues:
 
-| Game                    | Status               | Notes                 |
-| ----------------------- | -------------------- | --------------------- |
-| Call of Duty: Black Ops | Boots, purple screen | GPU ring buffer issue |
-| (Other games)           | Untested             | Need testing          |
+| Game                    | Status               | Notes                             |
+| ----------------------- | -------------------- | --------------------------------- |
+| Call of Duty: Black Ops | Boots, purple screen | GPU MMIO fix applied, needs test  |
+| (Other games)           | Untested             | Need testing                      |
 
 ### Regression Testing
 
@@ -242,13 +241,13 @@ adb shell run-as com.x360mu rm /data/data/com.x360mu/files/debug.log
 
 ## Timeline Estimate
 
-| Priority | Task               | Estimate  |
-| -------- | ------------------ | --------- |
-| P1       | GPU Ring Buffer    | 1-2 weeks |
-| P1       | Command Processor  | 2-4 weeks |
-| P2       | Missing Syscalls   | Ongoing   |
-| P3       | Shader Translation | 4-8 weeks |
-| P4       | Audio Integration  | 2-3 weeks |
-| P5       | Input/Controllers  | 1-2 weeks |
+| Priority | Task               | Estimate  | Status         |
+| -------- | ------------------ | --------- | -------------- |
+| P1       | GPU Ring Buffer    | 1-2 weeks | ✅ Fix applied |
+| P1       | Command Processor  | 2-4 weeks | Next priority  |
+| P2       | Missing Syscalls   | Ongoing   | As needed      |
+| P3       | Shader Translation | 4-8 weeks | Basic done     |
+| P4       | Audio Integration  | 2-3 weeks | Pending        |
+| P5       | Input/Controllers  | 1-2 weeks | Pending        |
 
-**Goal:** First game rendering something other than purple screen within 1-2 months.
+**Next Step:** Build and test with Call of Duty: Black Ops to verify GPU commands are now being received.
