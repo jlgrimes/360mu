@@ -173,30 +173,17 @@ void Cpu::dispatch_syscall(ThreadContext& ctx) {
     
     // SPIN LOOP ANALYSIS: Log LR for ordinal 2168 (KeSetEventBoostPriority)
     // This tells us where the spin loop is calling from
+    // CRITICAL: Log r11 (the register the game loaded the flag into BEFORE calling us)
     static int spin_log = 0;
-    static bool dumped_spin_code = false;
     if (ordinal == 2168 && spin_log++ < 10) {
-        LOGI("KeSetEventBoostPriority called from LR=0x%08X, r3(event)=0x%08X, r4(boost)=0x%08X",
-             (u32)ctx.lr, (u32)ctx.gpr[3], (u32)ctx.gpr[4]);
+        GuestAddr r11 = ctx.gpr[11];  // Game loaded flag into r11 BEFORE calling KeSetEventBoostPriority
+        GuestAddr flag_addr = ctx.gpr[31] + 0x14C;
         
-        // Dump the instructions around LR to understand the spin loop
-        if (!dumped_spin_code && memory_ && ctx.lr >= 0x82000000 && ctx.lr < 0x90000000) {
-            dumped_spin_code = true;
-            LOGI("=== SPIN LOOP CODE DUMP (around LR=0x%08X) ===", (u32)ctx.lr);
-            // Dump 16 instructions before and after LR
-            GuestAddr start = (ctx.lr - 64) & ~3;  // Align to 4 bytes
-            for (int i = 0; i < 32; i++) {
-                GuestAddr addr = start + i * 4;
-                u32 inst = memory_->read_u32(addr);
-                LOGI("  0x%08X: %08X%s", (u32)addr, inst, (addr == ctx.lr) ? " <-- LR" : "");
-            }
-            LOGI("=== END SPIN LOOP CODE DUMP ===");
-            
-            // Also dump key registers
-            LOGI("Key registers: r1(SP)=0x%08X r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X",
-                 (u32)ctx.gpr[1], (u32)ctx.gpr[3], (u32)ctx.gpr[4], (u32)ctx.gpr[5],
-                 (u32)ctx.gpr[6], (u32)ctx.gpr[7], (u32)ctx.gpr[8], (u32)ctx.gpr[9]);
-        }
+        // Read current memory value at flag address to compare
+        u32 mem_val = memory_ ? memory_->read_u32(flag_addr) : 0xBADBAD;
+        
+        LOGI("SPIN DEBUG: r11=0x%08X, mem[0x%08X]=0x%08X, r11==mem?=%d",
+             (u32)r11, (u32)flag_addr, mem_val, ((u32)r11 == mem_val));
     }
     
     // Debug: Log syscall dispatch
@@ -300,7 +287,13 @@ void Cpu::execute_with_context(u32 thread_id, ThreadContext& external_ctx, u64 c
         u64 executed = jit_->execute(cpu_ctx, cycles);
         if (cpu_ctx.interrupted) {
             cpu_ctx.interrupted = false;
+            // CRITICAL FIX: Sync cpu_ctx to external_ctx BEFORE dispatch_syscall.
+            // handle_syscall uses GetCurrentGuestThread()->context (= external_ctx).
+            // Without this sync, handle_syscall sees old register values!
+            external_ctx = cpu_ctx;
             dispatch_syscall(cpu_ctx);
+            // After syscall, handle_syscall modified external_ctx, so sync back
+            cpu_ctx = external_ctx;
         }
         if (executed > 0) {
             // Copy CPU context back to external context
@@ -315,7 +308,10 @@ void Cpu::execute_with_context(u32 thread_id, ThreadContext& external_ctx, u64 c
     
     if (cpu_ctx.interrupted) {
         cpu_ctx.interrupted = false;
+        // CRITICAL FIX: Same fix for interpreter path
+        external_ctx = cpu_ctx;
         dispatch_syscall(cpu_ctx);
+        cpu_ctx = external_ctx;
     }
     
     // Copy CPU context back to external context (restore state)

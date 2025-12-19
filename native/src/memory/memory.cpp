@@ -299,6 +299,12 @@ u32 Memory::read_u32(GuestAddr addr) {
     memcpy(&value, static_cast<u8*>(main_memory_) + phys_addr, sizeof(u32));
     value = byte_swap(value);
     
+    // CRITICAL DEBUG: Trace flag address 0x7003FC3C (phys 0x1003FC3C)
+    static int flag_read_log = 0;
+    if ((phys_addr == 0x1003FC3C || addr == 0x7003FC3C) && flag_read_log++ < 20) {
+        LOGI("MEM READ: addr=0x%08X phys=0x%08X value=0x%08X", (u32)addr, (u32)phys_addr, value);
+    }
+    
     // #region agent log - Hypothesis U: Track ALL reads to event addresses with phys addr
     static int event_read_log = 0;
     bool is_event_addr = (addr == 0x9FFEFC44 || addr == 0x9FFEFC48);

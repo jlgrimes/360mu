@@ -4,29 +4,44 @@
 
 This document describes the threading architecture for 360μ, an Xbox 360 emulator. The Xbox 360's Xenon processor has 3 cores with 2 hardware threads each (6 total), and games make heavy use of multi-threading with complex synchronization.
 
-## The Problem: Call of Duty Boot Hang
+## Status: FIXED ✅
 
-Call of Duty: Black Ops hangs during initialization with a purple screen. Analysis revealed:
+As of December 2024, the Call of Duty: Black Ops boot hang has been fixed. The game now advances past the worker thread initialization sequence.
+
+## The Problem: Call of Duty Boot Hang (RESOLVED)
+
+Call of Duty: Black Ops was hanging during initialization with a purple screen. Analysis revealed:
 
 1. The game immediately enters a spin loop calling `KeSetEventBoostPriority`
 2. It polls a completion flag at `r31 + 0x14C` waiting for it to change
 3. The game expects **kernel worker threads** to process work and set the flag
-4. Our worker threads had no code to execute (`entry = 0`)
+4. Multiple bugs were preventing progress
 
-### Root Cause Analysis
+### Root Causes Found and Fixed
 
-The game uses a custom work queue pattern (NOT `ExQueueWorkItem`):
+**Bug 1: JIT syscall not advancing PC**
 
-```
-1. Game creates work request structure on stack
-2. Event object at structure + 0x50
-3. Completion flag at structure + 0x14C
-4. Game calls KeSetEventBoostPriority(event) to "wake workers"
-5. Workers should process work and set completion flag
-6. Game spin-polls completion flag until non-zero
-```
+- After a `sc` (syscall) instruction, the JIT wasn't advancing PC
+- This caused the game to loop forever on the same syscall instruction
+- **Fix**: Added PC += 4 in `compile_syscall()`
 
-The fundamental issue: our architecture didn't support **real thread blocking and waking**.
+**Bug 2: Context desynchronization**
+
+- JIT used a local copy of context (`cpu_ctx`), while HLE modified `external_ctx`
+- Syscall results weren't propagating back to JIT
+- **Fix**: Sync `external_ctx = cpu_ctx` BEFORE syscall, `cpu_ctx = external_ctx` AFTER
+
+**Bug 3: Address translation mismatch**
+
+- JIT masked all addresses with `0x1FFFFFFF` (512MB physical)
+- Memory class wasn't applying the same mask consistently
+- **Fix**: Updated `Memory::translate_address()` to always mask with `0x1FFFFFFF`
+
+**Bug 4: TLS for thread identification**
+
+- In multi-threaded mode, `GetCurrentGuestThread()` needed thread-local storage
+- Without TLS, syscall handlers couldn't identify which thread was calling
+- **Fix**: Added `thread_local GuestThread* g_current_guest_thread`
 
 ## Architecture Comparison
 

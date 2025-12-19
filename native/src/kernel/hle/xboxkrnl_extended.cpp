@@ -1848,13 +1848,42 @@ void Kernel::register_xboxkrnl_extended() {
                 u32 current_val = memory->read_u32(completion_flag);
                 // Set bit 0 to indicate "done" while preserving original value
                 u32 new_val = current_val | 0x1;
-                if (new_val != current_val) {
-                    memory->write_u32(completion_flag, new_val);
-                    static int completion_log = 0;
-                    if (completion_log++ < 30) {
-                        LOGI("WorkerSim: SET flag 0x%08X: 0x%08X -> 0x%08X (event=0x%08X)", 
-                             (u32)completion_flag, current_val, new_val, (u32)event);
+                
+                // CRITICAL DEBUG: Also read directly from fastmem to check for mismatch
+                static int flag_log = 0;
+                if (flag_log++ < 100) {
+                    // Get raw fastmem value for comparison
+                    u8* fastmem = static_cast<u8*>(memory->get_fastmem_base());
+                    GuestAddr phys = completion_flag & 0x1FFFFFFF;
+                    u32 raw_val = 0;
+                    if (fastmem && phys < 0x20000000) {
+                        memcpy(&raw_val, fastmem + phys, 4);
+                        // raw_val is in big-endian, need to byteswap
+                        raw_val = __builtin_bswap32(raw_val);
                     }
+                    LOGI("WorkerSim: flag=0x%08X phys=0x%08X read=0x%08X raw=0x%08X match=%d (call #%d)", 
+                         (u32)completion_flag, (u32)phys, current_val, raw_val, 
+                         (current_val == raw_val), flag_log);
+                }
+                
+                // ALWAYS write a very obvious non-zero value
+                u32 done_val = 0xDEADBEEF;  // Very obvious value
+                memory->write_u32(completion_flag, done_val);
+                
+                // Verify the write worked
+                u32 verify = memory->read_u32(completion_flag);
+                u8* fastmem = static_cast<u8*>(memory->get_fastmem_base());
+                GuestAddr phys = completion_flag & 0x1FFFFFFF;
+                u32 raw_verify = 0;
+                if (fastmem && phys < 0x20000000) {
+                    memcpy(&raw_verify, fastmem + phys, 4);
+                    raw_verify = __builtin_bswap32(raw_verify);
+                }
+                
+                static int write_log = 0;
+                if (write_log++ < 20) {
+                    LOGI("WorkerSim: WROTE 0x%08X, verify_read=0x%08X, raw=0x%08X, match=%d", 
+                         done_val, verify, raw_verify, (verify == raw_verify && verify == done_val));
                 }
             }
         }

@@ -2135,8 +2135,13 @@ void JitCompiler::compile_syscall(ARM64Emitter& emit, const DecodedInst& inst) {
     emit.MOV_imm(arm64::X0, 1);
     emit.STRB(arm64::X0, arm64::CTX_REG, offsetof(ThreadContext, interrupted));
     
+    // CRITICAL FIX: Advance PC past the syscall instruction (4 bytes)
+    // Without this, the game loops forever on the same syscall!
+    emit.LDR(arm64::X1, arm64::CTX_REG, offsetof(ThreadContext, pc));
+    emit.ADD_imm(arm64::X1, arm64::X1, 4);
+    emit.STR(arm64::X1, arm64::CTX_REG, offsetof(ThreadContext, pc));
+    
     // Return from block to handle syscall
-    // Note: PC is NOT updated here - the dispatcher will handle PC advancement
     emit_block_epilogue(emit, current_block_inst_count_);
 }
 
