@@ -88,20 +88,43 @@ extern "C" void jit_trace_mirror_access(GuestAddr addr, u32 is_store) {
 }
 
 // Trace ALL memory accesses, not just mirror range, to find the crash source
-extern "C" void jit_trace_all_access(GuestAddr addr, u32 is_store) {
-    static int all_count = 0;
-    all_count++;
+// Trace the ORIGINAL (pre-mask) address to catch invalid/negative pointers
+extern "C" void jit_trace_original_addr(GuestAddr original_addr, GuestAddr masked_addr, u32 is_store) {
+    static int trace_count = 0;
+    trace_count++;
     
-    // Always log if this is the exact crash address
-    if (addr == 0x20000000) {
-        LOGI("!!! FOUND IT !!! access #%d: %s addr=0x20000000 EXACT MATCH!", 
-             all_count, is_store ? "STORE" : "LOAD");
+    // Check for suspicious addresses that would mask to boundary
+    // -4 (0xFFFFFFFC) & 0x1FFFFFFF = 0x1FFFFFFC
+    // -1 (0xFFFFFFFF) & 0x1FFFFFFF = 0x1FFFFFFF
+    u32 orig32 = (u32)original_addr;
+    s32 orig_signed = (s32)orig32;
+    
+    // Log if original looks like a negative number (indicates bug in game code or our emulation)
+    if (orig_signed < 0 && orig_signed > -0x1000) {
+        __android_log_print(ANDROID_LOG_ERROR, "JIT_BAD_PTR", 
+            "!!! NEGATIVE PTR !!! #%d: %s original=0x%08X (signed=%d) masked=0x%08llX",
+            trace_count, is_store ? "STORE" : "LOAD", 
+            orig32, orig_signed, (unsigned long long)masked_addr);
     }
-    // Log first 100 accesses
-    else if (all_count <= 100) {
-        LOGI("ALL ACCESS #%d: %s addr=0x%08llX", all_count, 
-             is_store ? "STORE" : "LOAD", (unsigned long long)addr);
+    
+    // Also log if masked address is near the 512MB boundary (last 64 bytes)
+    if (masked_addr >= 0x1FFFFFC0) {
+        __android_log_print(ANDROID_LOG_ERROR, "JIT_BOUNDARY", 
+            "!!! BOUNDARY ACCESS !!! #%d: %s original=0x%08X masked=0x%08llX",
+            trace_count, is_store ? "STORE" : "LOAD", 
+            orig32, (unsigned long long)masked_addr);
     }
+    
+    // Log first 10 for debugging
+    if (trace_count <= 10) {
+        __android_log_print(ANDROID_LOG_ERROR, "JIT_TRACE", 
+            "ACCESS #%d: %s orig=0x%08X masked=0x%08llX", trace_count, 
+            is_store ? "STORE" : "LOAD", orig32, (unsigned long long)masked_addr);
+    }
+}
+
+extern "C" void jit_trace_all_access(GuestAddr addr, u32 is_store) {
+    // Kept for compatibility but not used
 }
 
 extern "C" void jit_mmio_write_u32(void* mem, GuestAddr addr, u32 value) {
@@ -315,6 +338,15 @@ u64 JitCompiler::execute(ThreadContext& ctx, u64 cycles) {
             // Execute the block
             using BlockFn = void(*)(ThreadContext*, u8*);
             BlockFn fn = reinterpret_cast<BlockFn>(block->code);
+            
+            // DEBUG: Log before block execution to identify crashing block
+            static int exec_count = 0;
+            exec_count++;
+            if (exec_count <= 20 || exec_count % 10000 == 0) {
+                __android_log_print(ANDROID_LOG_ERROR, "JIT_EXEC", 
+                    "Executing block #%d at PC=0x%08llX (block code=%p)", 
+                    exec_count, (unsigned long long)ctx.pc, block->code);
+            }
             
             // Execute the block (fastmem_base is now embedded in block code)
             fn(&ctx, nullptr);
@@ -1527,6 +1559,9 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
     // Not in GPU physical MMIO range
     emit.patch_branch(reinterpret_cast<u32*>(below_gpu_phys), emit.current());
     
+    // Save ORIGINAL address in X4 before masking (for debugging)
+    emit.ORR(arm64::X4, arm64::XZR, arm64::X0);
+    
     // For all other addresses, apply mask to get physical address in 512MB range
     // This handles:
     // - Physical 0x00000000-0x1FFFFFFF → unchanged (main RAM)
@@ -1595,25 +1630,31 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
     
     // === FASTMEM PATH ===
     // X0 already has the masked physical address (0x00000000-0x1FFFFFFF)
+    // X4 has the ORIGINAL address (saved before masking)
     emit.patch_branch(reinterpret_cast<u32*>(fastmem_path), emit.current());
     
-    // DEBUG: Trace the masked address before fastmem access
+    // DEBUG: Trace BOTH original and masked address to catch negative/invalid pointers
     {
-        emit.SUB_imm(arm64::SP, arm64::SP, 48);
+        emit.SUB_imm(arm64::SP, arm64::SP, 64);
         emit.STP(arm64::X0, arm64::X1, arm64::SP, 0);
         emit.STP(arm64::X2, arm64::X3, arm64::SP, 16);
-        emit.STP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        emit.STP(arm64::X4, arm64::X5, arm64::SP, 32);
+        emit.STP(arm64::X30, arm64::XZR, arm64::SP, 48);
         
-        // X0 = masked addr, X1 = is_store (1 for store)
-        emit.MOV_imm(arm64::X1, 1);
-        u64 trace_func = reinterpret_cast<u64>(&jit_trace_all_access);
+        // Args: X0 = original addr, X1 = masked addr, X2 = is_store
+        emit.ORR(arm64::X5, arm64::XZR, arm64::X0);  // Save masked in X5
+        emit.ORR(arm64::X0, arm64::XZR, arm64::X4);  // X0 = original
+        emit.ORR(arm64::X1, arm64::XZR, arm64::X5);  // X1 = masked
+        emit.MOV_imm(arm64::X2, 1);                   // X2 = is_store
+        u64 trace_func = reinterpret_cast<u64>(&jit_trace_original_addr);
         emit.MOV_imm(arm64::X16, trace_func);
         emit.BLR(arm64::X16);
         
-        emit.LDP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        emit.LDP(arm64::X30, arm64::XZR, arm64::SP, 48);
+        emit.LDP(arm64::X4, arm64::X5, arm64::SP, 32);
         emit.LDP(arm64::X2, arm64::X3, arm64::SP, 16);
         emit.LDP(arm64::X0, arm64::X1, arm64::SP, 0);
-        emit.ADD_imm(arm64::SP, arm64::SP, 48);
+        emit.ADD_imm(arm64::SP, arm64::SP, 64);
     }
     
     // Reload value since we may have clobbered X1 in MMIO path setup

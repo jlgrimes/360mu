@@ -144,10 +144,14 @@ Status Memory::setup_fastmem() {
     
     LOGI("Reserved fastmem at %p (4GB)", fastmem_base_);
     
-    // Map the first 512MB as read/write for physical memory
+    // Map the first 512MB + 4KB as read/write for physical memory
+    // The extra 4KB page handles edge case where a multi-byte store at 
+    // offset 0x1FFFFFFC (end of 512MB) would cross into unmapped memory.
+    // This is a guard page that allows such stores to complete safely.
+    const size_t guard_page_size = 4096;  // One extra page
     void* mapped = mmap(
         fastmem_base_,
-        main_memory_size_,
+        main_memory_size_ + guard_page_size,
         PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
         -1, 0
