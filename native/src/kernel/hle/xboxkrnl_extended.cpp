@@ -2026,6 +2026,12 @@ void Kernel::register_xboxkrnl_extended() {
         *result = 0;
     };
     
+    // 2260 (0x8D4): RtlIsPartialPlaceholderFileInfo
+    // Returns FALSE - file is not a partial placeholder
+    hle_functions_[make_import_key(0, 2260)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
+        *result = 0;  // FALSE - not a placeholder file
+    };
+    
     // 2504 (0x9C8): Unknown kernel function
     hle_functions_[make_import_key(0, 2504)] = [](Cpu* cpu, Memory* memory, u64* args, u64* result) {
         *result = 0;

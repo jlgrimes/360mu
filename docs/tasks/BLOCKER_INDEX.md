@@ -1,19 +1,25 @@
 # Emulator Blocker Tasks - Overview
 
-These 4 tasks can be executed in parallel by separate agents. Each task is self-contained with no dependencies on the others.
+> **Note**: Some of these blockers may have been addressed. Check current status before starting.
 
 ## Task Summary
 
-| #   | Task                                                               | Priority | Complexity | Files Modified        |
-| --- | ------------------------------------------------------------------ | -------- | ---------- | --------------------- |
-| 1   | [LZX Decompression](BLOCKER_01_LZX_DECOMPRESSION.md)               | CRITICAL | Medium     | 4 files + new library |
-| 2   | [Time Base Register](BLOCKER_02_TIME_BASE_REGISTER.md)             | HIGH     | Low        | 3-4 files             |
-| 3   | [Shader Loops/Predication](BLOCKER_03_SHADER_LOOPS_PREDICATION.md) | HIGH     | High       | 4 files               |
-| 4   | [Alertable Waits](BLOCKER_04_ALERTABLE_WAITS.md)                   | MEDIUM   | Medium     | 5 files               |
+| #   | Task                                                               | Priority | Status      | Files Modified        |
+| --- | ------------------------------------------------------------------ | -------- | ----------- | --------------------- |
+| 1   | [LZX Decompression](BLOCKER_01_LZX_DECOMPRESSION.md)               | CRITICAL | Check       | 4 files + new library |
+| 2   | [Time Base Register](BLOCKER_02_TIME_BASE_REGISTER.md)             | HIGH     | Check       | 3-4 files             |
+| 3   | [Shader Loops/Predication](BLOCKER_03_SHADER_LOOPS_PREDICATION.md) | HIGH     | Not Started | 4 files               |
+| 4   | [Alertable Waits](BLOCKER_04_ALERTABLE_WAITS.md)                   | MEDIUM   | Check       | 5 files               |
+
+## Current Primary Blocker
+
+**GPU Ring Buffer Not Receiving Commands**
+
+The main blocker as of December 2024 is that the GPU command processor never receives ring buffer commands from the game. See [NEXT_STEPS.md](../NEXT_STEPS.md) for details.
 
 ## Parallel Execution
 
-All tasks are independent and can be worked on simultaneously:
+Tasks that are still relevant can be worked on simultaneously:
 
 ```
 ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
@@ -70,3 +76,7 @@ The tasks modify different files, so there should be no merge conflicts:
 - **Task 2** (Time Base): `cpu.h`, `interpreter.cpp`, `jit_compiler.cpp`
 - **Task 3** (Shaders): `shader_translator.cpp/h`, `spirv_builder.cpp/h`
 - **Task 4** (APCs): `xthread.cpp/h`, `xboxkrnl_threading.cpp`, `types.h`
+
+---
+
+_Last updated: December 2024_

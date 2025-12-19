@@ -1,201 +1,132 @@
 # Critical Issue: Spin Loop Waiting for Worker Thread Completion
 
-## Status: SOLUTION IDENTIFIED - Implementing 1:1 Threading Model
+## Status: ✅ RESOLVED (December 2024)
 
-**Solution**: Migrate from N:M cooperative scheduling to 1:1 threading model (like Xenia).
-See: `/docs/architecture/THREADING_MODEL.md`
+The original spin loop issue has been **fixed**. The game now progresses past the worker thread initialization sequence.
+
+---
 
 ## Summary
 
-Call of Duty: Black Ops (and likely other games) gets stuck in a spin loop during early initialization, causing a purple screen. The game is waiting for worker threads to complete work, but our emulated worker threads have no executable code.
+Call of Duty: Black Ops (and likely other games) was getting stuck in a spin loop during early initialization, causing a purple screen. This issue has been resolved through multiple bug fixes in the threading and JIT systems.
 
 ---
 
-## Symptoms
+## Root Causes Found and Fixed
+
+### Bug 1: JIT Syscall Not Advancing PC ✅
+
+- **Problem**: After a `sc` (syscall) instruction, the JIT wasn't advancing PC
+- **Symptom**: Game looped forever on the same syscall instruction
+- **Fix**: Added `PC += 4` in `JitCompiler::compile_syscall()`
+- **File**: `native/src/cpu/jit/jit_compiler.cpp`
+
+### Bug 2: Context Desynchronization ✅
+
+- **Problem**: JIT used a local copy of context (`cpu_ctx`), while HLE modified `external_ctx`
+- **Symptom**: Syscall results weren't propagating back to JIT
+- **Fix**: Sync contexts before AND after syscall dispatch
+- **File**: `native/src/cpu/xenon/cpu.cpp`
+
+```cpp
+// BEFORE syscall: sync JIT's working context to thread context
+external_ctx = cpu_ctx;
+dispatch_syscall(cpu_ctx);
+// AFTER syscall: sync modified thread context back to JIT
+cpu_ctx = external_ctx;
+```
+
+### Bug 3: Address Translation Mismatch ✅
+
+- **Problem**: JIT masked addresses with `0x1FFFFFFF`, but Memory class didn't always apply the same mask
+- **Symptom**: HLE writes went to different physical addresses than JIT reads
+- **Fix**: Updated `Memory::translate_address()` to always mask with `0x1FFFFFFF`
+- **File**: `native/src/memory/memory.cpp`
+
+### Bug 4: TLS for Thread Identification ✅
+
+- **Problem**: In multi-threaded mode, `GetCurrentGuestThread()` needed thread-local storage
+- **Symptom**: Syscall handlers couldn't identify which thread was calling
+- **Fix**: Added `thread_local GuestThread* g_current_guest_thread`
+- **File**: `native/src/cpu/xenon/threading.cpp`
+
+---
+
+## Original Symptoms (Historical)
 
 - Purple screen (GPU test clear color)
 - High CPU usage (game spinning in loop)
-- Only syscall being made is `KeSetEventBoostPriority` (ordinal 2168)
-- GPU never receives ring buffer configuration or rendering commands
+- Only syscall being made was `KeSetEventBoostPriority` (ordinal 2168)
+- GPU never received ring buffer configuration or rendering commands
 
 ---
 
-## Root Cause Analysis
+## Architecture Change: 1:1 Threading Model
 
-### The Spin Loop
+As part of fixing this issue, the threading model was redesigned:
 
-The game is stuck at PC around `0x824D2BC0-0x824D2BE8` in a loop that:
+**Before**: N:M cooperative scheduling (broken)
 
-1. Loads a completion flag from `r31 + 0x14C` (stack address `0x9FFEFD3C`)
-2. Checks if it's non-zero
-3. If zero, calls `KeSetEventBoostPriority` to try to wake workers
-4. Loops back and checks again
+- Host threads shared guest threads via queue
+- `wait_for_object()` returned immediately (no real blocking)
+- Worker threads had `entry=0` (no code to run)
 
-**Disassembled spin loop:**
+**After**: 1:1 real threading (working)
+
+- Each guest thread has its own host `std::thread`
+- Real OS-level blocking via `std::condition_variable`
+- Thread-local storage for proper thread identification
+
+See: [/docs/architecture/THREADING_MODEL.md](../architecture/THREADING_MODEL.md)
+
+---
+
+## Current State
+
+The original spin loop is fixed. The game now:
+
+1. ✅ Boots past XEX loading
+2. ✅ Executes syscalls correctly
+3. ✅ Creates and manages multiple threads
+4. ✅ Processes VBlank interrupts
+5. ✅ Presents GPU frames (purple test color)
+
+**New Blocker**: The game is now stuck in a secondary polling loop at PC `0x825FB308`, waiting for something else. This is a separate issue - the original worker thread spin loop is resolved.
+
+---
+
+## Files Modified
+
+| File                                  | Change                                      |
+| ------------------------------------- | ------------------------------------------- |
+| `native/src/cpu/jit/jit_compiler.cpp` | Added PC advancement in `compile_syscall()` |
+| `native/src/cpu/xenon/cpu.cpp`        | Added context sync before/after syscall     |
+| `native/src/memory/memory.cpp`        | Fixed `translate_address()` to always mask  |
+| `native/src/cpu/xenon/threading.cpp`  | Added TLS for thread identification         |
+| `native/src/cpu/xenon/threading.h`    | Added TLS accessor functions                |
+
+---
+
+## Testing
+
+The fix has been verified with Call of Duty: Black Ops:
 
 ```
-0x824D2BC0: 2B0B0000  cmplwi r11, 0           ; Check if completion flag is zero
-0x824D2BC4: 409AFD8C  bne 0x824D2950          ; If non-zero, continue (exit loop)
-0x824D2BC8: 3CA06000  lis r5, 0x6000          ; Otherwise, set up for syscall
-0x824D2BCC: 7F67DB78  mr r7, r27
-0x824D2BD0: 38C00004  li r6, 4
-0x824D2BD4: 60A52000  ori r5, r5, 0x2000
-0x824D2BD8: 389F0144  addi r4, r31, 0x144     ; Boost parameter
-0x824D2BDC: 387F0050  addi r3, r31, 0x50      ; Event address (0x9FFEFC40)
-0x824D2BE0: 4813F941  bl KeSetEventBoostPriority
-0x824D2BE4: 2C030000  cmpwi r3, 0             ; Check return value
-0x824D2BE8: 4180FD68  blt 0x824D2950          ; If error, branch
-0x824D2BEC: 817F014C  lwz r11, 0x14C(r31)     ; RELOAD completion flag
-0x824D2BF4: 2B0B0000  cmplwi r11, 0           ; Check again...
-```
-
-### Key Memory Addresses
-
-| Address      | Description                                     |
-| ------------ | ----------------------------------------------- |
-| `0x9FFEFBF0` | r31 (stack frame base)                          |
-| `0x9FFEFC40` | Event object (r31 + 0x50)                       |
-| `0x9FFEFD34` | Boost parameter (r31 + 0x144)                   |
-| `0x9FFEFD3C` | **Completion flag** (r31 + 0x14C) - **THE KEY** |
-
-### Why It's Stuck
-
-The game expects:
-
-1. Main thread queues work items
-2. Worker threads dequeue and process work
-3. Worker threads write non-zero to completion flag (`r31 + 0x14C`)
-4. Main thread sees flag and continues
-
-**But in our emulator:**
-
-- Worker threads are created with `entry_point = 0` (no code!)
-- They're set to `ThreadState::Waiting` immediately
-- They can never execute any code
-- Completion flag is never set
-- Game loops forever
-
-### Evidence from Logs
-
-```
-Created system worker thread 2 (DPC processor) - starting in Waiting state
-Created system worker thread 3 (DPC processor) - starting in Waiting state
-Created system worker thread 4 (DPC processor) - starting in Waiting state
-```
-
-All worker threads have `entry=0x00000000` - they have no code to run!
-
----
-
-## What Xbox 360 Does Differently
-
-On real Xbox 360 hardware:
-
-1. Kernel boots and creates system worker threads with real code
-2. Worker threads run in a loop: `dequeue_work() -> process() -> signal_completion()`
-3. Various system services are initialized
-4. System events are signaled when subsystems are ready
-5. **THEN** game entry point is called
-
-Our emulator calls the game entry point immediately without proper kernel initialization.
-
----
-
-## Attempted Fixes
-
-### 1. Thread Tracking Fix ✅
-
-Fixed `ThreadScheduler::run()` to properly assign main thread to `hw_threads_[0]`, allowing `get_current_thread()` to work.
-
-### 2. Wait Object Fix ✅
-
-Fixed `wait_for_object()` to not busy-loop returning success.
-
-### 3. Completion Flag Hack ❌ (Partial)
-
-Added code to write to `event + 0xFC` (completion flag offset) after 50 syscalls. Needs more testing - offset may not be consistent.
-
----
-
-## Solution: 1:1 Threading Model (Xenia's Approach)
-
-After researching how Xenia (the reference Xbox 360 emulator) handles this, the proper solution is clear:
-
-### The Problem with N:M Cooperative Scheduling
-
-Our previous architecture:
-
-- N host threads share M guest threads via cooperative scheduling
-- `wait_for_object()` returns `STATUS_TIMEOUT` immediately (no real blocking)
-- `signal_object()` writes memory flags (no real thread wake)
-- Worker threads have `entry=0` (no code to run)
-
-### Xenia's 1:1 Model
-
-Xenia uses a 1:1 thread mapping:
-
-- Each `GuestThread` has its own `std::thread`
-- `KeWaitForSingleObject` actually blocks the host thread using `std::condition_variable`
-- `KeSetEvent` signals the condition variable, waking blocked threads
-- `ExQueueWorkItem` creates a NEW thread for each work item
-
-### Implementation Plan
-
-1. **Enhance GuestThread**: Add `std::thread`, `std::mutex`, `std::condition_variable`
-2. **Real Blocking**: `KeWaitForSingleObject` blocks on condition variable
-3. **Real Wake**: `KeSetEvent` signals condition variable
-4. **Work Items**: `ExQueueWorkItem` spawns new thread per item
-
-See `/docs/architecture/THREADING_MODEL.md` for full details.
-
-### Why This Fixes Call of Duty
-
-The game's pattern:
-
-1. Game calls `KeSetEventBoostPriority` to wake workers
-2. Workers should be BLOCKED on `KeWaitForSingleObject`
-3. Workers wake up, process work, set completion flag
-4. Game's spin-poll sees flag and continues
-
-With 1:1 threading:
-
-- Worker threads can actually block and wake
-- Real synchronization replaces memory flag polling
-- Proper multi-threaded execution
-
----
-
-## Files Involved
-
-- `native/src/cpu/xenon/threading.cpp` - Thread scheduler
-- `native/src/kernel/kernel.cpp` - Guest thread creation
-- `native/src/kernel/hle/xboxkrnl_extended.cpp` - KeSetEventBoostPriority implementation
-- `native/src/cpu/xenon/cpu.cpp` - Syscall dispatch
-
----
-
-## Debugging Commands
-
-```bash
-# Check for spin loop
-adb logcat -d | grep "KeSetEventBoostPriority"
-
-# Get code dump around spin loop
-adb logcat -d | grep -A 50 "SPIN LOOP CODE DUMP"
-
-# Check what threads exist
-adb logcat -d | grep "Created thread"
-
-# Check for any syscalls other than 2168
-adb logcat -d | grep "dispatch_syscall" | grep -v "ordinal=2168"
+✅ VBlank #60 (1 second elapsed)
+✅ GPU::present() called (frame 1-20+)
+✅ No UNIMPLEMENTED syscall errors
+✅ No infinite syscall loop at KeSetEventBoostPriority
 ```
 
 ---
 
-## Next Steps
+## Historical Context
 
-1. ✅ **Document the architecture gap** - See `/docs/architecture/THREADING_MODEL.md`
-2. 🔄 **Implement 1:1 threading** - Each GuestThread gets own host thread
-3. 🔄 **Implement real blocking** - KeWaitForSingleObject uses condition variables
-4. 🔄 **Implement real wake** - KeSetEvent signals condition variables
-5. 🔄 **Test with Call of Duty** - Verify it boots past purple screen
+This issue was the primary blocker for weeks. Key insights came from:
+
+1. Researching Xenia's 1:1 threading model
+2. Tracing exactly where the game was polling
+3. Understanding the relationship between JIT context and HLE context
+4. Debugging address translation discrepancies
+
+The journey from "purple screen" to "boots past initialization" involved understanding the fundamental architecture differences between N:M cooperative scheduling and 1:1 real threading.

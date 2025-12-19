@@ -4,203 +4,48 @@
 
 This document describes the threading architecture for 360μ, an Xbox 360 emulator. The Xbox 360's Xenon processor has 3 cores with 2 hardware threads each (6 total), and games make heavy use of multi-threading with complex synchronization.
 
-## Status: FIXED ✅
+## Status: ✅ IMPLEMENTED
 
-As of December 2024, the Call of Duty: Black Ops boot hang has been fixed. The game now advances past the worker thread initialization sequence.
+As of December 2024, the 1:1 threading model is implemented and working. Call of Duty: Black Ops successfully boots past the initial worker thread initialization sequence.
 
-## The Problem: Call of Duty Boot Hang (RESOLVED)
+---
 
-Call of Duty: Black Ops was hanging during initialization with a purple screen. Analysis revealed:
+## Architecture: 1:1 Real Threading
 
-1. The game immediately enters a spin loop calling `KeSetEventBoostPriority`
-2. It polls a completion flag at `r31 + 0x14C` waiting for it to change
-3. The game expects **kernel worker threads** to process work and set the flag
-4. Multiple bugs were preventing progress
-
-### Root Causes Found and Fixed
-
-**Bug 1: JIT syscall not advancing PC**
-
-- After a `sc` (syscall) instruction, the JIT wasn't advancing PC
-- This caused the game to loop forever on the same syscall instruction
-- **Fix**: Added PC += 4 in `compile_syscall()`
-
-**Bug 2: Context desynchronization**
-
-- JIT used a local copy of context (`cpu_ctx`), while HLE modified `external_ctx`
-- Syscall results weren't propagating back to JIT
-- **Fix**: Sync `external_ctx = cpu_ctx` BEFORE syscall, `cpu_ctx = external_ctx` AFTER
-
-**Bug 3: Address translation mismatch**
-
-- JIT masked all addresses with `0x1FFFFFFF` (512MB physical)
-- Memory class wasn't applying the same mask consistently
-- **Fix**: Updated `Memory::translate_address()` to always mask with `0x1FFFFFFF`
-
-**Bug 4: TLS for thread identification**
-
-- In multi-threaded mode, `GetCurrentGuestThread()` needed thread-local storage
-- Without TLS, syscall handlers couldn't identify which thread was calling
-- **Fix**: Added `thread_local GuestThread* g_current_guest_thread`
-
-## Architecture Comparison
-
-### Previous Architecture (N:M Cooperative)
+Each guest thread gets its own dedicated host thread. This enables real OS-level blocking and waking, which is essential for correct Xbox 360 emulation.
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    ThreadScheduler                       │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐        │
-│  │HostThread 0 │ │HostThread 1 │ │HostThread 2 │ ...    │
-│  │  (std::thread)│  (std::thread)│  (std::thread)│        │
-│  └──────┬──────┘ └──────┬──────┘ └──────┬──────┘        │
-│         │               │               │                │
-│         ▼               ▼               ▼                │
-│  ┌──────────────────────────────────────────────┐       │
-│  │           Ready Queue (cooperative)           │       │
-│  │  [Guest1] [Guest2] [Guest3] [Guest4] ...     │       │
-│  └──────────────────────────────────────────────┘       │
-└─────────────────────────────────────────────────────────┘
-
-Problems:
-- wait_for_object() returns immediately (no real blocking)
-- signal_object() sets memory flag (no real wake)
-- Worker threads have no code to execute
-- Spin-waits consume CPU without progress
-```
-
-### New Architecture (1:1 Real Threading)
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Guest Threads                         │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐        │
-│  │ GuestThread1│ │ GuestThread2│ │ GuestThread3│ ...    │
-│  │ + HostThread│ │ + HostThread│ │ + HostThread│        │
-│  │ + CondVar   │ │ + CondVar   │ │ + CondVar   │        │
-│  └──────┬──────┘ └──────┬──────┘ └──────┬──────┘        │
-│         │               │               │                │
-│         ▼               ▼               ▼                │
-│  ┌──────────────────────────────────────────────┐       │
-│  │           Synchronization Objects             │       │
-│  │  XEvent    XSemaphore    XMutex    XTimer    │       │
-│  │  (real condition variables + wait lists)      │       │
-│  └──────────────────────────────────────────────┘       │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    Guest Threads                             │
+│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐            │
+│  │ GuestThread1│ │ GuestThread2│ │ GuestThread3│ ...        │
+│  │ + HostThread│ │ + HostThread│ │ + HostThread│            │
+│  │ + Mutex     │ │ + Mutex     │ │ + Mutex     │            │
+│  │ + CondVar   │ │ + CondVar   │ │ + CondVar   │            │
+│  └──────┬──────┘ └──────┬──────┘ └──────┬──────┘            │
+│         │               │               │                    │
+│         ▼               ▼               ▼                    │
+│  ┌──────────────────────────────────────────────┐           │
+│  │           Synchronization Objects             │           │
+│  │  XEvent    XSemaphore    XMutex    XTimer    │           │
+│  │  (real condition variables + wait lists)      │           │
+│  └──────────────────────────────────────────────┘           │
+└─────────────────────────────────────────────────────────────┘
 
 Benefits:
 - KeWaitForSingleObject actually blocks host thread
 - KeSetEvent actually wakes waiting threads
-- ExQueueWorkItem spawns real thread for work
 - Proper multi-core parallelism
+- No busy-wait polling
 ```
 
-## How Xenia Does It (Reference Implementation)
+---
 
-Xenia uses the 1:1 model:
+## Key Implementation Details
 
-1. **XThread class**: Each guest thread is an `XThread` with its own `std::thread`
-2. **XEvent class**: Real synchronization object with condition variable
-3. **KeWaitForSingleObject**: Blocks host thread on condition variable
-4. **KeSetEvent**: Signals condition variable, wakes waiters
-5. **ExQueueWorkItem**: Creates NEW thread per work item (no thread pool)
+### Thread-Local Storage (TLS)
 
-Key code pattern from Xenia:
-
-```cpp
-// XEvent::Set() - signal the event
-void XEvent::Set() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  signal_state_ = true;
-  if (manual_reset_) {
-    cv_.notify_all();  // Wake all waiters
-  } else {
-    cv_.notify_one();  // Wake one waiter (auto-reset)
-  }
-}
-
-// XThread::Wait() - block until signaled
-uint32_t XThread::Wait(XObject* object, uint64_t timeout) {
-  std::unique_lock<std::mutex> lock(object->mutex_);
-  while (!object->signaled()) {
-    if (timeout == 0) return STATUS_TIMEOUT;
-    object->cv_.wait(lock);
-  }
-  return STATUS_SUCCESS;
-}
-```
-
-## Implementation Plan
-
-### Phase 1: GuestThread Enhancement
-
-Each `GuestThread` gets:
-
-- `std::thread host_thread` - dedicated host thread
-- `std::mutex mutex` - for synchronization
-- `std::condition_variable wait_cv` - for blocking waits
-- `bool running` - thread lifecycle control
-
-### Phase 2: Synchronization Objects
-
-Create proper sync objects with real blocking:
-
-- `XEvent` - manual/auto reset events with condition variables
-- `XSemaphore` - counting semaphore
-- `XMutex` - mutual exclusion
-- Map guest addresses to these objects
-
-### Phase 3: Kernel Functions
-
-Implement real blocking/waking:
-
-- `KeWaitForSingleObject` - block on condition variable
-- `KeWaitForMultipleObjects` - wait on multiple objects
-- `KeSetEvent` / `KeSetEventBoostPriority` - signal and wake
-- `ExQueueWorkItem` - spawn new thread per work item
-
-### Phase 4: Thread Lifecycle
-
-- `ExCreateThread` - create new GuestThread with host thread
-- Thread termination and cleanup
-- Proper shutdown sequence
-
-## Memory Model Considerations
-
-The Xbox 360 uses a weakly-ordered memory model. With 1:1 threading:
-
-- Each host thread directly accesses guest memory
-- Memory barriers may be needed for cross-thread visibility
-- JIT code runs directly on host threads
-
-## Performance Considerations
-
-1:1 threading has trade-offs:
-
-- **Pro**: Real parallelism on multi-core hosts
-- **Pro**: Proper blocking (no busy-wait)
-- **Con**: Thread creation overhead
-- **Con**: More host threads than CPU cores
-
-Mitigations:
-
-- Thread pooling for ExQueueWorkItem (optional)
-- Affinity hints to OS scheduler
-- Yield hints in spin-waits
-
-## Files to Modify
-
-1. `native/src/cpu/xenon/threading.h` - GuestThread structure
-2. `native/src/cpu/xenon/threading.cpp` - ThreadScheduler implementation
-3. `native/src/kernel/hle/xboxkrnl_threading.cpp` - HLE functions
-4. `native/src/kernel/hle/xboxkrnl_extended.cpp` - Extended functions
-5. `native/src/kernel/kernel.cpp` - Thread creation
-
-## Critical Implementation Details
-
-### Thread-Local Storage (TLS) for Thread Identification
-
-In a true multi-threaded system, there is no single "current thread" - multiple threads run simultaneously. Xenia solves this with **thread-local storage**:
+In a true multi-threaded system, multiple threads run simultaneously. We use thread-local storage to identify the current guest thread:
 
 ```cpp
 // Each host thread has its own TLS slot
@@ -210,19 +55,12 @@ GuestThread* GetCurrentGuestThread() {
     return g_current_guest_thread;
 }
 
-// Set when 1:1 host thread starts
 void SetCurrentGuestThread(GuestThread* thread) {
     g_current_guest_thread = thread;
 }
 ```
 
-When a syscall happens:
-
-1. The host thread executing the syscall calls `GetCurrentGuestThread()`
-2. Returns the `GuestThread*` associated with THIS host thread
-3. Syscall handler uses the correct `ThreadContext`
-
-**Do NOT** use a global "current thread ID" or "active thread" variable - this is a race condition in multi-threaded code.
+When a host thread starts executing a guest thread, it calls `SetCurrentGuestThread()`. Syscall handlers then call `GetCurrentGuestThread()` to get the correct context.
 
 ### Address Translation Consistency
 
@@ -238,19 +76,116 @@ GuestAddr Memory::translate_address(GuestAddr addr) {
 }
 ```
 
-If translation differs:
+The Xbox 360 address space has multiple virtual mappings (0x00000000, 0x40000000, 0x80000000, etc.) that all map to the same 512MB of physical RAM.
 
-- JIT reads from physical `0x1003FC3C`
-- HLE writes to virtual `0x7003FC3C` (different location!)
-- Completion flags never seen by game code
+### Context Synchronization
 
-The Xbox 360 address space has multiple mappings (0x00000000, 0x40000000, 0x80000000, etc.) that all map to the same 512MB of physical RAM.
+The JIT uses a local copy of the thread context for performance. When a syscall occurs, we must sync:
+
+```cpp
+// In Cpu::execute_with_context()
+if (cpu_ctx.interrupted) {
+    // BEFORE syscall: copy JIT's working context to thread context
+    external_ctx = cpu_ctx;
+    dispatch_syscall(cpu_ctx);
+    // AFTER syscall: copy modified context back to JIT
+    cpu_ctx = external_ctx;
+}
+```
+
+### Syscall PC Advancement
+
+After a `sc` (syscall) instruction, the JIT must advance PC past the instruction:
+
+```cpp
+void JitCompiler::compile_syscall(ARM64Emitter& emit, const DecodedInst& inst) {
+    // Set interrupted flag
+    emit.MOV_imm(arm64::X0, 1);
+    emit.STRB(arm64::X0, arm64::CTX_REG, offsetof(ThreadContext, interrupted));
+
+    // CRITICAL: Advance PC past syscall (4 bytes)
+    emit.LDR(arm64::X1, arm64::CTX_REG, offsetof(ThreadContext, pc));
+    emit.ADD_imm(arm64::X1, arm64::X1, 4);
+    emit.STR(arm64::X1, arm64::CTX_REG, offsetof(ThreadContext, pc));
+
+    // Return from block
+    emit_block_epilogue(emit, current_block_inst_count_);
+}
+```
+
+---
+
+## Bugs Fixed (December 2024)
+
+### Bug 1: JIT syscall not advancing PC
+
+- After `sc` instruction, JIT wasn't advancing PC
+- Game looped forever on the same syscall
+- **Fix**: Added `PC += 4` in `compile_syscall()`
+
+### Bug 2: Context desynchronization
+
+- JIT used local `cpu_ctx`, HLE modified `external_ctx`
+- Syscall results weren't propagating back
+- **Fix**: Sync contexts before AND after syscall
+
+### Bug 3: Address translation mismatch
+
+- JIT masked with `0x1FFFFFFF`, Memory class didn't always
+- HLE writes went to wrong physical addresses
+- **Fix**: `translate_address()` always masks
+
+### Bug 4: TLS for thread identification
+
+- `GetCurrentGuestThread()` returned wrong thread
+- Syscall handlers used wrong context
+- **Fix**: Added `thread_local` TLS
+
+---
+
+## Files
+
+| File                                  | Description                               |
+| ------------------------------------- | ----------------------------------------- |
+| `native/src/cpu/xenon/threading.h`    | GuestThread structure, TLS declarations   |
+| `native/src/cpu/xenon/threading.cpp`  | ThreadScheduler, 1:1 thread creation, TLS |
+| `native/src/cpu/xenon/cpu.cpp`        | Context sync in `execute_with_context()`  |
+| `native/src/cpu/jit/jit_compiler.cpp` | PC advancement in `compile_syscall()`     |
+| `native/src/memory/memory.cpp`        | Consistent address translation            |
+
+---
+
+## Performance Considerations
+
+1:1 threading has trade-offs:
+
+| Pro                                  | Con                              |
+| ------------------------------------ | -------------------------------- |
+| Real parallelism on multi-core hosts | Thread creation overhead         |
+| Proper blocking (no busy-wait)       | More host threads than CPU cores |
+| Correct synchronization semantics    | Context switch overhead          |
+
+Modern Android devices (8+ cores) handle this well. The Snapdragon 8 Gen 2+ has enough cores for the Xbox 360's 6 hardware threads plus system overhead.
+
+---
+
+## Reference: Xenia's Approach
+
+Our implementation is inspired by Xenia:
+
+1. **XThread class**: Each guest thread has its own `std::thread`
+2. **XEvent class**: Real synchronization with condition variables
+3. **KeWaitForSingleObject**: Blocks host thread on condition variable
+4. **KeSetEvent**: Signals condition variable, wakes waiters
+
+---
 
 ## Testing
 
-After implementation, verify:
+Verified with Call of Duty: Black Ops:
 
-1. Call of Duty: Black Ops boots past purple screen ✓
-2. Multi-threaded games run correctly
-3. No deadlocks or race conditions
-4. Performance is acceptable on target hardware (Android)
+- ✅ Boots past XEX loading
+- ✅ Creates multiple guest threads
+- ✅ Syscalls execute correctly
+- ✅ VBlank interrupts fire
+- ✅ No infinite syscall loops
