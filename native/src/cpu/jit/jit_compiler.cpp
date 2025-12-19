@@ -10,6 +10,7 @@
 #include "jit.h"
 #include "../../memory/memory.h"
 #include "../xenon/cpu.h"
+#include "x360mu/feature_flags.h"
 #include <thread>
 #include <unordered_map>
 
@@ -67,6 +68,8 @@ extern "C" void jit_trace_store(GuestAddr addr) {
 // Debug helper to trace mirror/high physical addresses that would cause SIGSEGV
 // This catches addresses in 0x20000000-0x7FFFFFFF range before masking
 extern "C" void jit_trace_mirror_access(GuestAddr addr, u32 is_store) {
+    if (!FeatureFlags::jit_trace_mirror_access.load(std::memory_order_relaxed)) return;
+    
     static int trace_count = 0;
     trace_count++;
     
@@ -90,6 +93,8 @@ extern "C" void jit_trace_mirror_access(GuestAddr addr, u32 is_store) {
 // Trace ALL memory accesses, not just mirror range, to find the crash source
 // Trace the ORIGINAL (pre-mask) address to catch invalid/negative pointers
 extern "C" void jit_trace_original_addr(GuestAddr original_addr, GuestAddr masked_addr, u32 is_store) {
+    if (!FeatureFlags::jit_trace_memory.load(std::memory_order_relaxed)) return;
+    
     static int trace_count = 0;
     trace_count++;
     
@@ -108,7 +113,7 @@ extern "C" void jit_trace_original_addr(GuestAddr original_addr, GuestAddr maske
     }
     
     // Also log if masked address is near the 512MB boundary (last 64 bytes)
-    if (masked_addr >= 0x1FFFFFC0) {
+    if (masked_addr >= 0x1FFFFFC0 && FeatureFlags::jit_trace_boundary_access.load(std::memory_order_relaxed)) {
         __android_log_print(ANDROID_LOG_ERROR, "JIT_BOUNDARY", 
             "!!! BOUNDARY ACCESS !!! #%d: %s original=0x%08X masked=0x%08llX",
             trace_count, is_store ? "STORE" : "LOAD", 
@@ -128,12 +133,12 @@ extern "C" void jit_trace_all_access(GuestAddr addr, u32 is_store) {
 }
 
 extern "C" void jit_mmio_write_u32(void* mem, GuestAddr addr, u32 value) {
-    static int call_count = 0;
-    
-    // Log ALL MMIO writes - we need to see if any GPU writes are happening
-    call_count++;
-    if (call_count <= 100 || (call_count % 10000 == 0)) {
-        LOGI("MMIO write_u32 #%d: addr=0x%08llX value=0x%08X", call_count, (unsigned long long)addr, value);
+    if (FeatureFlags::jit_trace_mmio.load(std::memory_order_relaxed)) {
+        static int call_count = 0;
+        call_count++;
+        if (call_count <= 100 || (call_count % 10000 == 0)) {
+            LOGI("MMIO write_u32 #%d: addr=0x%08llX value=0x%08X", call_count, (unsigned long long)addr, value);
+        }
     }
     static_cast<Memory*>(mem)->write_u32(addr, value);
 }
@@ -339,13 +344,15 @@ u64 JitCompiler::execute(ThreadContext& ctx, u64 cycles) {
             using BlockFn = void(*)(ThreadContext*, u8*);
             BlockFn fn = reinterpret_cast<BlockFn>(block->code);
             
-            // DEBUG: Log before block execution to identify crashing block
-            static int exec_count = 0;
-            exec_count++;
-            if (exec_count <= 20 || exec_count % 10000 == 0) {
-                __android_log_print(ANDROID_LOG_ERROR, "JIT_EXEC", 
-                    "Executing block #%d at PC=0x%08llX (block code=%p)", 
-                    exec_count, (unsigned long long)ctx.pc, block->code);
+            // DEBUG: Log block execution (controlled by feature flag)
+            if (FeatureFlags::jit_trace_blocks.load(std::memory_order_relaxed)) {
+                static int exec_count = 0;
+                exec_count++;
+                if (exec_count <= 20 || exec_count % 10000 == 0) {
+                    __android_log_print(ANDROID_LOG_ERROR, "JIT_EXEC", 
+                        "Executing block #%d at PC=0x%08llX (block code=%p)", 
+                        exec_count, (unsigned long long)ctx.pc, block->code);
+                }
             }
             
             // Execute the block (fastmem_base is now embedded in block code)
@@ -2285,17 +2292,22 @@ void JitCompiler::compile_branch_conditional(ARM64Emitter& emit, const DecodedIn
     std::vector<u8*> skip_branches;
     
     // Handle CTR decrement (not for bcctr)
+    // Xbox 360 runs in 32-bit mode, so CTR is effectively 32-bit.
+    // Use 32-bit instructions to ensure proper 32-bit wrap-around behavior.
+    // Note: We pass X0 (register 0) but the _32 variants use W0 encoding.
     if (decrement_ctr && !is_ctr_target) {
-        emit.LDR(arm64::X0, arm64::CTX_REG, ctx_offset_ctr());
-        emit.SUB_imm(arm64::X0, arm64::X0, 1);
-        emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_ctr());
+        // Load CTR as 32-bit (lower half of 64-bit storage)
+        emit.LDR_u32(arm64::X0, arm64::CTX_REG, ctx_offset_ctr());
+        emit.SUB_imm_32(arm64::X0, arm64::X0, 1);
+        // Store back as 32-bit (zero-extends to 64-bit in storage)
+        emit.STR_u32(arm64::X0, arm64::CTX_REG, ctx_offset_ctr());
         
-        // Test CTR
+        // Test CTR (32-bit)
         u8* skip = emit.current();
         if (test_ctr_zero) { // Branch if CTR == 0
-            emit.CBNZ(arm64::X0, 0);  // Skip to not-taken if CTR != 0
+            emit.CBNZ_32(arm64::X0, 0);  // Skip to not-taken if CTR != 0
         } else { // Branch if CTR != 0
-            emit.CBZ(arm64::X0, 0);   // Skip to not-taken if CTR == 0
+            emit.CBZ_32(arm64::X0, 0);   // Skip to not-taken if CTR == 0
         }
         skip_branches.push_back(skip);
     }

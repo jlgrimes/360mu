@@ -188,6 +188,7 @@ public:
     void ADD_imm(int rd, int rn, u32 imm12, bool shift = false);
     void ADDS_imm(int rd, int rn, u32 imm12, bool shift = false);
     void SUB_imm(int rd, int rn, u32 imm12, bool shift = false);
+    void SUB_imm_32(int rd, int rn, u32 imm12, bool shift = false);  // 32-bit SUB
     void SUBS_imm(int rd, int rn, u32 imm12, bool shift = false);
     void CMP_imm(int rn, u32 imm12);
     void CMN_imm(int rn, u32 imm12);
@@ -272,6 +273,7 @@ public:
     
     // Load/Store
     void LDR(int rt, int rn, s32 offset = 0);
+    void LDR_u32(int rt, int rn, s32 offset = 0);  // 32-bit load (zero-extends to 64-bit)
     void LDRB(int rt, int rn, s32 offset = 0);
     void LDRH(int rt, int rn, s32 offset = 0);
     void LDRSB(int rt, int rn, s32 offset = 0);
@@ -281,6 +283,7 @@ public:
     void LDP(int rt1, int rt2, int rn, s32 offset = 0);
     
     void STR(int rt, int rn, s32 offset = 0);
+    void STR_u32(int rt, int rn, s32 offset = 0);  // 32-bit store
     void STRB(int rt, int rn, s32 offset = 0);
     void STRH(int rt, int rn, s32 offset = 0);
     void STR_reg(int rt, int rn, int rm, int extend = 0, bool shift = false);
@@ -300,7 +303,9 @@ public:
     void BLR(int rn);
     void RET(int rn = arm64::X30);
     void CBZ(int rt, s32 offset);
+    void CBZ_32(int rt, s32 offset);    // 32-bit CBZ
     void CBNZ(int rt, s32 offset);
+    void CBNZ_32(int rt, s32 offset);  // 32-bit CBNZ
     void TBZ(int rt, int bit, s32 offset);
     void TBNZ(int rt, int bit, s32 offset);
     

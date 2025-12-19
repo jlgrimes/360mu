@@ -10,6 +10,7 @@
 #include <android/log.h>
 
 #include "x360mu/emulator.h"
+#include "x360mu/feature_flags.h"
 #include <string>
 #include <memory>
 
@@ -375,6 +376,75 @@ Java_com_x360mu_core_NativeEmulator_nativeSetVsync(
         // TODO: Implement vsync setting
         LOGD("Setting vsync to %s", enabled ? "enabled" : "disabled");
     }
+}
+
+// ============================================================================
+// Feature Flags
+// ============================================================================
+
+JNIEXPORT void JNICALL
+Java_com_x360mu_core_NativeEmulator_nativeSetFeatureFlag(
+    JNIEnv* env, jobject /* this */, jstring flagName, jboolean enabled) {
+    
+    std::string name = jstring_to_string(env, flagName);
+    bool value = enabled == JNI_TRUE;
+    
+    LOGI("Setting feature flag '%s' = %s", name.c_str(), value ? "true" : "false");
+    
+    // Map flag names to actual flags
+    if (name == "jit_trace_memory") {
+        FeatureFlags::jit_trace_memory = value;
+    } else if (name == "jit_trace_mirror_access") {
+        FeatureFlags::jit_trace_mirror_access = value;
+    } else if (name == "jit_trace_boundary_access") {
+        FeatureFlags::jit_trace_boundary_access = value;
+    } else if (name == "jit_trace_blocks") {
+        FeatureFlags::jit_trace_blocks = value;
+    } else if (name == "jit_trace_mmio") {
+        FeatureFlags::jit_trace_mmio = value;
+    } else if (name == "gpu_trace_registers") {
+        FeatureFlags::gpu_trace_registers = value;
+    } else if (name == "gpu_trace_shaders") {
+        FeatureFlags::gpu_trace_shaders = value;
+    } else if (name == "gpu_trace_draws") {
+        FeatureFlags::gpu_trace_draws = value;
+    } else if (name == "kernel_trace_syscalls") {
+        FeatureFlags::kernel_trace_syscalls = value;
+    } else if (name == "kernel_trace_threads") {
+        FeatureFlags::kernel_trace_threads = value;
+    } else if (name == "kernel_trace_files") {
+        FeatureFlags::kernel_trace_files = value;
+    } else if (name == "disable_fastmem") {
+        FeatureFlags::disable_fastmem = value;
+    } else if (name == "force_interpreter") {
+        FeatureFlags::force_interpreter = value;
+    } else {
+        LOGE("Unknown feature flag: %s", name.c_str());
+    }
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_x360mu_core_NativeEmulator_nativeGetFeatureFlag(
+    JNIEnv* env, jobject /* this */, jstring flagName) {
+    
+    std::string name = jstring_to_string(env, flagName);
+    
+    if (name == "jit_trace_memory") return FeatureFlags::jit_trace_memory ? JNI_TRUE : JNI_FALSE;
+    if (name == "jit_trace_mirror_access") return FeatureFlags::jit_trace_mirror_access ? JNI_TRUE : JNI_FALSE;
+    if (name == "jit_trace_boundary_access") return FeatureFlags::jit_trace_boundary_access ? JNI_TRUE : JNI_FALSE;
+    if (name == "jit_trace_blocks") return FeatureFlags::jit_trace_blocks ? JNI_TRUE : JNI_FALSE;
+    if (name == "jit_trace_mmio") return FeatureFlags::jit_trace_mmio ? JNI_TRUE : JNI_FALSE;
+    if (name == "gpu_trace_registers") return FeatureFlags::gpu_trace_registers ? JNI_TRUE : JNI_FALSE;
+    if (name == "gpu_trace_shaders") return FeatureFlags::gpu_trace_shaders ? JNI_TRUE : JNI_FALSE;
+    if (name == "gpu_trace_draws") return FeatureFlags::gpu_trace_draws ? JNI_TRUE : JNI_FALSE;
+    if (name == "kernel_trace_syscalls") return FeatureFlags::kernel_trace_syscalls ? JNI_TRUE : JNI_FALSE;
+    if (name == "kernel_trace_threads") return FeatureFlags::kernel_trace_threads ? JNI_TRUE : JNI_FALSE;
+    if (name == "kernel_trace_files") return FeatureFlags::kernel_trace_files ? JNI_TRUE : JNI_FALSE;
+    if (name == "disable_fastmem") return FeatureFlags::disable_fastmem ? JNI_TRUE : JNI_FALSE;
+    if (name == "force_interpreter") return FeatureFlags::force_interpreter ? JNI_TRUE : JNI_FALSE;
+    
+    LOGE("Unknown feature flag: %s", name.c_str());
+    return JNI_FALSE;
 }
 
 } // extern "C"

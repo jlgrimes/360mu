@@ -287,5 +287,36 @@ class NativeEmulator : AutoCloseable {
     
     private external fun nativeSetResolutionScale(handle: Long, scale: Int)
     private external fun nativeSetVsync(handle: Long, enabled: Boolean)
+    
+    // Feature flags for debugging
+    private external fun nativeSetFeatureFlag(flagName: String, enabled: Boolean)
+    private external fun nativeGetFeatureFlag(flagName: String): Boolean
+    
+    /**
+     * Set a feature flag value
+     * 
+     * Available flags:
+     * - jit_trace_memory: Trace all memory accesses
+     * - jit_trace_mirror_access: Trace mirror range accesses
+     * - jit_trace_boundary_access: Trace 512MB boundary accesses
+     * - jit_trace_blocks: Trace block execution
+     * - jit_trace_mmio: Trace MMIO operations
+     * - gpu_trace_registers: Trace GPU register writes
+     * - gpu_trace_shaders: Trace shader compilation
+     * - gpu_trace_draws: Trace draw calls
+     * - kernel_trace_syscalls: Trace syscalls
+     * - kernel_trace_threads: Trace threading
+     * - kernel_trace_files: Trace file I/O
+     * - disable_fastmem: Use slow path for memory
+     * - force_interpreter: Disable JIT
+     */
+    fun setFeatureFlag(name: String, enabled: Boolean) {
+        Log.i(TAG, "Setting feature flag: $name = $enabled")
+        nativeSetFeatureFlag(name, enabled)
+    }
+    
+    fun getFeatureFlag(name: String): Boolean {
+        return nativeGetFeatureFlag(name)
+    }
 }
 

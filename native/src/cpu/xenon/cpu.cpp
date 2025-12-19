@@ -241,12 +241,31 @@ void Cpu::execute_with_context(u32 thread_id, ThreadContext& external_ctx, u64 c
     
     // === DEBUG: Log PC periodically to see where the game is spinning ===
     static u64 exec_call_count = 0;
+    static u64 stuck_pc_count = 0;
     static GuestAddr last_logged_pc = 0;
     exec_call_count++;
+    
+    // Special tracking for the known stuck PC
+    if (external_ctx.pc == 0x825FB308) {
+        stuck_pc_count++;
+        if (stuck_pc_count == 1 || stuck_pc_count == 100 || stuck_pc_count == 1000 || 
+            stuck_pc_count == 10000 || stuck_pc_count == 100000) {
+            LOGI("STUCK PC 0x825FB308: count=%llu, time_base=%llu, CTR=%llu, r3=0x%llX, r4=0x%llX, r5=0x%llX, r6=0x%llX",
+                 stuck_pc_count, external_ctx.time_base, external_ctx.ctr,
+                 external_ctx.gpr[3], external_ctx.gpr[4], external_ctx.gpr[5], external_ctx.gpr[6]);
+        }
+    } else {
+        if (stuck_pc_count > 0) {
+            LOGI("Left stuck PC after %llu iterations, now at PC=0x%08llX", 
+                 stuck_pc_count, external_ctx.pc);
+            stuck_pc_count = 0;
+        }
+    }
+    
     // Log every 50000 calls, or when PC changes significantly
     if (exec_call_count <= 10 || (exec_call_count % 50000 == 0)) {
-        LOGI("execute_with_context #%llu: tid=%u PC=0x%08llX LR=0x%08llX",
-             exec_call_count, thread_id, external_ctx.pc, external_ctx.lr);
+        LOGI("execute_with_context #%llu: tid=%u PC=0x%08llX LR=0x%08llX time_base=%llu",
+             exec_call_count, thread_id, external_ctx.pc, external_ctx.lr, external_ctx.time_base);
         last_logged_pc = external_ctx.pc;
     }
     

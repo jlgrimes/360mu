@@ -59,6 +59,12 @@ void ARM64Emitter::SUB_imm(int rd, int rn, u32 imm12, bool shift) {
     emit32(0xD1000000 | (sh << 22) | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd);
 }
 
+void ARM64Emitter::SUB_imm_32(int rd, int rn, u32 imm12, bool shift) {
+    // SUB Wd, Wn, #imm{, LSL #12} - 32-bit version
+    u32 sh = shift ? 1 : 0;
+    emit32(0x51000000 | (sh << 22) | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd);
+}
+
 void ARM64Emitter::SUBS_imm(int rd, int rn, u32 imm12, bool shift) {
     // SUBS Xd, Xn, #imm{, LSL #12}
     u32 sh = shift ? 1 : 0;
@@ -557,6 +563,22 @@ void ARM64Emitter::LDR(int rt, int rn, s32 offset) {
     }
 }
 
+void ARM64Emitter::LDR_u32(int rt, int rn, s32 offset) {
+    // LDR Wt, [Xn, #offset] - 32-bit load (zero-extends to 64-bit)
+    if (offset >= 0 && offset < 16380 && (offset & 3) == 0) {
+        // Unsigned offset form (scaled by 4)
+        emit32(0xB9400000 | ((offset >> 2) << 10) | (rn << 5) | rt);
+    } else if (offset >= -256 && offset <= 255) {
+        // Signed offset form (unscaled)
+        emit32(0xB8400000 | ((offset & 0x1FF) << 12) | (rn << 5) | rt);
+    } else {
+        // Use temp register for large offset
+        MOV_imm(arm64::X16, offset);
+        // LDR Wt, [Xn, X16] - register offset, 32-bit
+        emit32(0xB8606800 | (arm64::X16 << 16) | (rn << 5) | rt);
+    }
+}
+
 void ARM64Emitter::LDRB(int rt, int rn, s32 offset) {
     if (offset >= 0 && offset < 4096) {
         emit32(0x39400000 | (offset << 10) | (rn << 5) | rt);
@@ -621,6 +643,22 @@ void ARM64Emitter::STR(int rt, int rn, s32 offset) {
     } else {
         MOV_imm(arm64::X16, offset);
         STR_reg(rt, rn, arm64::X16);
+    }
+}
+
+void ARM64Emitter::STR_u32(int rt, int rn, s32 offset) {
+    // STR Wt, [Xn, #offset] - 32-bit store
+    if (offset >= 0 && offset < 16380 && (offset & 3) == 0) {
+        // Unsigned offset form (scaled by 4)
+        emit32(0xB9000000 | ((offset >> 2) << 10) | (rn << 5) | rt);
+    } else if (offset >= -256 && offset <= 255) {
+        // Signed offset form (unscaled)
+        emit32(0xB8000000 | ((offset & 0x1FF) << 12) | (rn << 5) | rt);
+    } else {
+        // Use temp register for large offset
+        MOV_imm(arm64::X16, offset);
+        // STR Wt, [Xn, X16] - register offset, 32-bit
+        emit32(0xB8206800 | (arm64::X16 << 16) | (rn << 5) | rt);
     }
 }
 
@@ -705,9 +743,21 @@ void ARM64Emitter::CBZ(int rt, s32 offset) {
     emit32(0xB4000000 | ((imm19 & 0x7FFFF) << 5) | rt);
 }
 
+void ARM64Emitter::CBZ_32(int rt, s32 offset) {
+    // CBZ Wt, label - 32-bit compare and branch if zero
+    s32 imm19 = offset >> 2;
+    emit32(0x34000000 | ((imm19 & 0x7FFFF) << 5) | rt);
+}
+
 void ARM64Emitter::CBNZ(int rt, s32 offset) {
     s32 imm19 = offset >> 2;
     emit32(0xB5000000 | ((imm19 & 0x7FFFF) << 5) | rt);
+}
+
+void ARM64Emitter::CBNZ_32(int rt, s32 offset) {
+    // CBNZ Wt, label - 32-bit compare and branch if not zero
+    s32 imm19 = offset >> 2;
+    emit32(0x35000000 | ((imm19 & 0x7FFFF) << 5) | rt);
 }
 
 void ARM64Emitter::TBZ(int rt, int bit, s32 offset) {

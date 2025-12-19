@@ -234,14 +234,43 @@ GuestThread* ThreadScheduler::create_thread(GuestAddr entry_point, GuestAddr par
             }
             
             // Main execution loop - run until thread terminates
+            static int loop_log_counter = 0;
+            static u64 last_pc = 0;
+            static int same_pc_count = 0;
             while (ptr->should_run.load() && ptr->state != ThreadState::Terminated) {
+                loop_log_counter++;
+                
+                // Track if PC is changing - detect infinite loops
+                if (ptr->context.pc == last_pc) {
+                    same_pc_count++;
+                    if (same_pc_count == 100 || same_pc_count == 1000 || same_pc_count == 10000) {
+                        LOGI("1:1 thread %u: STUCK at PC=0x%08llX for %d iterations",
+                             ptr->thread_id, ptr->context.pc, same_pc_count);
+                    }
+                } else {
+                    if (same_pc_count > 100) {
+                        LOGI("1:1 thread %u: moved from PC=0x%08llX (was stuck %d iters) to PC=0x%08llX",
+                             ptr->thread_id, last_pc, same_pc_count, ptr->context.pc);
+                    }
+                    same_pc_count = 0;
+                    last_pc = ptr->context.pc;
+                }
+                
+                if (loop_log_counter <= 10 || (loop_log_counter % 50000 == 0)) {
+                    LOGI("1:1 thread %u loop #%d: state=%d, PC=0x%08llX",
+                         ptr->thread_id, loop_log_counter, (int)ptr->state, ptr->context.pc);
+                }
+                
                 if (ptr->state == ThreadState::Waiting) {
                     // Thread is in a blocking wait - actually block here
+                    LOGI("1:1 thread %u entering wait (loop #%d)", ptr->thread_id, loop_log_counter);
                     std::unique_lock<std::mutex> lock(ptr->wait_mutex);
                     ptr->wait_cv.wait(lock, [ptr]{ 
                         return ptr->wait_signaled || !ptr->should_run.load() ||
                                ptr->state != ThreadState::Waiting;
                     });
+                    LOGI("1:1 thread %u woke from wait: signaled=%d, should_run=%d, state=%d",
+                         ptr->thread_id, ptr->wait_signaled, ptr->should_run.load(), (int)ptr->state);
                     
                     if (ptr->wait_signaled) {
                         ptr->state = ThreadState::Running;
@@ -287,10 +316,63 @@ GuestThread* ThreadScheduler::create_thread(GuestAddr entry_point, GuestAddr par
             ptr->context.running = false;
             LOGI("1:1 Host thread ended for guest thread %u", ptr->thread_id);
         });
+    } else if (thread->is_worker_thread) {
+        // Worker thread (entry=0): Spawn host thread that processes work queue items
+        LOGI("Spawning 1:1 host thread for worker thread %u (queue_type=%d)",
+             thread->thread_id, static_cast<int>(thread->worker_queue_type));
+        
+        ptr->host_thread = std::make_unique<std::thread>([ptr, scheduler = this]() {
+            LOGI("1:1 Worker host thread started for guest worker thread %u", ptr->thread_id);
+            ptr->is_running.store(true);
+            
+            int loop_count = 0;
+            int work_processed = 0;
+            
+            while (ptr->should_run.load()) {
+                loop_count++;
+                
+                // Log periodically
+                if (loop_count == 1 || loop_count == 100 || loop_count % 10000 == 0) {
+                    LOGI("Worker thread %u loop #%d: processed %d items so far",
+                         ptr->thread_id, loop_count, work_processed);
+                }
+                
+                // Handle waiting state
+                if (ptr->state == ThreadState::Waiting) {
+                    std::unique_lock<std::mutex> lock(ptr->wait_mutex);
+                    ptr->wait_cv.wait(lock, [ptr]{ 
+                        return ptr->wait_signaled || !ptr->should_run.load() ||
+                               ptr->state != ThreadState::Waiting;
+                    });
+                    if (ptr->wait_signaled) {
+                        ptr->state = ThreadState::Ready;
+                        ptr->wait_signaled = false;
+                    }
+                    continue;
+                }
+                
+                // Process work queue items
+                ptr->state = ThreadState::Running;
+                bool did_work = scheduler->process_worker_thread(ptr);
+                
+                if (did_work) {
+                    work_processed++;
+                } else {
+                    // No work available - yield and sleep briefly to avoid busy spinning
+                    ptr->state = ThreadState::Ready;
+                    std::this_thread::yield();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            
+            ptr->is_running.store(false);
+            LOGI("1:1 Worker host thread ended for guest worker thread %u (processed %d items)",
+                 ptr->thread_id, work_processed);
+        });
     } else {
-        // entry_point == 0: This is a special marker thread (like worker threads)
-        // Don't spawn a host thread - these threads wait for work via other mechanisms
-        LOGI("Thread %u has entry=0, no host thread spawned", thread->thread_id);
+        // entry_point == 0 but not a worker thread - this shouldn't happen
+        LOGW("Thread %u has entry=0 but is_worker_thread=false, skipping host thread", 
+             thread->thread_id);
     }
     
     stats_.total_threads_created++;
