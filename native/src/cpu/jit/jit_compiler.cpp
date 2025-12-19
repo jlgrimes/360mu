@@ -64,6 +64,46 @@ extern "C" void jit_trace_store(GuestAddr addr) {
     }
 }
 
+// Debug helper to trace mirror/high physical addresses that would cause SIGSEGV
+// This catches addresses in 0x20000000-0x7FFFFFFF range before masking
+extern "C" void jit_trace_mirror_access(GuestAddr addr, u32 is_store) {
+    static int trace_count = 0;
+    trace_count++;
+    
+    // ALWAYS log if address is exactly 0x20000000 or close to it
+    if (addr >= 0x1FF00000 && addr <= 0x20100000) {
+        LOGI("*** CRITICAL *** #%d: %s addr=0x%08llX - THIS IS THE CRASH ADDRESS!", 
+             trace_count, 
+             is_store ? "STORE" : "LOAD",
+             (unsigned long long)addr);
+    }
+    // Log first 50, then every 1000th
+    else if (trace_count <= 50 || (trace_count % 1000 == 0)) {
+        LOGI("MIRROR ACCESS #%d: %s addr=0x%08llX (would be offset 0x%08llX without mask)", 
+             trace_count, 
+             is_store ? "STORE" : "LOAD",
+             (unsigned long long)addr,
+             (unsigned long long)addr);  // Raw offset if mask wasn't applied
+    }
+}
+
+// Trace ALL memory accesses, not just mirror range, to find the crash source
+extern "C" void jit_trace_all_access(GuestAddr addr, u32 is_store) {
+    static int all_count = 0;
+    all_count++;
+    
+    // Always log if this is the exact crash address
+    if (addr == 0x20000000) {
+        LOGI("!!! FOUND IT !!! access #%d: %s addr=0x20000000 EXACT MATCH!", 
+             all_count, is_store ? "STORE" : "LOAD");
+    }
+    // Log first 100 accesses
+    else if (all_count <= 100) {
+        LOGI("ALL ACCESS #%d: %s addr=0x%08llX", all_count, 
+             is_store ? "STORE" : "LOAD", (unsigned long long)addr);
+    }
+}
+
 extern "C" void jit_mmio_write_u32(void* mem, GuestAddr addr, u32 value) {
     static int call_count = 0;
     
@@ -1120,6 +1160,45 @@ void JitCompiler::compile_load(ARM64Emitter& emit, const DecodedInst& inst) {
     // Save original EA for MMIO path (X2 = original EA)
     emit.ORR(arm64::X2, arm64::XZR, arm64::X0);
     
+    // DEBUG: Trace addresses in the dangerous mirror range (0x20000000-0x7FFFFFFF)
+    // These would cause SIGSEGV if mask isn't applied properly
+    {
+        u8* skip_trace_low = nullptr;
+        u8* skip_trace_high = nullptr;
+        
+        // Check if addr >= 0x20000000
+        emit.MOV_imm(arm64::X16, 0x20000000ULL);
+        emit.CMP(arm64::X0, arm64::X16);
+        skip_trace_low = emit.current();
+        emit.B_cond(arm64_cond::CC, 0);  // Skip if addr < 0x20000000
+        
+        // Check if addr < 0x80000000 (we only care about physical mirror range)
+        emit.MOV_imm(arm64::X16, 0x80000000ULL);
+        emit.CMP(arm64::X0, arm64::X16);
+        skip_trace_high = emit.current();
+        emit.B_cond(arm64_cond::CS, 0);  // Skip if addr >= 0x80000000
+        
+        // Address is in dangerous range! Log it.
+        emit.SUB_imm(arm64::SP, arm64::SP, 48);
+        emit.STP(arm64::X0, arm64::X1, arm64::SP, 0);
+        emit.STP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.STP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        
+        // X0 = addr, X1 = is_store (0 for load)
+        emit.MOV_imm(arm64::X1, 0);  // is_store = false
+        u64 trace_func = reinterpret_cast<u64>(&jit_trace_mirror_access);
+        emit.MOV_imm(arm64::X16, trace_func);
+        emit.BLR(arm64::X16);
+        
+        emit.LDP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        emit.LDP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.LDP(arm64::X0, arm64::X1, arm64::SP, 0);
+        emit.ADD_imm(arm64::SP, arm64::SP, 48);
+        
+        emit.patch_branch(reinterpret_cast<u32*>(skip_trace_low), emit.current());
+        emit.patch_branch(reinterpret_cast<u32*>(skip_trace_high), emit.current());
+    }
+
     // === Address routing for loads ===
     // 1. Kernel addresses (>= 0xA0000000) → MMIO path
     // 2. Usermode virtual (0x80000000-0x9FFFFFFF) → mask to physical
@@ -1153,6 +1232,26 @@ void JitCompiler::compile_load(ARM64Emitter& emit, const DecodedInst& inst) {
     // - Virtual 0x80000000-0x9FFFFFFF → masked to 0x00000000-0x1FFFFFFF
     emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
     emit.AND(arm64::X0, arm64::X0, arm64::X16);
+    
+    // DEBUG: Trace the masked address before fastmem access
+    // If we still crash, this will show what addresses reach fastmem
+    {
+        emit.SUB_imm(arm64::SP, arm64::SP, 48);
+        emit.STP(arm64::X0, arm64::X1, arm64::SP, 0);
+        emit.STP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.STP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        
+        // X0 = masked addr, X1 = is_store (0 for load)
+        emit.MOV_imm(arm64::X1, 0);
+        u64 trace_func = reinterpret_cast<u64>(&jit_trace_all_access);
+        emit.MOV_imm(arm64::X16, trace_func);
+        emit.BLR(arm64::X16);
+        
+        emit.LDP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        emit.LDP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.LDP(arm64::X0, arm64::X1, arm64::SP, 0);
+        emit.ADD_imm(arm64::SP, arm64::SP, 48);
+    }
     
     // === FASTMEM PATH for loads ===
     // X0 now contains physical address in range 0x00000000-0x1FFFFFFF
@@ -1327,36 +1426,43 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
         emit.ORR(arm64::X3, arm64::XZR, arm64::X0);
     }
     
-    // DEBUG: Trace high-address stores to see what addresses the game is accessing
-    // Emit a call to jit_trace_store(X0) to log the address at runtime
-    // Only do this for addresses above 0x90000000 to reduce noise
+    // DEBUG: Trace addresses in the dangerous mirror range (0x20000000-0x7FFFFFFF)
+    // These would cause SIGSEGV if mask isn't applied properly
     {
-        // Check if addr >= 0xA0000000 before calling trace
-        u8* skip_trace_pos = nullptr;
-        emit.MOV_imm(arm64::X16, 0xA0000000ULL);
+        u8* skip_trace_low = nullptr;
+        u8* skip_trace_high = nullptr;
+        
+        // Check if addr >= 0x20000000
+        emit.MOV_imm(arm64::X16, 0x20000000ULL);
         emit.CMP(arm64::X0, arm64::X16);
-        skip_trace_pos = emit.current();
-        emit.B_cond(arm64_cond::CC, 0);  // Skip trace if addr < 0xA0000000
+        skip_trace_low = emit.current();
+        emit.B_cond(arm64_cond::CC, 0);  // Skip if addr < 0x20000000
         
-        // Save registers on stack (decrement SP first, then store)
+        // Check if addr < 0x80000000 (we only care about physical mirror range)
+        emit.MOV_imm(arm64::X16, 0x80000000ULL);
+        emit.CMP(arm64::X0, arm64::X16);
+        skip_trace_high = emit.current();
+        emit.B_cond(arm64_cond::CS, 0);  // Skip if addr >= 0x80000000
+        
+        // Address is in dangerous range! Log it.
         emit.SUB_imm(arm64::SP, arm64::SP, 48);
-        emit.STP(arm64::X0, arm64::X1, arm64::SP, 0);    // Save X0, X1
-        emit.STP(arm64::X2, arm64::X3, arm64::SP, 16);   // Save X2, X3
-        emit.STP(arm64::X30, arm64::XZR, arm64::SP, 32); // Save LR
+        emit.STP(arm64::X0, arm64::X1, arm64::SP, 0);
+        emit.STP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.STP(arm64::X30, arm64::XZR, arm64::SP, 32);
         
-        // X0 already has the address
-        u64 trace_func = reinterpret_cast<u64>(&jit_trace_store);
+        // X0 = addr, X1 = is_store (1 for store)
+        emit.MOV_imm(arm64::X1, 1);  // is_store = true
+        u64 trace_func = reinterpret_cast<u64>(&jit_trace_mirror_access);
         emit.MOV_imm(arm64::X16, trace_func);
         emit.BLR(arm64::X16);
         
-        // Restore registers (load then increment SP)
-        emit.LDP(arm64::X30, arm64::XZR, arm64::SP, 32); // Restore LR
-        emit.LDP(arm64::X2, arm64::X3, arm64::SP, 16);   // Restore X2, X3
-        emit.LDP(arm64::X0, arm64::X1, arm64::SP, 0);    // Restore X0, X1
+        emit.LDP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        emit.LDP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.LDP(arm64::X0, arm64::X1, arm64::SP, 0);
         emit.ADD_imm(arm64::SP, arm64::SP, 48);
         
-        // Patch the skip branch
-        emit.patch_branch(reinterpret_cast<u32*>(skip_trace_pos), emit.current());
+        emit.patch_branch(reinterpret_cast<u32*>(skip_trace_low), emit.current());
+        emit.patch_branch(reinterpret_cast<u32*>(skip_trace_high), emit.current());
     }
     
     // Load value to store
@@ -1491,6 +1597,25 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
     // X0 already has the masked physical address (0x00000000-0x1FFFFFFF)
     emit.patch_branch(reinterpret_cast<u32*>(fastmem_path), emit.current());
     
+    // DEBUG: Trace the masked address before fastmem access
+    {
+        emit.SUB_imm(arm64::SP, arm64::SP, 48);
+        emit.STP(arm64::X0, arm64::X1, arm64::SP, 0);
+        emit.STP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.STP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        
+        // X0 = masked addr, X1 = is_store (1 for store)
+        emit.MOV_imm(arm64::X1, 1);
+        u64 trace_func = reinterpret_cast<u64>(&jit_trace_all_access);
+        emit.MOV_imm(arm64::X16, trace_func);
+        emit.BLR(arm64::X16);
+        
+        emit.LDP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        emit.LDP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.LDP(arm64::X0, arm64::X1, arm64::SP, 0);
+        emit.ADD_imm(arm64::SP, arm64::SP, 48);
+    }
+    
     // Reload value since we may have clobbered X1 in MMIO path setup
     load_gpr(emit, arm64::X1, inst.rs);
     
@@ -1586,13 +1711,36 @@ void JitCompiler::compile_load_multiple(ARM64Emitter& emit, const DecodedInst& i
     emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
     emit.AND(arm64::X0, arm64::X0, arm64::X16);
     
-    // Fastmem path - address is in main RAM (< 0x20000000 after masking)
-    // Add fastmem base
-    emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(fastmem_base_));
-    emit.ADD(arm64::X0, arm64::X0, arm64::X16);
+    // DEBUG: Trace the masked address before fastmem access (lmw)
+    {
+        emit.SUB_imm(arm64::SP, arm64::SP, 48);
+        emit.STP(arm64::X0, arm64::X1, arm64::SP, 0);
+        emit.STP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.STP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        emit.MOV_imm(arm64::X1, 0);  // is_store = false (lmw is load)
+        u64 trace_func = reinterpret_cast<u64>(&jit_trace_all_access);
+        emit.MOV_imm(arm64::X16, trace_func);
+        emit.BLR(arm64::X16);
+        emit.LDP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        emit.LDP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.LDP(arm64::X0, arm64::X1, arm64::SP, 0);
+        emit.ADD_imm(arm64::SP, arm64::SP, 48);
+    }
     
+    // Fastmem path - address is in main RAM (< 0x20000000 after masking)
+    // CRITICAL FIX: Must mask EACH address including offset to avoid overflow past 512MB
+    // Xbox 360 memory wraps, so 0x1FFFFFC0 + 64 should wrap to 0x00000000 not crash at 0x20000000
     for (u32 r = inst.rd; r < 32; r++) {
-        emit.LDR(arm64::X1, arm64::X0, (r - inst.rd) * 4);
+        // Calculate full address = base + offset
+        emit.ADD_imm(arm64::X3, arm64::X0, (r - inst.rd) * 4);
+        // Mask to 512MB to handle wrap-around
+        emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
+        emit.AND(arm64::X3, arm64::X3, arm64::X16);
+        // Add fastmem base
+        emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(fastmem_base_));
+        emit.ADD(arm64::X3, arm64::X3, arm64::X16);
+        // Load from masked address
+        emit.LDR(arm64::X1, arm64::X3);
         byteswap32(emit, arm64::X1);
         store_gpr(emit, r, arm64::X1);
     }
@@ -1654,15 +1802,37 @@ void JitCompiler::compile_store_multiple(ARM64Emitter& emit, const DecodedInst& 
     emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
     emit.AND(arm64::X0, arm64::X0, arm64::X16);
     
-    // Fastmem path - address is now in valid range
-    // Add fastmem base
-    emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(fastmem_base_));
-    emit.ADD(arm64::X0, arm64::X0, arm64::X16);
+    // DEBUG: Trace the masked address before fastmem access (stmw)
+    {
+        emit.SUB_imm(arm64::SP, arm64::SP, 48);
+        emit.STP(arm64::X0, arm64::X1, arm64::SP, 0);
+        emit.STP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.STP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        emit.MOV_imm(arm64::X1, 1);  // is_store = true (stmw is store)
+        u64 trace_func = reinterpret_cast<u64>(&jit_trace_all_access);
+        emit.MOV_imm(arm64::X16, trace_func);
+        emit.BLR(arm64::X16);
+        emit.LDP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        emit.LDP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.LDP(arm64::X0, arm64::X1, arm64::SP, 0);
+        emit.ADD_imm(arm64::SP, arm64::SP, 48);
+    }
     
+    // Fastmem path - address is now in valid range
+    // CRITICAL FIX: Must mask EACH address including offset to avoid overflow past 512MB
     for (u32 r = inst.rs; r < 32; r++) {
         load_gpr(emit, arm64::X1, r);
         byteswap32(emit, arm64::X1);
-        emit.STR(arm64::X1, arm64::X0, (r - inst.rs) * 4);
+        // Calculate full address = base + offset
+        emit.ADD_imm(arm64::X4, arm64::X0, (r - inst.rs) * 4);
+        // Mask to 512MB to handle wrap-around
+        emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
+        emit.AND(arm64::X4, arm64::X4, arm64::X16);
+        // Add fastmem base
+        emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(fastmem_base_));
+        emit.ADD(arm64::X4, arm64::X4, arm64::X16);
+        // Store to masked address
+        emit.STR(arm64::X1, arm64::X4);
     }
     
     u8* done = emit.current();
@@ -1726,6 +1896,22 @@ void JitCompiler::compile_atomic_load(ARM64Emitter& emit, const DecodedInst& ins
     // For all other addresses, apply mask to get physical address in 512MB range
     emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
     emit.AND(arm64::X0, arm64::X0, arm64::X16);
+    
+    // DEBUG: Trace the masked address before fastmem access (lwarx)
+    {
+        emit.SUB_imm(arm64::SP, arm64::SP, 48);
+        emit.STP(arm64::X0, arm64::X1, arm64::SP, 0);
+        emit.STP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.STP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        emit.MOV_imm(arm64::X1, 0);  // is_store = false (lwarx is load)
+        u64 trace_func = reinterpret_cast<u64>(&jit_trace_all_access);
+        emit.MOV_imm(arm64::X16, trace_func);
+        emit.BLR(arm64::X16);
+        emit.LDP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        emit.LDP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.LDP(arm64::X0, arm64::X1, arm64::SP, 0);
+        emit.ADD_imm(arm64::SP, arm64::SP, 48);
+    }
     
     // Fastmem path - address is in main RAM
     emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(fastmem_base_));
@@ -1803,6 +1989,22 @@ void JitCompiler::compile_atomic_store(ARM64Emitter& emit, const DecodedInst& in
     // For all other addresses, apply mask to get physical address in 512MB range
     emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
     emit.AND(arm64::X0, arm64::X0, arm64::X16);
+    
+    // DEBUG: Trace the masked address before fastmem access (stwcx.)
+    {
+        emit.SUB_imm(arm64::SP, arm64::SP, 48);
+        emit.STP(arm64::X0, arm64::X1, arm64::SP, 0);
+        emit.STP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.STP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        emit.MOV_imm(arm64::X1, 1);  // is_store = true (stwcx. is store)
+        u64 trace_func = reinterpret_cast<u64>(&jit_trace_all_access);
+        emit.MOV_imm(arm64::X16, trace_func);
+        emit.BLR(arm64::X16);
+        emit.LDP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        emit.LDP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.LDP(arm64::X0, arm64::X1, arm64::SP, 0);
+        emit.ADD_imm(arm64::SP, arm64::SP, 48);
+    }
     
     // Fastmem path - address is in main RAM
     emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(fastmem_base_));
@@ -1883,6 +2085,22 @@ void JitCompiler::compile_dcbz(ARM64Emitter& emit, const DecodedInst& inst) {
     // For all other addresses, apply mask to get physical address in 512MB range
     emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
     emit.AND(arm64::X0, arm64::X0, arm64::X16);
+    
+    // DEBUG: Trace the masked address before fastmem access (dcbz)
+    {
+        emit.SUB_imm(arm64::SP, arm64::SP, 48);
+        emit.STP(arm64::X0, arm64::X1, arm64::SP, 0);
+        emit.STP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.STP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        emit.MOV_imm(arm64::X1, 1);  // is_store = true (dcbz writes zeros)
+        u64 trace_func = reinterpret_cast<u64>(&jit_trace_all_access);
+        emit.MOV_imm(arm64::X16, trace_func);
+        emit.BLR(arm64::X16);
+        emit.LDP(arm64::X30, arm64::XZR, arm64::SP, 32);
+        emit.LDP(arm64::X2, arm64::X3, arm64::SP, 16);
+        emit.LDP(arm64::X0, arm64::X1, arm64::SP, 0);
+        emit.ADD_imm(arm64::SP, arm64::SP, 48);
+    }
     
     // Fastmem path - address is in main RAM
     emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(fastmem_base_));

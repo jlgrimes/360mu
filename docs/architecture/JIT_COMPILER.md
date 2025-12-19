@@ -48,6 +48,25 @@ physical_addr = guest_addr & 0x1FFFFFFF;
 host_addr = fastmem_base + physical_addr;
 ```
 
+### ⚠️ CRITICAL: Multi-Register Instructions
+
+When generating code for instructions that access multiple memory locations (lmw, stmw, lvx, stvx, etc.), you MUST mask the **FULL address including offset** for each access:
+
+```cpp
+// ❌ WRONG - Offset can overflow past 512MB boundary!
+emit.AND(X0, X0, 0x1FFFFFFF);      // Mask base only
+emit.ADD(X0, X0, fastmem_base);
+emit.LDR(X1, X0, offset);          // offset can push past 512MB!
+
+// ✅ CORRECT - Mask full address for each access
+emit.ADD(X3, X0, offset);          // Full address = base + offset
+emit.AND(X3, X3, 0x1FFFFFFF);      // Mask full address
+emit.ADD(X3, X3, fastmem_base);
+emit.LDR(X1, X3);                  // Safe access
+```
+
+This bug caused crashes at exactly 0x20000000 when base was near end of 512MB range.
+
 This mask ensures:
 - `0x00000000` → `0x00000000` (unchanged)
 - `0x20000000` → `0x00000000` (mirror wrapped)
