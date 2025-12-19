@@ -1,6 +1,9 @@
 # Critical Issue: Spin Loop Waiting for Worker Thread Completion
 
-## Status: OPEN - Root Cause Identified
+## Status: SOLUTION IDENTIFIED - Implementing 1:1 Threading Model
+
+**Solution**: Migrate from N:M cooperative scheduling to 1:1 threading model (like Xenia).
+See: `/docs/architecture/THREADING_MODEL.md`
 
 ## Summary
 
@@ -114,39 +117,47 @@ Added code to write to `event + 0xFC` (completion flag offset) after 50 syscalls
 
 ---
 
-## Potential Solutions
+## Solution: 1:1 Threading Model (Xenia's Approach)
 
-### Option A: Implement Real Worker Threads (Proper Fix)
+After researching how Xenia (the reference Xbox 360 emulator) handles this, the proper solution is clear:
 
-1. Create worker threads with actual executable code
-2. Implement a work queue system
-3. Worker threads dequeue and process work items
-4. Set completion flags when done
+### The Problem with N:M Cooperative Scheduling
 
-**Pros:** Correct emulation, will work for all games
-**Cons:** Complex, need to understand Xbox 360 kernel work queue format
+Our previous architecture:
+- N host threads share M guest threads via cooperative scheduling
+- `wait_for_object()` returns `STATUS_TIMEOUT` immediately (no real blocking)
+- `signal_object()` writes memory flags (no real thread wake)
+- Worker threads have `entry=0` (no code to run)
 
-### Option B: Force Completion Flag (Targeted Hack)
+### Xenia's 1:1 Model
 
-When `KeSetEventBoostPriority` is called repeatedly:
+Xenia uses a 1:1 thread mapping:
+- Each `GuestThread` has its own `std::thread`
+- `KeWaitForSingleObject` actually blocks the host thread using `std::condition_variable`
+- `KeSetEvent` signals the condition variable, waking blocked threads
+- `ExQueueWorkItem` creates a NEW thread for each work item
 
-1. Detect the pattern (same LR, same event)
-2. Calculate completion flag address (event + 0xFC for this game)
-3. Write non-zero to force game to progress
+### Implementation Plan
 
-**Pros:** Quick fix for specific games
-**Cons:** Game-specific, may break other things
+1. **Enhance GuestThread**: Add `std::thread`, `std::mutex`, `std::condition_variable`
+2. **Real Blocking**: `KeWaitForSingleObject` blocks on condition variable
+3. **Real Wake**: `KeSetEvent` signals condition variable
+4. **Work Items**: `ExQueueWorkItem` spawns new thread per item
 
-### Option C: Pre-signal System Events
+See `/docs/architecture/THREADING_MODEL.md` for full details.
 
-Before calling game entry point:
+### Why This Fixes Call of Duty
 
-1. Signal all system initialization events
-2. Mark system as "ready"
-3. May satisfy games waiting for kernel init
+The game's pattern:
+1. Game calls `KeSetEventBoostPriority` to wake workers
+2. Workers should be BLOCKED on `KeWaitForSingleObject`
+3. Workers wake up, process work, set completion flag
+4. Game's spin-poll sees flag and continues
 
-**Pros:** Simpler than full worker threads
-**Cons:** May not work if games expect actual work to be done
+With 1:1 threading:
+- Worker threads can actually block and wake
+- Real synchronization replaces memory flag polling
+- Proper multi-threaded execution
 
 ---
 
@@ -179,7 +190,8 @@ adb logcat -d | grep "dispatch_syscall" | grep -v "ordinal=2168"
 
 ## Next Steps
 
-1. **Investigate what work the game expects** - The work queue structure needs reverse engineering
-2. **Implement minimal worker thread code** - Even a simple "mark all work complete" loop might help
-3. **Test completion flag hack more thoroughly** - Verify the 0xFC offset is correct
-4. **Try other games** - See if they have the same pattern or different init requirements
+1. ✅ **Document the architecture gap** - See `/docs/architecture/THREADING_MODEL.md`
+2. 🔄 **Implement 1:1 threading** - Each GuestThread gets own host thread
+3. 🔄 **Implement real blocking** - KeWaitForSingleObject uses condition variables
+4. 🔄 **Implement real wake** - KeSetEvent signals condition variables
+5. 🔄 **Test with Call of Duty** - Verify it boots past purple screen
