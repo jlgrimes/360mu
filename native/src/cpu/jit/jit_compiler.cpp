@@ -2476,7 +2476,9 @@ void JitCompiler::compile_mtspr(ARM64Emitter& emit, const DecodedInst& inst) {
             emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_lr());
             break;
         case 9: // CTR
-            emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_ctr());
+            // Xbox 360 runs in 32-bit mode, so CTR is effectively 32-bit.
+            // Store only the lower 32 bits to ensure proper wrap-around.
+            emit.STR_u32(arm64::X0, arm64::CTX_REG, ctx_offset_ctr());
             break;
         case 1: // XER
             emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_xer());

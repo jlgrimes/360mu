@@ -890,7 +890,7 @@ void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
                 switch (spr) {
                     case 1: ctx.xer.from_u32(static_cast<u32>(ctx.gpr[d.rs])); break;
                     case 8: ctx.lr = ctx.gpr[d.rs]; break;
-                    case 9: ctx.ctr = ctx.gpr[d.rs]; break;
+                    case 9: ctx.ctr = static_cast<u32>(ctx.gpr[d.rs]); break;  // 32-bit mode
                     default:
                         // Other SPRs are supervisor-only or ignored
                         break;

@@ -712,8 +712,9 @@ void Interpreter::exec_branch(ThreadContext& ctx, const DecodedInst& d) {
                 bool cond_ok = true;
                 
                 // Decrement CTR if BO[2] = 0
+                // Xbox 360 runs in 32-bit mode, so CTR wraps at 32 bits
                 if (!(d.bo & 0x04)) {
-                    ctx.ctr--;
+                    ctx.ctr = static_cast<u32>(ctx.ctr - 1);
                     ctr_ok = (d.bo & 0x02) ? (ctx.ctr == 0) : (ctx.ctr != 0);
                 }
                 
@@ -746,8 +747,9 @@ void Interpreter::exec_branch(ThreadContext& ctx, const DecodedInst& d) {
                 
                 if (d.xo == 16) { // bclr
                     // Decrement CTR if BO[2] = 0
+                    // Xbox 360 runs in 32-bit mode, so CTR wraps at 32 bits
                     if (!(d.bo & 0x04)) {
-                        ctx.ctr--;
+                        ctx.ctr = static_cast<u32>(ctx.ctr - 1);
                         ctr_ok = (d.bo & 0x02) ? (ctx.ctr == 0) : (ctx.ctr != 0);
                     }
                     target = ctx.lr & ~3ULL;
@@ -835,7 +837,8 @@ void Interpreter::exec_system(ThreadContext& ctx, const DecodedInst& d) {
                         ctx.lr = ctx.gpr[d.rs];
                         break;
                     case 9: // CTR
-                        ctx.ctr = ctx.gpr[d.rs];
+                        // Xbox 360 runs in 32-bit mode, so CTR is effectively 32-bit
+                        ctx.ctr = static_cast<u32>(ctx.gpr[d.rs]);
                         break;
                     case 1: // XER
                         ctx.xer.from_u32(static_cast<u32>(ctx.gpr[d.rs]));

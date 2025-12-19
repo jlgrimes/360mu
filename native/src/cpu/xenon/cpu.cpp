@@ -254,6 +254,16 @@ void Cpu::execute_with_context(u32 thread_id, ThreadContext& external_ctx, u64 c
                  stuck_pc_count, external_ctx.time_base, external_ctx.ctr,
                  external_ctx.gpr[3], external_ctx.gpr[4], external_ctx.gpr[5], external_ctx.gpr[6]);
         }
+        
+        // WORKAROUND: If the loop is stuck with an invalid destination pointer (r3 < 0x1000),
+        // force CTR to 0 to exit the loop. This happens when the game passes a bad pointer
+        // to a memset-like function.
+        if (stuck_pc_count >= 100 && external_ctx.gpr[3] < 0x1000) {
+            LOGI("WORKAROUND: Forcing CTR=0 to skip stuck memset loop with invalid ptr r3=0x%llX",
+                 external_ctx.gpr[3]);
+            external_ctx.ctr = 0;
+            stuck_pc_count = 0;
+        }
     } else {
         if (stuck_pc_count > 0) {
             LOGI("Left stuck PC after %llu iterations, now at PC=0x%08llX", 

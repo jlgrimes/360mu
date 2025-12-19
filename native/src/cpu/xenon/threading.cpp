@@ -182,11 +182,26 @@ GuestThread* ThreadScheduler::create_thread(GuestAddr entry_point, GuestAddr par
     memory_->allocate(thread->stack_base, stack_size,
                       MemoryRegion::Read | MemoryRegion::Write);
     
+    // Allocate Thread Local Storage (TLS) 
+    // Xbox 360 games expect r13 to point to thread-local storage area.
+    // TLS is typically at 0x00800000+ like XThread does.
+    static constexpr u32 TLS_SIZE = 64 * 4;  // 64 slots * 4 bytes each = 256 bytes
+    static std::atomic<GuestAddr> next_tls{0x00800000};
+    GuestAddr tls_address = next_tls.fetch_add(TLS_SIZE, std::memory_order_relaxed);
+    memory_->allocate(tls_address, TLS_SIZE, MemoryRegion::Read | MemoryRegion::Write);
+    
+    // Zero-initialize TLS
+    for (u32 i = 0; i < TLS_SIZE / 4; i++) {
+        memory_->write_u32(tls_address + i * 4, 0);
+    }
+    
+    LOGI("Allocated TLS for thread at 0x%08X", tls_address);
+    
     // Setup initial context
     thread->context.pc = entry_point;
     thread->context.gpr[1] = thread->stack_limit - 0x100;  // Stack pointer (r1)
     thread->context.gpr[3] = param;                         // First argument (r3)
-    thread->context.gpr[13] = 0;                            // Small data pointer
+    thread->context.gpr[13] = tls_address;                  // TLS pointer (r13)
     thread->context.lr = 0;                                 // Return to kernel on exit
     thread->context.running = false;
     thread->context.thread_id = thread->thread_id;

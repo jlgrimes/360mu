@@ -626,6 +626,11 @@ VkResult VulkanBackend::create_edram_resources() {
 //=============================================================================
 
 Status VulkanBackend::begin_frame() {
+    // Check if swapchain is initialized
+    if (swapchain_ == VK_NULL_HANDLE) {
+        return Status::ErrorSwapchain;
+    }
+    
     // Wait for previous frame
     vkWaitForFences(device_, 1, &in_flight_fences_[current_frame_], VK_TRUE, UINT64_MAX);
     
