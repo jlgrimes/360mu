@@ -27,6 +27,23 @@
 
 namespace x360mu {
 
+// === THREAD-LOCAL STORAGE FOR 1:1 THREADING ===
+// Each host thread has its own TLS slot pointing to the GuestThread it's emulating.
+// This allows syscall handlers to find the correct thread context without a global
+// "current thread" variable (which would be a race condition in multi-threaded code).
+//
+// When a 1:1 host thread starts, it sets this TLS variable.
+// When a syscall happens, GetCurrentGuestThread() returns the correct thread.
+thread_local GuestThread* g_current_guest_thread = nullptr;
+
+GuestThread* GetCurrentGuestThread() {
+    return g_current_guest_thread;
+}
+
+void SetCurrentGuestThread(GuestThread* thread) {
+    g_current_guest_thread = thread;
+}
+
 ThreadScheduler::ThreadScheduler() {
     ready_queues_.fill(nullptr);
     stats_ = {};
@@ -52,7 +69,7 @@ Status ThreadScheduler::initialize(Memory* memory, Kernel* kernel, Cpu* cpu, u32
     LOGI("ThreadScheduler: using %u host threads for %u guest hardware threads", 
          num_host_threads_, 6u);
     
-    // Initialize hardware thread state
+    // Initialize hardware thread state (legacy, kept for compatibility)
     for (u32 i = 0; i < 6; i++) {
         hw_threads_[i].current_thread = nullptr;
         hw_threads_[i].running = false;
@@ -60,19 +77,18 @@ Status ThreadScheduler::initialize(Memory* memory, Kernel* kernel, Cpu* cpu, u32
         hw_threads_[i].time_slice_remaining = 0;
     }
     
-    // Start host threads for multi-threaded execution
+    // === 1:1 THREADING MODEL ===
+    // With 1:1 threading, we do NOT start the old hw_thread_main threads.
+    // Each guest thread gets its own dedicated host thread when created.
+    // The old system would run guest code from multiple host threads simultaneously,
+    // causing race conditions.
+    //
+    // The old hw_thread_main system is DISABLED. Guest threads are executed
+    // by their dedicated 1:1 host threads spawned in create_thread().
     running_ = true;
-    for (u32 i = 0; i < num_host_threads_; i++) {
-        hw_threads_[i].running = true;
-        hw_threads_[i].stop_flag = false;
-        hw_threads_[i].host_thread = std::thread(
-            &ThreadScheduler::hw_thread_main, this, i
-        );
-        
-        LOGI("Started host thread %u", i);
-    }
+    num_host_threads_ = 0;  // Disable legacy scheduler threads
     
-    LOGI("ThreadScheduler initialized with %u active host threads", num_host_threads_);
+    LOGI("ThreadScheduler initialized with 1:1 threading model (no legacy hw_threads)");
     return Status::Ok;
 }
 
@@ -82,26 +98,57 @@ void ThreadScheduler::shutdown() {
     // Signal all threads to stop
     running_ = false;
     
-    // Stop all hardware threads
+    // === 1:1 THREADING MODEL: Stop all guest thread host threads ===
+    {
+        std::lock_guard<std::mutex> lock(threads_mutex_);
+        for (auto& thread : threads_) {
+            thread->should_run.store(false);
+            thread->state = ThreadState::Terminated;
+            thread->signal_wake(0xC0000001);  // Wake any blocked threads
+        }
+    }
+    
+    // Wait for all 1:1 host threads to finish
+    // Make a copy of thread pointers to avoid holding lock during join
+    std::vector<std::thread*> threads_to_join;
+    {
+        std::lock_guard<std::mutex> lock(threads_mutex_);
+        for (auto& thread : threads_) {
+            if (thread->host_thread && thread->host_thread->joinable()) {
+                threads_to_join.push_back(thread->host_thread.get());
+            }
+        }
+    }
+    
+    for (auto* ht : threads_to_join) {
+        if (ht->joinable()) {
+            ht->join();
+        }
+    }
+    LOGI("All 1:1 host threads joined");
+    
+    // Stop legacy hardware threads (scheduler infrastructure)
     for (auto& hw : hw_threads_) {
         hw.stop_flag = true;
         hw.running = false;
         hw.wake_cv.notify_all();
     }
     
-    // Wait for host threads to finish
+    // Wait for legacy host threads to finish
     for (u32 i = 0; i < num_host_threads_; i++) {
         auto& hw = hw_threads_[i];
         if (hw.host_thread.joinable()) {
-            LOGI("Waiting for host thread %u to finish...", i);
+            LOGI("Waiting for legacy host thread %u to finish...", i);
             hw.host_thread.join();
-            LOGI("Host thread %u finished", i);
+            LOGI("Legacy host thread %u finished", i);
         }
     }
     
     // Clean up all threads
-    std::lock_guard<std::mutex> lock(threads_mutex_);
-    threads_.clear();
+    {
+        std::lock_guard<std::mutex> lock(threads_mutex_);
+        threads_.clear();
+    }
     
     LOGI("ThreadScheduler shutdown complete");
 }
@@ -143,30 +190,119 @@ GuestThread* ThreadScheduler::create_thread(GuestAddr entry_point, GuestAddr par
     thread->context.lr = 0;                                 // Return to kernel on exit
     thread->context.running = false;
     thread->context.thread_id = thread->thread_id;
+    thread->context.memory = memory_;  // For MMIO access
     
     // Check creation flags
-    if (creation_flags & 0x04) {  // CREATE_SUSPENDED
+    bool start_suspended = (creation_flags & 0x04) != 0;  // CREATE_SUSPENDED
+    if (start_suspended) {
         thread->suspend_count = 1;
         thread->state = ThreadState::Suspended;
     } else {
         thread->state = ThreadState::Ready;
-        enqueue_thread(thread.get());
     }
     
     LOGI("Created thread %u: entry=0x%08X, stack=0x%08X-0x%08X",
          thread->thread_id, entry_point, thread->stack_base, thread->stack_limit);
     
+    // === 1:1 THREADING MODEL ===
+    // Each guest thread gets its own dedicated host thread.
+    // The host thread runs a loop that executes guest code until the thread terminates.
+    GuestThread* ptr = thread.get();
+    
+    if (entry_point != 0) {
+        // Only spawn host thread if there's actual code to run
+        thread->should_run.store(!start_suspended);
+        
+        // Capture needed pointers for the lambda
+        Cpu* cpu = cpu_;
+        Memory* memory = memory_;
+        
+        thread->host_thread = std::make_unique<std::thread>([ptr, cpu, memory, this]() {
+            // === SET THREAD-LOCAL STORAGE ===
+            // This allows syscall handlers to find this thread's context
+            SetCurrentGuestThread(ptr);
+            
+            LOGI("1:1 Host thread started for guest thread %u (entry=0x%08X)", 
+                 ptr->thread_id, (u32)ptr->context.pc);
+            
+            ptr->is_running.store(true);
+            
+            // Wait until we should run (handles CREATE_SUSPENDED)
+            {
+                std::unique_lock<std::mutex> lock(ptr->wait_mutex);
+                ptr->wait_cv.wait(lock, [ptr]{ return ptr->should_run.load(); });
+            }
+            
+            // Main execution loop - run until thread terminates
+            while (ptr->should_run.load() && ptr->state != ThreadState::Terminated) {
+                if (ptr->state == ThreadState::Waiting) {
+                    // Thread is in a blocking wait - actually block here
+                    std::unique_lock<std::mutex> lock(ptr->wait_mutex);
+                    ptr->wait_cv.wait(lock, [ptr]{ 
+                        return ptr->wait_signaled || !ptr->should_run.load() ||
+                               ptr->state != ThreadState::Waiting;
+                    });
+                    
+                    if (ptr->wait_signaled) {
+                        ptr->state = ThreadState::Running;
+                        ptr->wait_signaled = false;
+                    }
+                    continue;
+                }
+                
+                if (ptr->state == ThreadState::Suspended) {
+                    // Thread is suspended - wait for resume
+                    std::unique_lock<std::mutex> lock(ptr->wait_mutex);
+                    ptr->wait_cv.wait(lock, [ptr]{ 
+                        return ptr->suspend_count == 0 || !ptr->should_run.load();
+                    });
+                    if (ptr->suspend_count == 0) {
+                        ptr->state = ThreadState::Ready;
+                    }
+                    continue;
+                }
+                
+                // Execute guest code
+                ptr->state = ThreadState::Running;
+                ptr->context.running = true;
+                
+                // Execute a batch of cycles
+                constexpr u64 CYCLES_PER_BATCH = 10000;
+                cpu->execute_with_context(ptr->thread_id, ptr->context, CYCLES_PER_BATCH);
+                
+                // Check if thread exited (LR=0 and PC=0 means returned from entry)
+                if (ptr->context.pc == 0) {
+                    LOGI("Guest thread %u returned (exit)", ptr->thread_id);
+                    ptr->state = ThreadState::Terminated;
+                    break;
+                }
+                
+                ptr->execution_time += CYCLES_PER_BATCH;
+                
+                // Yield occasionally to other threads
+                std::this_thread::yield();
+            }
+            
+            ptr->is_running.store(false);
+            ptr->context.running = false;
+            LOGI("1:1 Host thread ended for guest thread %u", ptr->thread_id);
+        });
+    } else {
+        // entry_point == 0: This is a special marker thread (like worker threads)
+        // Don't spawn a host thread - these threads wait for work via other mechanisms
+        LOGI("Thread %u has entry=0, no host thread spawned", thread->thread_id);
+    }
+    
     // #region agent log - Hypothesis N: Track thread creation
     static int thread_create_log = 0;
     if (thread_create_log++ < 30) {
         FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"N\",\"location\":\"threading.cpp:create_thread\",\"message\":\"THREAD CREATED\",\"data\":{\"id\":%u,\"entry\":%u,\"state\":%d,\"suspended\":%d}}\n", thread->thread_id, (u32)entry_point, (int)thread->state, (creation_flags & 0x04) ? 1 : 0); fclose(f); }
+        if (f) { fprintf(f, "{\"hypothesisId\":\"N\",\"location\":\"threading.cpp:create_thread\",\"message\":\"THREAD CREATED\",\"data\":{\"id\":%u,\"entry\":%u,\"state\":%d,\"suspended\":%d,\"has_host_thread\":%d}}\n", ptr->thread_id, (u32)entry_point, (int)ptr->state, start_suspended ? 1 : 0, ptr->host_thread ? 1 : 0); fclose(f); }
     }
     // #endregion
     
     stats_.total_threads_created++;
     
-    GuestThread* ptr = thread.get();
     threads_.push_back(std::move(thread));
     return ptr;
 }
@@ -174,11 +310,31 @@ GuestThread* ThreadScheduler::create_thread(GuestAddr entry_point, GuestAddr par
 void ThreadScheduler::terminate_thread(GuestThread* thread, u32 exit_code) {
     if (!thread) return;
     
-    std::lock_guard<std::mutex> lock(threads_mutex_);
+    LOGI("Terminating thread %u with exit code %u", thread->thread_id, exit_code);
     
+    // === 1:1 THREADING MODEL: Stop host thread ===
     thread->exit_code = exit_code;
     thread->state = ThreadState::Terminated;
     thread->context.running = false;
+    thread->should_run.store(false);
+    
+    // Wake the thread if it's blocked in a wait
+    thread->signal_wake(0xC0000001);  // STATUS_UNSUCCESSFUL
+    
+    // Wait for host thread to finish (don't hold threads_mutex_ during join)
+    if (thread->host_thread && thread->host_thread->joinable()) {
+        // Need to release lock before joining to avoid deadlock
+        std::unique_ptr<std::thread> ht = std::move(thread->host_thread);
+        {
+            // Unlock temporarily for join
+            // Note: This is a simplified approach - production code should use
+            // a more robust mechanism
+        }
+        ht->join();
+        LOGI("Host thread for guest %u joined", thread->thread_id);
+    }
+    
+    std::lock_guard<std::mutex> lock(threads_mutex_);
     
     // Remove from any scheduler queues
     if (thread->prev) thread->prev->next = thread->next;
@@ -194,7 +350,7 @@ void ThreadScheduler::terminate_thread(GuestThread* thread, u32 exit_code) {
     // Free stack memory
     memory_->free(thread->stack_base);
     
-    LOGI("Terminated thread %u with exit code %u", thread->thread_id, exit_code);
+    LOGI("Terminated thread %u complete", thread->thread_id);
 }
 
 u32 ThreadScheduler::suspend_thread(GuestThread* thread) {
@@ -222,7 +378,12 @@ u32 ThreadScheduler::resume_thread(GuestThread* thread) {
     
     if (thread->suspend_count == 0 && thread->state == ThreadState::Suspended) {
         thread->state = ThreadState::Ready;
-        enqueue_thread(thread);
+        
+        // === 1:1 THREADING MODEL: Wake the host thread ===
+        thread->should_run.store(true);
+        thread->wait_cv.notify_one();
+        
+        LOGI("Resumed thread %u", thread->thread_id);
     }
     
     return prev_count;
@@ -350,62 +511,22 @@ int ThreadScheduler::priority_to_queue_index(ThreadPriority priority) const {
 u64 ThreadScheduler::run(u64 cycles) {
     u64 total_executed = 0;
     
-    // #region agent log - NEW HYPOTHESIS G: Check if scheduler is running threads
-    static int sched_log = 0;
-    if (sched_log++ < 10) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"G\",\"location\":\"threading.cpp:run\",\"message\":\"scheduler run\",\"data\":{\"call\":%d,\"cycles\":%llu,\"num_host_threads\":%u,\"has_cpu\":%d}}\n", sched_log, (unsigned long long)cycles, num_host_threads_, cpu_!=nullptr); fclose(f); }
-    }
-    // #endregion
+    // === 1:1 THREADING MODEL ===
+    // With 1:1 threading, each guest thread has its own dedicated host thread.
+    // This run() function should NOT execute guest code directly - the 1:1 host
+    // threads handle that. We just need to:
+    // 1. Process timers/DPCs
+    // 2. Track time
+    // 3. NOT duplicate execution via the old hw_thread_main system
+    //
+    // The old code would call cpu_->execute_thread() AND have hw_thread_main
+    // threads, causing the same guest code to run from multiple host threads
+    // simultaneously - a race condition!
     
-    // CRITICAL FIX: Ensure hw_threads_[0].current_thread is set to the main thread
-    // before executing CPU thread 0. This is required for KeWaitForSingleObject to
-    // properly block the thread via get_current_thread(0).
-    {
-        std::lock_guard<std::mutex> lock(hw_threads_[0].mutex);
-        if (hw_threads_[0].current_thread == nullptr) {
-            // Find the main game thread - it's the first non-system thread
-            // (system threads have is_system_thread=true or start in Waiting state with entry=0)
-            GuestThread* main_thread = nullptr;
-            {
-                std::lock_guard<std::mutex> threads_lock(threads_mutex_);
-                for (auto& thread : threads_) {
-                    if (!thread->is_system_thread && 
-                        thread->state != ThreadState::Terminated &&
-                        thread->context.pc != 0) {
-                        main_thread = thread.get();
-                        break;
-                    }
-                }
-            }
-            
-            // If main thread found, assign it to hw_threads_[0]
-            if (main_thread) {
-                hw_threads_[0].current_thread = main_thread;
-                main_thread->state = ThreadState::Running;
-                LOGI("Assigned main thread %u (entry=0x%08X) to hw_threads_[0]", 
-                     main_thread->thread_id, (u32)main_thread->context.pc);
-            }
-        }
-    }
-    
-    // Wake host threads to process any ready threads (worker threads)
-    if (num_host_threads_ > 1) {
-        // Start from hw_thread 1 since hw_thread 0 runs main thread directly
-        for (u32 hw = 1; hw < num_host_threads_; hw++) {
-            hw_threads_[hw].wake_cv.notify_one();
-        }
-    }
-    
-    // Execute CPU thread 0 (the main game thread)
-    // This is set up via cpu_->start_thread() during prepare_entry
-    if (cpu_) {
-        cpu_->execute_thread(0, cycles);
-        total_executed = cycles;
-    }
-    
+    // Just track time - the 1:1 host threads handle actual execution
     current_time_ += cycles;
-    stats_.total_cycles_executed += total_executed;
+    stats_.total_cycles_executed += cycles;
+    total_executed = cycles;
     
     return total_executed;
 }
@@ -458,62 +579,74 @@ u32 ThreadScheduler::wait_for_object(GuestThread* thread, GuestAddr object, u64 
         return 0x00000102;  // STATUS_TIMEOUT
     }
     
+    // === 1:1 THREADING MODEL: REAL BLOCKING ===
+    // Actually block the host thread using condition variable.
+    // This is the key change from cooperative scheduling.
+    
+    static int wait_log = 0;
+    if (wait_log++ < 20) {
+        LOGI("wait_for_object: thread %u blocking on object 0x%08X (timeout=%llu ns)",
+             thread->thread_id, (u32)object, timeout_ns);
+    }
+    
     // Mark thread as waiting
     thread->state = ThreadState::Waiting;
     thread->wait_object = object;
-    
-    if (timeout_ns != ~0ULL) {
-        thread->wait_timeout = current_time_ + (timeout_ns / 100);
-    } else {
-        thread->wait_timeout = ~0ULL;  // Infinite
-    }
-    
-    // Remove from hardware thread
-    for (auto& hw : hw_threads_) {
-        if (hw.current_thread == thread) {
-            hw.current_thread = nullptr;
-            break;
-        }
-    }
+    thread->wait_signaled = false;
     
     stats_.waiting_thread_count++;
     
-    // Return STATUS_TIMEOUT to indicate we're not signaled yet
-    // The caller should yield/sleep and retry
-    return 0x00000102;  // STATUS_TIMEOUT
+    // Convert timeout
+    u64 timeout_ms = (timeout_ns == ~0ULL) ? 0 : (timeout_ns / 1000000);
+    
+    // ACTUALLY BLOCK using the thread's condition variable
+    // The thread will be woken when signal_object() is called
+    u32 result = thread->block_until_signaled(timeout_ms);
+    
+    stats_.waiting_thread_count--;
+    
+    if (result == 0) {
+        // Successfully signaled
+        // For auto-reset events, clear the signal
+        if (header.type == static_cast<u8>(KernelObjectType::SynchronizationEvent)) {
+            memory_->write_u32(object + 4, 0);
+        }
+    }
+    
+    thread->wait_object = 0;
+    return result;
 }
 
 void ThreadScheduler::signal_object(GuestAddr object) {
     DispatcherHeader header;
     header.type = memory_->read_u8(object);
     
-    // #region agent log - Hypothesis W: Check event type and signal_object write
-    static int sig_type_log = 0;
-    if (sig_type_log++ < 50) {
-        u32 before = memory_->read_u32(object + 4);
-        LOGI("signal_object: object=0x%08X, type=%u, signal_before=%u", (u32)object, header.type, before);
-    }
-    // #endregion
-    
-    // For semaphores (type 5), the signal state IS the count - don't overwrite it
-    // Only set signal state to 1 for events
+    // Set signal state in guest memory
     constexpr u8 SEMAPHORE_TYPE = 5;
     if (header.type != SEMAPHORE_TYPE) {
         memory_->write_u32(object + 4, 1);
     }
     
-    // Wake waiting threads
+    // === 1:1 THREADING MODEL: REAL WAKE ===
+    // Actually wake blocked threads using their condition variables.
+    
     std::lock_guard<std::mutex> lock(threads_mutex_);
     
     int woken_count = 0;
     for (auto& thread : threads_) {
         if (thread->state == ThreadState::Waiting && 
             thread->wait_object == object) {
+            
+            // ACTUALLY WAKE the thread using its condition variable
+            thread->signal_wake(0);  // STATUS_SUCCESS
             thread->state = ThreadState::Ready;
-            thread->wait_object = 0;
-            enqueue_thread(thread.get());
-            stats_.waiting_thread_count--;
             woken_count++;
+            
+            static int wake_log = 0;
+            if (wake_log++ < 20) {
+                LOGI("signal_object: WOKE thread %u from wait on 0x%08X",
+                     thread->thread_id, (u32)object);
+            }
             
             // For synchronization events, only wake one thread and auto-reset
             if (header.type == static_cast<u8>(KernelObjectType::SynchronizationEvent)) {
@@ -534,25 +667,11 @@ void ThreadScheduler::signal_object(GuestAddr object) {
         }
     }
     
-    // FIX: If no real threads were woken but we've been signaling the same object
-    // many times, fake that a worker thread was woken. This breaks initialization
-    // loops that wait for non-existent worker threads.
-    static std::unordered_map<GuestAddr, int> signal_counts;
-    signal_counts[object]++;
-    if (woken_count == 0 && signal_counts[object] > 100) {
-        // Fake that a worker thread was woken by setting the signal state
-        // to indicate "work complete" - this may break the game's wait loop
-        woken_count = 1;  // Report as if we woke a thread
-        signal_counts[object] = 0;  // Reset counter
-    }
-    
-    // #region agent log - Hypothesis N: Track signal_object results
     static int signal_log = 0;
     if (signal_log++ < 30) {
-        FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-        if (f) { fprintf(f, "{\"hypothesisId\":\"N\",\"location\":\"threading.cpp:signal_object\",\"message\":\"SIGNAL_OBJECT\",\"data\":{\"object\":%u,\"woken\":%d,\"total_threads\":%zu}}\n", (u32)object, woken_count, threads_.size()); fclose(f); }
+        LOGI("signal_object: object=0x%08X, type=%u, woken=%d threads",
+             (u32)object, header.type, woken_count);
     }
-    // #endregion
 }
 
 GuestThread* ThreadScheduler::get_thread(u32 thread_id) {

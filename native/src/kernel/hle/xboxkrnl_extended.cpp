@@ -1793,8 +1793,12 @@ void Kernel::register_xboxkrnl_extended() {
         }
         
         // Validate event pointer - must be in valid memory range
-        if (event < 0x80000000 || event >= 0xC0000000) {
-            // Invalid event pointer, treat as no-op
+        // Valid ranges include:
+        // - 0x70000000+ : Stack/heap allocations
+        // - 0x80000000+ : Executable/data sections
+        // - 0x90000000+ : Additional data
+        if (event < 0x10000 || event >= 0xE0000000) {
+            // Invalid event pointer (too low or in reserved area), treat as no-op
             *result = 1;
             return;
         }
@@ -1837,29 +1841,19 @@ void Kernel::register_xboxkrnl_extended() {
         // We need to change it to something else (like setting a "done" bit).
         {
             GuestAddr completion_flag = event + 0xFC;
-            // Log all attempts for debugging
-            static int flag_check_log = 0;
-            if (flag_check_log++ < 50) {
-                if (completion_flag >= 0x70000000 && completion_flag < 0xC0000000) {
-                    u32 current_val = memory->read_u32(completion_flag);
-                    LOGI("WorkerSim: event=0x%08X flag=0x%08X val=0x%08X (%u)",
-                         (u32)event, (u32)completion_flag, current_val, current_val);
-                }
-            }
             
             // Set completion flag to non-zero to indicate work is done
-            // The actual value the game checks for might vary, but setting bit 0
-            // and preserving upper bits should work
-            if (completion_flag >= 0x70000000 && completion_flag < 0xC0000000) {
+            // Valid address ranges: stack (0x70000000+) and data (0x80000000+)
+            if (completion_flag >= 0x70000000 && completion_flag < 0xE0000000) {
                 u32 current_val = memory->read_u32(completion_flag);
                 // Set bit 0 to indicate "done" while preserving original value
                 u32 new_val = current_val | 0x1;
                 if (new_val != current_val) {
                     memory->write_u32(completion_flag, new_val);
                     static int completion_log = 0;
-                    if (completion_log++ < 20) {
-                        LOGI("WorkerSim: SET flag 0x%08X: 0x%08X -> 0x%08X", 
-                             (u32)completion_flag, current_val, new_val);
+                    if (completion_log++ < 30) {
+                        LOGI("WorkerSim: SET flag 0x%08X: 0x%08X -> 0x%08X (event=0x%08X)", 
+                             (u32)completion_flag, current_val, new_val, (u32)event);
                     }
                 }
             }

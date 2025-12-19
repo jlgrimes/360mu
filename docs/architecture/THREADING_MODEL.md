@@ -91,6 +91,7 @@ Xenia uses the 1:1 model:
 5. **ExQueueWorkItem**: Creates NEW thread per work item (no thread pool)
 
 Key code pattern from Xenia:
+
 ```cpp
 // XEvent::Set() - signal the event
 void XEvent::Set() {
@@ -119,6 +120,7 @@ uint32_t XThread::Wait(XObject* object, uint64_t timeout) {
 ### Phase 1: GuestThread Enhancement
 
 Each `GuestThread` gets:
+
 - `std::thread host_thread` - dedicated host thread
 - `std::mutex mutex` - for synchronization
 - `std::condition_variable wait_cv` - for blocking waits
@@ -127,6 +129,7 @@ Each `GuestThread` gets:
 ### Phase 2: Synchronization Objects
 
 Create proper sync objects with real blocking:
+
 - `XEvent` - manual/auto reset events with condition variables
 - `XSemaphore` - counting semaphore
 - `XMutex` - mutual exclusion
@@ -135,6 +138,7 @@ Create proper sync objects with real blocking:
 ### Phase 3: Kernel Functions
 
 Implement real blocking/waking:
+
 - `KeWaitForSingleObject` - block on condition variable
 - `KeWaitForMultipleObjects` - wait on multiple objects
 - `KeSetEvent` / `KeSetEventBoostPriority` - signal and wake
@@ -149,6 +153,7 @@ Implement real blocking/waking:
 ## Memory Model Considerations
 
 The Xbox 360 uses a weakly-ordered memory model. With 1:1 threading:
+
 - Each host thread directly accesses guest memory
 - Memory barriers may be needed for cross-thread visibility
 - JIT code runs directly on host threads
@@ -156,12 +161,14 @@ The Xbox 360 uses a weakly-ordered memory model. With 1:1 threading:
 ## Performance Considerations
 
 1:1 threading has trade-offs:
+
 - **Pro**: Real parallelism on multi-core hosts
 - **Pro**: Proper blocking (no busy-wait)
 - **Con**: Thread creation overhead
 - **Con**: More host threads than CPU cores
 
 Mitigations:
+
 - Thread pooling for ExQueueWorkItem (optional)
 - Affinity hints to OS scheduler
 - Yield hints in spin-waits
@@ -177,6 +184,7 @@ Mitigations:
 ## Testing
 
 After implementation, verify:
+
 1. Call of Duty: Black Ops boots past purple screen
 2. Multi-threaded games run correctly
 3. No deadlocks or race conditions

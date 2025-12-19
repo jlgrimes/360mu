@@ -238,15 +238,19 @@ bool Memory::handle_fault(void* fault_addr) {
 // Translate virtual address to physical address
 // Xbox 360 memory map:
 // 0x00000000-0x1FFFFFFF: Physical memory (512 MB)
+// 0x20000000-0x3FFFFFFF: Physical (uncached?) - also 512MB mirrored
+// 0x40000000-0x7FFFFFFF: Physical (more mirrors/modes) 
 // 0x80000000-0x9FFFFFFF: Virtual usermode (maps to physical)
 // 0xA0000000+: Various system regions
+//
+// CRITICAL: The JIT uses addr & 0x1FFFFFFF for ALL addresses.
+// We must match that behavior to ensure consistency between JIT and HLE code.
 GuestAddr Memory::translate_address(GuestAddr addr) {
-    // Usermode virtual range maps to physical by clearing top bits
-    if (addr >= 0x80000000 && addr < 0xA0000000) {
-        return addr & 0x1FFFFFFF;
-    }
-    // Physical addresses pass through
-    return addr;
+    // IMPORTANT: Mask ALL addresses to 29 bits, just like the JIT does.
+    // This ensures HLE writes go to the same physical location the JIT reads.
+    // The Xbox 360's address space has multiple mappings that all map to
+    // the same 512MB of physical RAM.
+    return addr & 0x1FFFFFFF;
 }
 
 // Memory access with byte swapping (Xbox 360 is big-endian)

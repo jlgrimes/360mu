@@ -26,6 +26,13 @@ namespace x360mu {
 
 class Memory;
 class Kernel;
+struct GuestThread;
+
+// === THREAD-LOCAL STORAGE FOR 1:1 THREADING ===
+// Get/set the GuestThread associated with the current host thread.
+// Used by syscall handlers to find the correct thread context.
+GuestThread* GetCurrentGuestThread();
+void SetCurrentGuestThread(GuestThread* thread);
 
 /**
  * Thread state
@@ -81,6 +88,10 @@ struct ApcEntry {
 
 /**
  * Represents a guest thread
+ * 
+ * 1:1 Threading Model: Each GuestThread has its own host std::thread.
+ * This allows proper blocking waits using condition variables, matching
+ * how Xenia and the real Xbox 360 kernel work.
  */
 struct GuestThread {
     // Thread identification
@@ -113,14 +124,28 @@ struct GuestThread {
     // Exit code
     u32 exit_code;
     
-    // Host thread (for multi-threaded execution)
-    std::thread* host_thread;
+    // === 1:1 THREADING MODEL ===
+    // Each guest thread has its own dedicated host thread
+    std::unique_ptr<std::thread> host_thread;
+    
+    // Synchronization for blocking waits (1:1 model)
+    // When a guest thread calls KeWaitForSingleObject, we actually block
+    // the host thread using this condition variable. When KeSetEvent is
+    // called, we signal this CV to wake the thread.
+    std::mutex wait_mutex;
+    std::condition_variable wait_cv;
+    bool wait_signaled;         // Set to true when wait object is signaled
+    u32 wait_result;            // Result code when woken (STATUS_SUCCESS, etc.)
+    
+    // Thread lifecycle control
+    std::atomic<bool> should_run{false};    // Thread should continue executing
+    std::atomic<bool> is_running{false};    // Thread is currently in execution loop
     
     // Timing
     u64 execution_time;  // Total cycles executed
     u64 last_schedule_time;
     
-    // Link for scheduler queues
+    // Link for scheduler queues (legacy, may be removed)
     GuestThread* next;
     GuestThread* prev;
     
@@ -156,6 +181,10 @@ struct GuestThread {
         is_system_thread = false;
         is_worker_thread = false;
         worker_queue_type = WorkQueueType::Delayed;
+        wait_signaled = false;
+        wait_result = 0;
+        should_run.store(false);
+        is_running.store(false);
     }
     
     /**
@@ -200,10 +229,61 @@ struct GuestThread {
     void alert() {
         alerted = true;
     }
+    
+    // === 1:1 Threading Model Methods ===
+    
+    /**
+     * Block this thread until signaled or timeout.
+     * Called when guest code calls KeWaitForSingleObject.
+     * This ACTUALLY blocks the host thread using condition variables.
+     * 
+     * @param timeout_ms Timeout in milliseconds (0 = infinite)
+     * @return Wait result (STATUS_SUCCESS, STATUS_TIMEOUT, etc.)
+     */
+    u32 block_until_signaled(u64 timeout_ms = 0) {
+        std::unique_lock<std::mutex> lock(wait_mutex);
+        wait_signaled = false;
+        
+        if (timeout_ms == 0) {
+            // Infinite wait
+            wait_cv.wait(lock, [this]{ return wait_signaled || !should_run.load(); });
+        } else {
+            // Timed wait
+            auto result = wait_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                           [this]{ return wait_signaled || !should_run.load(); });
+            if (!result && !wait_signaled) {
+                return 0x00000102;  // STATUS_TIMEOUT
+            }
+        }
+        
+        if (!should_run.load()) {
+            return 0xC0000001;  // STATUS_UNSUCCESSFUL - thread terminating
+        }
+        
+        return wait_result;
+    }
+    
+    /**
+     * Wake this thread from a blocking wait.
+     * Called when guest code calls KeSetEvent or similar.
+     * 
+     * @param result The result code the wait should return
+     */
+    void signal_wake(u32 result = 0) {
+        {
+            std::lock_guard<std::mutex> lock(wait_mutex);
+            wait_signaled = true;
+            wait_result = result;
+        }
+        wait_cv.notify_one();
+    }
 };
 
 /**
- * Synchronization object base
+ * Synchronization object with real blocking support
+ * 
+ * Each sync object has a mutex and condition variable for proper
+ * blocking waits (1:1 threading model).
  */
 struct SyncObject {
     enum class Type {
@@ -217,16 +297,31 @@ struct SyncObject {
     Type type;
     GuestAddr guest_addr;  // Address in guest memory
     bool signaled;
+    bool manual_reset;     // For events: manual vs auto-reset
+    s32 signal_count;      // For semaphores: current count
     
-    // Waiting threads
+    // Synchronization primitives for real blocking
+    std::mutex mutex;
+    std::condition_variable cv;
+    
+    // Waiting threads (for tracking)
     std::vector<GuestThread*> wait_list;
+    
+    SyncObject() : type(Type::Event), guest_addr(0), signaled(false), 
+                   manual_reset(true), signal_count(0) {}
 };
 
 /**
- * Thread Scheduler
+ * Thread Scheduler - 1:1 Threading Model
  * 
- * Manages scheduling of guest threads across host CPU cores.
- * Implements priority-based preemptive scheduling similar to Xbox 360.
+ * Each guest thread has its own dedicated host thread. This allows
+ * proper blocking waits using condition variables, matching how
+ * Xenia and the real Xbox 360 kernel work.
+ * 
+ * Key changes from cooperative scheduling:
+ * - create_thread() spawns a real std::thread for each guest thread
+ * - wait_for_object() actually blocks the calling host thread
+ * - signal_object() wakes blocked threads via condition variables
  */
 class ThreadScheduler {
 public:

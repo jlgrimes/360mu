@@ -296,14 +296,26 @@ void Kernel::input_stick(u32 player, u32 stick, f32 x, f32 y) {
 }
 
 void Kernel::handle_syscall(u32 ordinal, u32 module_ordinal) {
+    // === 1:1 THREADING MODEL: Use Thread-Local Storage ===
+    // Get the current thread's context via TLS, not a global "context 0"
+    GuestThread* current_thread = GetCurrentGuestThread();
+    if (!current_thread) {
+        // Fallback to context 0 if no TLS (shouldn't happen with 1:1 threading)
+        LOGE("handle_syscall called with no current guest thread! Using context 0 as fallback.");
+        auto& ctx = cpu_->get_context(0);
+        ctx.gpr[3] = 0;  // STATUS_SUCCESS
+        return;
+    }
+    
+    ThreadContext& ctx = current_thread->context;
+    
     // Log unique syscalls for debugging
     static std::unordered_set<u64> logged_syscalls;
     u64 key = make_import_key(module_ordinal, ordinal);
     
     if (logged_syscalls.find(key) == logged_syscalls.end() && logged_syscalls.size() < 100) {
-        auto& ctx = cpu_->get_context(0);
-        LOGI("First call to syscall: module=%u, ordinal=%u (PC=0x%08llX)", 
-             module_ordinal, ordinal, ctx.pc);
+        LOGI("First call to syscall: module=%u, ordinal=%u (PC=0x%08llX, thread=%u)", 
+             module_ordinal, ordinal, ctx.pc, current_thread->thread_id);
         logged_syscalls.insert(key);
     }
     
@@ -311,26 +323,15 @@ void Kernel::handle_syscall(u32 ordinal, u32 module_ordinal) {
     if (it == hle_functions_.end()) {
         static std::unordered_set<u64> logged_unimpl;
         if (logged_unimpl.find(key) == logged_unimpl.end()) {
-            auto& ctx = cpu_->get_context(0);
             LOGE("UNIMPLEMENTED syscall: module=%u, ordinal=%u at PC=0x%08llX, LR=0x%08llX", 
                  module_ordinal, ordinal, ctx.pc, ctx.lr);
             logged_unimpl.insert(key);
         }
         // FIX: Set return value to STATUS_SUCCESS so game doesn't retry in infinite loop
-        auto& ctx = cpu_->get_context(0);
         ctx.gpr[3] = 0;  // STATUS_SUCCESS
-        
-        // #region agent log - Log unimplemented syscall return
-        static int unimpl_log = 0;
-        if (unimpl_log++ < 20) {
-            FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-            if (f) { fprintf(f, "{\"hypothesisId\":\"FIX\",\"location\":\"kernel.cpp:handle_syscall\",\"message\":\"UNIMPL SYSCALL returning SUCCESS\",\"data\":{\"module\":%u,\"ordinal\":%u}}\n", module_ordinal, ordinal); fclose(f); }
-        }
-        // #endregion
         return;
     }
     
-    auto& ctx = cpu_->get_context(0);
     u64 args[8] = {
         ctx.gpr[3], ctx.gpr[4], ctx.gpr[5], ctx.gpr[6],
         ctx.gpr[7], ctx.gpr[8], ctx.gpr[9], ctx.gpr[10]

@@ -124,6 +124,7 @@ After researching how Xenia (the reference Xbox 360 emulator) handles this, the 
 ### The Problem with N:M Cooperative Scheduling
 
 Our previous architecture:
+
 - N host threads share M guest threads via cooperative scheduling
 - `wait_for_object()` returns `STATUS_TIMEOUT` immediately (no real blocking)
 - `signal_object()` writes memory flags (no real thread wake)
@@ -132,6 +133,7 @@ Our previous architecture:
 ### Xenia's 1:1 Model
 
 Xenia uses a 1:1 thread mapping:
+
 - Each `GuestThread` has its own `std::thread`
 - `KeWaitForSingleObject` actually blocks the host thread using `std::condition_variable`
 - `KeSetEvent` signals the condition variable, waking blocked threads
@@ -149,12 +151,14 @@ See `/docs/architecture/THREADING_MODEL.md` for full details.
 ### Why This Fixes Call of Duty
 
 The game's pattern:
+
 1. Game calls `KeSetEventBoostPriority` to wake workers
 2. Workers should be BLOCKED on `KeWaitForSingleObject`
 3. Workers wake up, process work, set completion flag
 4. Game's spin-poll sees flag and continues
 
 With 1:1 threading:
+
 - Worker threads can actually block and wake
 - Real synchronization replaces memory flag polling
 - Proper multi-threaded execution
