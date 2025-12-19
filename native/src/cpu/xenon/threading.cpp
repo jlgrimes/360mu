@@ -621,25 +621,41 @@ void ThreadScheduler::hw_thread_main(u32 hw_thread_id) {
         
         if (!thread) continue;
         
-        // Execute guest thread on the actual CPU
-        thread->state = ThreadState::Running;
-        
-        // Map guest thread to CPU hardware thread context
-        // Use the thread's context.thread_id for CPU execution
-        u32 cpu_thread_id = thread->context.thread_id % 6;
-        
-        // Execute for a time slice using the real CPU
-        // Use execute_with_context for proper context synchronization and thread safety
-        if (cpu_) {
-            // #region agent log - Hypothesis N: Track host thread execution
-            static int hw_exec_log = 0;
-            if (hw_exec_log++ < 20) {
-                FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
-                if (f) { fprintf(f, "{\"hypothesisId\":\"N\",\"location\":\"threading.cpp:hw_thread_main\",\"message\":\"HOST THREAD EXECUTING\",\"data\":{\"hw_id\":%u,\"guest_id\":%u,\"pc\":%u}}\n", hw_thread_id, thread->thread_id, (u32)thread->context.pc); fclose(f); }
+        // Check if this is a worker thread
+        if (thread->is_worker_thread) {
+            // Worker threads process work queue items instead of running guest code
+            thread->state = ThreadState::Running;
+            
+            // Process work items from the queue
+            bool did_work = process_worker_thread(thread);
+            
+            if (!did_work) {
+                // No work available - put thread back in ready state
+                // and yield to avoid busy spinning
+                thread->state = ThreadState::Ready;
+                std::this_thread::yield();
             }
-            // #endregion
-            cpu_->execute_with_context(cpu_thread_id, thread->context, TIME_SLICE);
-            thread->execution_time += TIME_SLICE;
+        } else {
+            // Normal guest thread - execute guest code
+            thread->state = ThreadState::Running;
+            
+            // Map guest thread to CPU hardware thread context
+            // Use the thread's context.thread_id for CPU execution
+            u32 cpu_thread_id = thread->context.thread_id % 6;
+            
+            // Execute for a time slice using the real CPU
+            // Use execute_with_context for proper context synchronization and thread safety
+            if (cpu_) {
+                // #region agent log - Hypothesis N: Track host thread execution
+                static int hw_exec_log = 0;
+                if (hw_exec_log++ < 20) {
+                    FILE* f = fopen("/data/data/com.x360mu/files/debug.log", "a");
+                    if (f) { fprintf(f, "{\"hypothesisId\":\"N\",\"location\":\"threading.cpp:hw_thread_main\",\"message\":\"HOST THREAD EXECUTING\",\"data\":{\"hw_id\":%u,\"guest_id\":%u,\"pc\":%u}}\n", hw_thread_id, thread->thread_id, (u32)thread->context.pc); fclose(f); }
+                }
+                // #endregion
+                cpu_->execute_with_context(cpu_thread_id, thread->context, TIME_SLICE);
+                thread->execution_time += TIME_SLICE;
+            }
         }
         
         // Put thread back in ready queue if it's still runnable
@@ -790,6 +806,87 @@ void ThreadScheduler::alert_thread(GuestThread* thread) {
         
         LOGD("Alerted thread %u from wait", thread->thread_id);
     }
+}
+
+bool ThreadScheduler::process_worker_thread(GuestThread* thread) {
+    if (!thread || !thread->is_worker_thread) {
+        return false;
+    }
+    
+    // Try to dequeue a work item (non-blocking, short timeout)
+    WorkQueueItem item;
+    if (!WorkQueueManager::instance().dequeue(thread->worker_queue_type, item, 10)) {
+        // No work available
+        return false;
+    }
+    
+    LOGI("Worker thread %u processing work item: routine=0x%08X, param=0x%08X",
+         thread->thread_id, (u32)item.worker_routine, (u32)item.parameter);
+    
+    // Validate routine pointer
+    if (item.worker_routine == 0 || item.worker_routine < 0x80000000) {
+        LOGW("Worker thread %u: invalid routine pointer 0x%08X", 
+             thread->thread_id, (u32)item.worker_routine);
+        return false;
+    }
+    
+    // Save current context (in case worker was doing something)
+    ThreadContext saved_ctx = thread->context;
+    
+    // Set up context to call the worker routine
+    // Worker routine signature: void WorkerRoutine(PVOID Parameter)
+    thread->context.pc = item.worker_routine;
+    thread->context.gpr[3] = item.parameter;  // r3 = first parameter
+    thread->context.lr = 0;                    // Return address 0 = routine done
+    thread->context.running = true;
+    thread->state = ThreadState::Running;
+    
+    // Execute the worker routine until it returns (pc == 0 after blr to LR=0)
+    // or we hit a cycle limit to prevent infinite loops
+    constexpr u64 MAX_WORKER_CYCLES = 5000000;  // 5M cycles max per work item
+    u64 cycles_executed = 0;
+    constexpr u64 CYCLES_PER_BATCH = 50000;
+    
+    while (thread->context.pc != 0 && 
+           thread->state == ThreadState::Running &&
+           cycles_executed < MAX_WORKER_CYCLES) {
+        
+        // Execute a batch of cycles
+        u32 cpu_thread_id = thread->context.thread_id % 6;
+        cpu_->execute_with_context(cpu_thread_id, thread->context, CYCLES_PER_BATCH);
+        cycles_executed += CYCLES_PER_BATCH;
+        
+        // Check if routine returned (blr to LR=0 sets PC=0)
+        if (thread->context.pc == 0) {
+            break;
+        }
+        
+        // Check if thread got blocked on a wait
+        if (thread->state == ThreadState::Waiting) {
+            LOGD("Worker routine 0x%08X blocked on wait, continuing later", 
+                 (u32)item.worker_routine);
+            break;
+        }
+    }
+    
+    if (cycles_executed >= MAX_WORKER_CYCLES && thread->context.pc != 0) {
+        LOGW("Worker routine 0x%08X hit cycle limit, forcing completion", 
+             (u32)item.worker_routine);
+    }
+    
+    LOGI("Worker thread %u completed work item (routine=0x%08X, cycles=%llu)", 
+         thread->thread_id, (u32)item.worker_routine, (unsigned long long)cycles_executed);
+    
+    // Update execution time
+    thread->execution_time += cycles_executed;
+    
+    // Restore context for next work item
+    // Keep the thread in Ready state so it can process more work
+    thread->context = saved_ctx;
+    thread->context.pc = 0;  // Worker thread doesn't have guest entry point
+    thread->state = ThreadState::Ready;
+    
+    return true;
 }
 
 } // namespace x360mu

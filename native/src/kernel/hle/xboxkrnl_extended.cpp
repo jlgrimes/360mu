@@ -1815,18 +1815,53 @@ void Kernel::register_xboxkrnl_extended() {
         // Set event to signaled state (signal_state = 1)
         memory->write_u32(event + 4, 1);
         
-        // HACK: Force work completion for stuck games
-        // The game polls a completion flag at event + 0xFC (offset 0x14C - 0x50)
-        // Since our worker threads don't run, we simulate work completion here
-        // This allows games stuck waiting for worker thread completion to progress
-        if (boost_call_count > 50 && boost_call_count < 60) {
-            // After 50 calls, assume we're stuck and force completion
-            GuestAddr completion_flag = event + 0xFC;  // 0x14C - 0x50
-            u32 current_val = memory->read_u32(completion_flag);
-            if (current_val == 0) {
-                memory->write_u32(completion_flag, 1);
-                LOGI("HACK: Forced work completion at 0x%08X (event=0x%08X)", 
-                     (u32)completion_flag, (u32)event);
+        // WORKER THREAD SIMULATION: Set completion flag for Call of Duty style work requests
+        // 
+        // Call of Duty uses a custom work scheduling pattern:
+        // 1. Game creates a work request structure on stack (at r31)
+        // 2. Event object is at r31 + 0x50, completion flag is at r31 + 0x14C
+        // 3. Game calls KeSetEventBoostPriority(event) to "wake workers"
+        // 4. Worker threads are supposed to process work and set completion flag
+        // 5. Game polls completion flag (at event + 0xFC) until non-zero
+        //
+        // Since we don't have real kernel code for worker threads, we simulate
+        // the work completion by setting the flag when the event is signaled.
+        //
+        // The offset 0xFC = 0x14C - 0x50 (completion_flag_offset - event_offset)
+        // The game's work completion check is more complex than just "flag == 0"
+        // Looking at the disassembly, the game stores r30 to the completion flag
+        // BEFORE entering the loop, then checks if it's still that value.
+        // 
+        // The game expects the worker to CHANGE the value, not just check for zero.
+        // Since we see current_val = 65536 (0x10000), that's the initial value.
+        // We need to change it to something else (like setting a "done" bit).
+        {
+            GuestAddr completion_flag = event + 0xFC;
+            // Log all attempts for debugging
+            static int flag_check_log = 0;
+            if (flag_check_log++ < 50) {
+                if (completion_flag >= 0x70000000 && completion_flag < 0xC0000000) {
+                    u32 current_val = memory->read_u32(completion_flag);
+                    LOGI("WorkerSim: event=0x%08X flag=0x%08X val=0x%08X (%u)",
+                         (u32)event, (u32)completion_flag, current_val, current_val);
+                }
+            }
+            
+            // Set completion flag to non-zero to indicate work is done
+            // The actual value the game checks for might vary, but setting bit 0
+            // and preserving upper bits should work
+            if (completion_flag >= 0x70000000 && completion_flag < 0xC0000000) {
+                u32 current_val = memory->read_u32(completion_flag);
+                // Set bit 0 to indicate "done" while preserving original value
+                u32 new_val = current_val | 0x1;
+                if (new_val != current_val) {
+                    memory->write_u32(completion_flag, new_val);
+                    static int completion_log = 0;
+                    if (completion_log++ < 20) {
+                        LOGI("WorkerSim: SET flag 0x%08X: 0x%08X -> 0x%08X", 
+                             (u32)completion_flag, current_val, new_val);
+                    }
+                }
             }
         }
         

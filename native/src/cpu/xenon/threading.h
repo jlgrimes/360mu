@@ -12,6 +12,7 @@
 
 #include "x360mu/types.h"
 #include "cpu.h"
+#include "../../kernel/work_queue.h"
 #include <vector>
 #include <deque>
 #include <queue>
@@ -126,6 +127,10 @@ struct GuestThread {
     // System thread flag (kernel worker threads)
     bool is_system_thread;
     
+    // Worker thread support (for work queue processing)
+    bool is_worker_thread;
+    WorkQueueType worker_queue_type;
+    
     // APC (Asynchronous Procedure Call) support
     std::deque<ApcEntry> apc_queue;
     std::mutex apc_mutex;
@@ -149,6 +154,8 @@ struct GuestThread {
         alerted = false;
         in_alertable_wait = false;
         is_system_thread = false;
+        is_worker_thread = false;
+        worker_queue_type = WorkQueueType::Delayed;
     }
     
     /**
@@ -328,6 +335,14 @@ public:
      * Alert a thread (causes alertable waits to return with STATUS_ALERTED)
      */
     void alert_thread(GuestThread* thread);
+    
+    /**
+     * Process work queue for a worker thread
+     * Called by hw_thread_main when executing a worker thread
+     * @param thread Worker thread to process work for
+     * @return true if work was processed, false if no work available
+     */
+    bool process_worker_thread(GuestThread* thread);
     
     /**
      * Get thread by ID

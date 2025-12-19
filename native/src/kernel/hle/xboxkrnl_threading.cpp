@@ -13,6 +13,7 @@
 
 #include "../kernel.h"
 #include "../threading.h"
+#include "../work_queue.h"
 #include "../../cpu/xenon/cpu.h"
 #include "../../cpu/xenon/threading.h"
 #include "../../memory/memory.h"
@@ -899,6 +900,90 @@ static void HLE_NtDuplicateObject(Cpu* cpu, Memory* memory, u64* args, u64* resu
 }
 
 //=============================================================================
+// Work Queue HLE Functions
+//=============================================================================
+
+/**
+ * ExInitializeWorkItem - Initialize a work queue item
+ * 
+ * Ordinal: 60
+ * 
+ * VOID ExInitializeWorkItem(
+ *   PWORK_QUEUE_ITEM WorkItem,       // arg[0] - Work item to initialize
+ *   PWORKER_THREAD_ROUTINE Routine,  // arg[1] - Worker routine
+ *   PVOID Context                    // arg[2] - Context parameter
+ * );
+ * 
+ * WORK_QUEUE_ITEM structure:
+ * +0x00: LIST_ENTRY List (Flink, Blink)
+ * +0x08: PWORKER_THREAD_ROUTINE WorkerRoutine
+ * +0x0C: PVOID Parameter
+ */
+static void HLE_ExInitializeWorkItem(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr work_item = static_cast<GuestAddr>(args[0]);
+    GuestAddr routine = static_cast<GuestAddr>(args[1]);
+    GuestAddr context = static_cast<GuestAddr>(args[2]);
+    
+    LOGI("ExInitializeWorkItem: item=0x%08X, routine=0x%08X, context=0x%08X",
+         (u32)work_item, (u32)routine, (u32)context);
+    
+    // Initialize LIST_ENTRY to point to itself (empty/unlinked)
+    memory->write_u32(work_item + 0x00, work_item);  // Flink = self
+    memory->write_u32(work_item + 0x04, work_item);  // Blink = self
+    memory->write_u32(work_item + 0x08, routine);    // WorkerRoutine
+    memory->write_u32(work_item + 0x0C, context);    // Parameter
+    
+    // void function - no return value needed
+}
+
+/**
+ * ExQueueWorkItem - Queue a work item to a system worker thread
+ * 
+ * Ordinal: 61
+ * 
+ * VOID ExQueueWorkItem(
+ *   PWORK_QUEUE_ITEM WorkItem,  // arg[0] - Work item to queue
+ *   WORK_QUEUE_TYPE QueueType   // arg[1] - Queue type (Critical, Delayed, HyperCritical)
+ * );
+ */
+static void HLE_ExQueueWorkItem(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr work_item_addr = static_cast<GuestAddr>(args[0]);
+    u32 queue_type = static_cast<u32>(args[1]);
+    
+    // Read the work item from guest memory
+    WorkQueueItem item;
+    item.list_flink = memory->read_u32(work_item_addr + 0x00);
+    item.list_blink = memory->read_u32(work_item_addr + 0x04);
+    item.worker_routine = memory->read_u32(work_item_addr + 0x08);
+    item.parameter = memory->read_u32(work_item_addr + 0x0C);
+    item.item_address = work_item_addr;
+    
+    LOGI("ExQueueWorkItem: item=0x%08X, routine=0x%08X, param=0x%08X, type=%u",
+         (u32)work_item_addr, (u32)item.worker_routine, (u32)item.parameter, queue_type);
+    
+    // Validate routine pointer - must be in valid code range
+    if (item.worker_routine == 0) {
+        LOGW("ExQueueWorkItem: NULL routine pointer");
+        return;
+    }
+    
+    if (item.worker_routine < 0x80000000 || item.worker_routine >= 0xC0000000) {
+        LOGW("ExQueueWorkItem: Invalid routine pointer 0x%08X", (u32)item.worker_routine);
+        return;
+    }
+    
+    // Clamp queue type to valid range
+    if (queue_type >= static_cast<u32>(WorkQueueType::Maximum)) {
+        queue_type = static_cast<u32>(WorkQueueType::Delayed);
+    }
+    
+    // Queue to the work queue manager
+    WorkQueueManager::instance().enqueue(static_cast<WorkQueueType>(queue_type), item);
+    
+    // void function - no return value needed
+}
+
+//=============================================================================
 // Registration
 //=============================================================================
 
@@ -910,6 +995,10 @@ void register_xboxkrnl_threading(Kernel* kernel) {
     auto make_key = [](u32 module, u32 ordinal) -> u64 {
         return (static_cast<u64>(module) << 32) | ordinal;
     };
+    
+    // Work Queue functions
+    funcs[make_key(0, 60)] = HLE_ExInitializeWorkItem;
+    funcs[make_key(0, 61)] = HLE_ExQueueWorkItem;
     
     // Thread management
     funcs[make_key(0, 14)] = HLE_ExCreateThread;

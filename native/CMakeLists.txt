@@ -104,6 +104,7 @@ set(APU_SOURCES
 set(KERNEL_SOURCES
     src/kernel/kernel.cpp
     src/kernel/threading.cpp
+    src/kernel/work_queue.cpp
     src/kernel/xobject.cpp
     src/kernel/xthread.cpp
     src/kernel/xevent.cpp

@@ -5,6 +5,7 @@
  */
 
 #include "kernel.h"
+#include "work_queue.h"
 #include "memory/memory.h"
 #include "cpu/xenon/cpu.h"
 #include "cpu/xenon/threading.h"
@@ -218,31 +219,37 @@ void Kernel::prepare_entry() {
 }
 
 void Kernel::create_system_guest_threads() {
-    // Create system worker guest threads that process DPCs
-    // These simulate the Xbox 360 kernel's system threads
+    // Create system worker guest threads that process work queues
+    // These simulate the Xbox 360 kernel's system threads (ExpWorkerThread)
     //
-    // Instead of running busy loops, these threads start in Waiting state
-    // and are woken up when there's work to do (DPCs, timers, etc.)
+    // Worker threads process WORK_QUEUE_ITEMs queued via ExQueueWorkItem.
+    // Each worker services a specific queue type (Critical, Delayed, HyperCritical).
     
     if (!scheduler_) return;
     
-    // Create 3 system worker threads (Xbox 360 typically has 3-6 system threads)
+    // Create 3 worker threads - one for each queue type
+    // Xbox 360 typically has 3-6 system threads handling different work queues
     for (int i = 0; i < 3; i++) {
         GuestThread* worker = scheduler_->create_thread(
-            0,           // No initial entry point - DPC processor
-            i,           // param (worker ID)
+            0,           // Entry point 0 - special marker for worker thread
+            i,           // param (queue type)
             64 * 1024,   // 64KB stack
             0            // not suspended
         );
         if (worker) {
-            // Mark as system thread
+            // Mark as system thread AND worker thread
             worker->is_system_thread = true;
+            worker->is_worker_thread = true;
             
-            // Start in waiting state - will be activated when DPCs need processing
-            worker->state = ThreadState::Waiting;
+            // Assign queue type based on worker index
+            worker->worker_queue_type = static_cast<WorkQueueType>(i % 3);
             
-            LOGI("Created system worker thread %u (DPC processor) - starting in Waiting state", 
-                 worker->thread_id);
+            // Start in READY state - worker threads actively process work queues
+            // The scheduler will call process_worker_thread() when this thread runs
+            worker->state = ThreadState::Ready;
+            
+            LOGI("Created system worker thread %u for queue type %u - starting in Ready state", 
+                 worker->thread_id, static_cast<u32>(worker->worker_queue_type));
         }
     }
 }
