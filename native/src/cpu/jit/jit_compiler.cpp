@@ -52,16 +52,15 @@ extern "C" void jit_mmio_write_u16(void* mem, GuestAddr addr, u16 value) {
 // Debug helper to trace store addresses
 extern "C" void jit_trace_store(GuestAddr addr) {
     static int trace_count = 0;
-    // Log ALL high-address stores (above 0x90000000) - may include GPU virtual addresses
-    if (addr >= 0xA0000000) {
-        trace_count++;
-        if (trace_count <= 50 || (trace_count % 100000 == 0)) {
-            LOGI("High store #%d: addr=0x%08llX", trace_count, (unsigned long long)addr);
-        }
-    }
-    // Also log stores in potential GPU virtual range (0xC0000000-0xCFFFFFFF)
+    // Only log writes to GPU virtual range (0xC0000000-0xCFFFFFFF)
     if (addr >= 0xC0000000 && addr < 0xD0000000) {
-        LOGI("GPU virtual store: addr=0x%08llX", (unsigned long long)addr);
+        trace_count++;
+        LOGI("GPU virtual store #%d: addr=0x%08llX", trace_count, (unsigned long long)addr);
+    }
+    // Also log stores in physical GPU MMIO range (0x7FC00000-0x7FFFFFFF)
+    if (addr >= 0x7FC00000 && addr < 0x80000000) {
+        trace_count++;
+        LOGI("GPU physical store #%d: addr=0x%08llX", trace_count, (unsigned long long)addr);
     }
 }
 
@@ -1118,8 +1117,48 @@ void JitCompiler::compile_load(ARM64Emitter& emit, const DecodedInst& inst) {
         emit.ORR(arm64::X3, arm64::XZR, arm64::X0);
     }
     
-    // Translate virtual address to physical and add fastmem base
-    emit_translate_address(emit, arm64::X0);
+    // Save original EA for MMIO path (X2 = original EA)
+    emit.ORR(arm64::X2, arm64::XZR, arm64::X0);
+    
+    // === Address routing for loads ===
+    // 1. Kernel addresses (>= 0xA0000000) → MMIO path
+    // 2. Usermode virtual (0x80000000-0x9FFFFFFF) → mask to physical
+    // 3. GPU MMIO physical (0x7FC00000-0x7FFFFFFF) → MMIO path
+    // 4. All other physical (0x00000000-0x7FBFFFFF) → mask and use fastmem
+    
+    emit.MOV_imm(arm64::X16, 0xA0000000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* kernel_space_load = emit.current();
+    emit.B_cond(arm64_cond::CS, 0);  // Branch if addr >= 0xA0000000 -> MMIO path
+    
+    // Check for GPU MMIO physical range (0x7FC00000-0x7FFFFFFF)
+    // This must be checked BEFORE masking, as it's a special physical range
+    emit.MOV_imm(arm64::X16, 0x7FC00000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* below_gpu_mmio = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch if addr < 0x7FC00000
+    
+    emit.MOV_imm(arm64::X16, 0x80000000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* is_gpu_mmio = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch to MMIO if addr < 0x80000000 (in GPU range)
+    
+    // Not in GPU MMIO range
+    emit.patch_branch(reinterpret_cast<u32*>(below_gpu_mmio), emit.current());
+    
+    // For all addresses < 0xA0000000 (except GPU MMIO), apply mask to get physical
+    // This handles:
+    // - Physical 0x00000000-0x1FFFFFFF → unchanged (main RAM)
+    // - Physical 0x20000000-0x7FBFFFFF → masked to 0x00000000-0x1FFFFFFF (mirrors)
+    // - Virtual 0x80000000-0x9FFFFFFF → masked to 0x00000000-0x1FFFFFFF
+    emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
+    emit.AND(arm64::X0, arm64::X0, arm64::X16);
+    
+    // === FASTMEM PATH for loads ===
+    // X0 now contains physical address in range 0x00000000-0x1FFFFFFF
+    // Add fastmem base directly (no need to call emit_translate_address, we already masked)
+    emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(fastmem_base_));
+    emit.ADD(arm64::X0, arm64::X0, arm64::X16);
     
     // Load based on opcode
     int dest_reg = arm64::X1;
@@ -1190,7 +1229,64 @@ void JitCompiler::compile_load(ARM64Emitter& emit, const DecodedInst& inst) {
             break;
     }
     
-    store_gpr(emit, inst.rd, dest_reg);
+    // Jump past MMIO path
+    u8* skip_mmio_load = emit.current();
+    emit.B(0);
+    
+    // === MMIO PATH for loads ===
+    // Kernel addresses (>= 0xA0000000) and GPU MMIO (0x7FC00000-0x7FFFFFFF) land here
+    emit.patch_branch(reinterpret_cast<u32*>(kernel_space_load), emit.current());
+    emit.patch_branch(reinterpret_cast<u32*>(is_gpu_mmio), emit.current());
+    
+    // Call helper function with original virtual address (X2)
+    // jit_mmio_read_XX(memory, addr) returns value - Memory class handles routing
+    
+    // Load memory pointer into X0
+    emit.LDR(arm64::X0, arm64::CTX_REG, offsetof(ThreadContext, memory));
+    
+    // X1 = original addr (from X2)
+    emit.ORR(arm64::X1, arm64::XZR, arm64::X2);
+    
+    // Determine helper function based on load size
+    u64 mmio_read_helper = 0;
+    switch (inst.opcode) {
+        case 32: case 33: // lwz/lwzu
+            mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u32);
+            break;
+        case 34: case 35: // lbz/lbzu
+            mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u8);
+            break;
+        case 40: case 41: case 42: case 43: // lhz/lhzu/lha/lhau
+            mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u16);
+            break;
+        case 48: case 49: case 50: case 51: // lfs/lfsu/lfd/lfdu
+        case 58: // ld/ldu/lwa
+            mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u64);
+            break;
+        case 31: // Extended loads
+            switch (inst.xo) {
+                case 23: mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u32); break; // lwzx
+                case 87: mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u8); break;  // lbzx
+                case 279: case 343: mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u16); break; // lhzx/lhax
+                case 21: mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u64); break; // ldx
+                default: mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u32); break;
+            }
+            break;
+        default:
+            mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u32);
+            break;
+    }
+    
+    emit.MOV_imm(arm64::X16, mmio_read_helper);
+    emit.BLR(arm64::X16);
+    
+    // Result is in X0, move to dest_reg (X1)
+    emit.ORR(arm64::X1, arm64::XZR, arm64::X0);
+    
+    // === DONE ===
+    emit.patch_branch(reinterpret_cast<u32*>(skip_mmio_load), emit.current());
+    
+    store_gpr(emit, inst.rd, arm64::X1);
     
     // Update RA for update forms (use saved EA from X3)
     if (is_update && inst.ra != 0) {
@@ -1269,15 +1365,15 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
     // Save original virtual address for MMIO path (X2 = original EA)
     emit.ORR(arm64::X2, arm64::XZR, arm64::X0);
     
-    // === FIX v3: Proper MMIO detection including GPU virtual address ranges ===
-    // GPU MMIO can be accessed via:
-    // 1. Direct physical: 0x7FC00000-0x7FFFFFFF
-    // 2. Virtual mapping: 0xC0000000-0xC3FFFFFF -> 0x7FC00000+
-    // 3. Alternate virtual: 0xEC800000-0xECFFFFFF -> 0x7FC00000+
-    // 4. Usermode virtual: 0x80000000-0x9FFFFFFF -> physical via &0x1FFFFFFF
+    // === Address routing for stores (v4 - correct mirror handling) ===
+    // Routes to MMIO path for:
+    // 1. Kernel addresses (>= 0xA0000000)
+    // 2. GPU virtual mapping (0xC0000000-0xC3FFFFFF)
+    // 3. Alternate GPU virtual (0xEC800000-0xECFFFFFF)
+    // 4. GPU MMIO physical (0x7FC00000-0x7FFFFFFF)
+    // All other addresses: mask with 0x1FFFFFFF to handle mirrors → fastmem
     
     // First, check for GPU MMIO virtual addresses (0xC0000000-0xC3FFFFFF)
-    // These map directly to GPU registers and MUST go to MMIO path
     emit.MOV_imm(arm64::X16, 0xC0000000ULL);
     emit.CMP(arm64::X0, arm64::X16);
     u8* below_gpu_virt = emit.current();
@@ -1305,44 +1401,44 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
     // Not in alternate GPU range either
     emit.patch_branch(reinterpret_cast<u32*>(below_alt_gpu), emit.current());
     
-    // Now check for non-MMIO kernel space (addresses that are NOT GPU virtual)
-    // Skip to fastmem for addresses >= 0xA0000000 that are NOT GPU virtual
-    // (we already checked and excluded GPU virtual ranges above)
+    // Check for kernel addresses (>= 0xA0000000)
     emit.MOV_imm(arm64::X16, 0xA0000000ULL);
     emit.CMP(arm64::X0, arm64::X16);
     u8* kernel_space = emit.current();
-    emit.B_cond(arm64_cond::CS, 0);  // Branch if addr >= 0xA0000000 (kernel, not MMIO)
+    emit.B_cond(arm64_cond::CS, 0);  // Branch if addr >= 0xA0000000 -> MMIO path
     
-    // Check if usermode virtual (0x80000000-0x9FFFFFFF)
+    // Check for GPU MMIO physical range (0x7FC00000-0x7FFFFFFF)
+    emit.MOV_imm(arm64::X16, 0x7FC00000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* below_gpu_phys = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch if addr < 0x7FC00000
+    
     emit.MOV_imm(arm64::X16, 0x80000000ULL);
     emit.CMP(arm64::X0, arm64::X16);
-    u8* is_physical = emit.current();
-    emit.B_cond(arm64_cond::CC, 0);  // Branch if addr < 0x80000000 (already physical)
+    u8* is_gpu_phys = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch to MMIO if < 0x80000000 (in GPU MMIO range)
     
-    // It's usermode virtual (0x80000000-0x9FFFFFFF) - translate to physical
+    // Not in GPU physical MMIO range
+    emit.patch_branch(reinterpret_cast<u32*>(below_gpu_phys), emit.current());
+    
+    // For all other addresses, apply mask to get physical address in 512MB range
+    // This handles:
+    // - Physical 0x00000000-0x1FFFFFFF → unchanged (main RAM)
+    // - Physical 0x20000000-0x7FBFFFFF → masked to 0x00000000-0x1FFFFFFF (mirrors)
+    // - Virtual 0x80000000-0x9FFFFFFF → masked to 0x00000000-0x1FFFFFFF
     emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
     emit.AND(arm64::X0, arm64::X0, arm64::X16);
     
-    // Patch is_physical branch to here (now X0 has physical address)
-    emit.patch_branch(reinterpret_cast<u32*>(is_physical), emit.current());
-    
-    // Now X0 = physical address - check if it's in GPU MMIO range (0x7FC00000-0x7FFFFFFF)
-    emit.MOV_imm(arm64::X16, GPU_MMIO_BASE);  // 0x7FC00000
-    emit.CMP(arm64::X0, arm64::X16);
-    u8* not_mmio = emit.current();
-    emit.B_cond(arm64_cond::CC, 0);  // Branch if phys < 0x7FC00000 (not MMIO)
-    
-    // Also check upper bound (must be < 0x80000000 to be valid physical MMIO)
-    emit.MOV_imm(arm64::X16, 0x80000000ULL);
-    emit.CMP(arm64::X0, arm64::X16);
-    u8* above_mmio = emit.current();
-    emit.B_cond(arm64_cond::CS, 0);  // Branch if phys >= 0x80000000 (not in GPU range)
+    // Fastmem path - address is now in valid range
+    u8* fastmem_path = emit.current();
+    emit.B(0);  // Branch to fastmem path
     
     // === MMIO PATH ===
-    // All GPU virtual and physical addresses land here
-    // Patch GPU virtual address branches to here
+    // GPU virtual, GPU physical, and kernel addresses land here
     emit.patch_branch(reinterpret_cast<u32*>(is_gpu_virt), emit.current());
     emit.patch_branch(reinterpret_cast<u32*>(is_alt_gpu), emit.current());
+    emit.patch_branch(reinterpret_cast<u32*>(kernel_space), emit.current());
+    emit.patch_branch(reinterpret_cast<u32*>(is_gpu_phys), emit.current());
     
     // Call helper function with ORIGINAL virtual address (X2)
     // jit_mmio_write_XX(memory, addr, value) - Memory class will handle MMIO routing
@@ -1392,17 +1488,15 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
     emit.B(0);
     
     // === FASTMEM PATH ===
-    // Patch all non-MMIO branches here
-    emit.patch_branch(reinterpret_cast<u32*>(kernel_space), emit.current());
-    emit.patch_branch(reinterpret_cast<u32*>(not_mmio), emit.current());
-    emit.patch_branch(reinterpret_cast<u32*>(above_mmio), emit.current());
+    // X0 already has the masked physical address (0x00000000-0x1FFFFFFF)
+    emit.patch_branch(reinterpret_cast<u32*>(fastmem_path), emit.current());
     
-    // Reload original EA and value since we may have clobbered registers
-    emit.ORR(arm64::X0, arm64::XZR, arm64::X2);  // Restore original EA from X2
+    // Reload value since we may have clobbered X1 in MMIO path setup
     load_gpr(emit, arm64::X1, inst.rs);
     
-    // Translate virtual address to physical and add fastmem base
-    emit_translate_address(emit, arm64::X0);
+    // Add fastmem base (address already masked above)
+    emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(fastmem_base_));
+    emit.ADD(arm64::X0, arm64::X0, arm64::X16);
     
     // Store based on opcode
     switch (inst.opcode) {
@@ -1464,25 +1558,138 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
 
 void JitCompiler::compile_load_multiple(ARM64Emitter& emit, const DecodedInst& inst) {
     calc_ea(emit, arm64::X0, inst.ra, inst.simm);
-    emit_translate_address(emit, arm64::X0);
+    
+    // Save original EA for slow path
+    emit.ORR(arm64::X2, arm64::XZR, arm64::X0);
+    
+    // === Address routing (v4 - correct mirror handling) ===
+    // Check for kernel addresses (>= 0xA0000000) - bail to slow path
+    emit.MOV_imm(arm64::X16, 0xA0000000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* kernel_addr = emit.current();
+    emit.B_cond(arm64_cond::CS, 0);  // Branch if >= 0xA0000000
+    
+    // Check for GPU MMIO physical range (0x7FC00000-0x7FFFFFFF)
+    emit.MOV_imm(arm64::X16, 0x7FC00000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* below_gpu = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch if addr < 0x7FC00000
+    
+    emit.MOV_imm(arm64::X16, 0x80000000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* is_gpu = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch to slow path if < 0x80000000 (in GPU MMIO)
+    
+    emit.patch_branch(reinterpret_cast<u32*>(below_gpu), emit.current());
+    
+    // For all other addresses, apply mask to get physical address in 512MB range
+    emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
+    emit.AND(arm64::X0, arm64::X0, arm64::X16);
+    
+    // Fastmem path - address is in main RAM (< 0x20000000 after masking)
+    // Add fastmem base
+    emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(fastmem_base_));
+    emit.ADD(arm64::X0, arm64::X0, arm64::X16);
     
     for (u32 r = inst.rd; r < 32; r++) {
         emit.LDR(arm64::X1, arm64::X0, (r - inst.rd) * 4);
         byteswap32(emit, arm64::X1);
         store_gpr(emit, r, arm64::X1);
     }
+    
+    u8* done = emit.current();
+    emit.B(0);  // Jump to end
+    
+    // Slow path - kernel addresses and GPU MMIO
+    emit.patch_branch(reinterpret_cast<u32*>(kernel_addr), emit.current());
+    emit.patch_branch(reinterpret_cast<u32*>(is_gpu), emit.current());
+    
+    // X2 has the original EA
+    for (u32 r = inst.rd; r < 32; r++) {
+        // Calculate address for this register
+        emit.ADD_imm(arm64::X1, arm64::X2, (r - inst.rd) * 4);
+        
+        // Load memory pointer
+        emit.LDR(arm64::X0, arm64::CTX_REG, offsetof(ThreadContext, memory));
+        
+        // Call jit_mmio_read_u32(memory, addr)
+        u64 read_func = reinterpret_cast<u64>(&jit_mmio_read_u32);
+        emit.MOV_imm(arm64::X16, read_func);
+        emit.BLR(arm64::X16);
+        
+        // Result is in X0, store to GPR
+        store_gpr(emit, r, arm64::X0);
+    }
+    
+    emit.patch_branch(reinterpret_cast<u32*>(done), emit.current());
 }
 
 void JitCompiler::compile_store_multiple(ARM64Emitter& emit, const DecodedInst& inst) {
     calc_ea(emit, arm64::X0, inst.ra, inst.simm);
     
-    emit_translate_address(emit, arm64::X0);
+    // Save original EA for slow path
+    emit.ORR(arm64::X3, arm64::XZR, arm64::X0);
+    
+    // === Address routing (v4 - correct mirror handling) ===
+    // Check for kernel addresses (>= 0xA0000000) - bail to slow path
+    emit.MOV_imm(arm64::X16, 0xA0000000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* kernel_addr = emit.current();
+    emit.B_cond(arm64_cond::CS, 0);  // Branch if >= 0xA0000000
+    
+    // Check for GPU MMIO physical range (0x7FC00000-0x7FFFFFFF)
+    emit.MOV_imm(arm64::X16, 0x7FC00000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* below_gpu = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch if addr < 0x7FC00000
+    
+    emit.MOV_imm(arm64::X16, 0x80000000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* is_gpu = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch to slow path if < 0x80000000 (in GPU MMIO)
+    
+    emit.patch_branch(reinterpret_cast<u32*>(below_gpu), emit.current());
+    
+    // For all other addresses, apply mask to get physical address in 512MB range
+    emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
+    emit.AND(arm64::X0, arm64::X0, arm64::X16);
+    
+    // Fastmem path - address is now in valid range
+    // Add fastmem base
+    emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(fastmem_base_));
+    emit.ADD(arm64::X0, arm64::X0, arm64::X16);
     
     for (u32 r = inst.rs; r < 32; r++) {
         load_gpr(emit, arm64::X1, r);
         byteswap32(emit, arm64::X1);
         emit.STR(arm64::X1, arm64::X0, (r - inst.rs) * 4);
     }
+    
+    u8* done = emit.current();
+    emit.B(0);  // Jump to end
+    
+    // Slow path - kernel addresses and GPU MMIO
+    emit.patch_branch(reinterpret_cast<u32*>(kernel_addr), emit.current());
+    emit.patch_branch(reinterpret_cast<u32*>(is_gpu), emit.current());
+    
+    // X3 has the original EA
+    for (u32 r = inst.rs; r < 32; r++) {
+        // Load value to store
+        load_gpr(emit, arm64::X2, r);
+        
+        // Calculate address for this register
+        emit.ADD_imm(arm64::X1, arm64::X3, (r - inst.rs) * 4);
+        
+        // Load memory pointer
+        emit.LDR(arm64::X0, arm64::CTX_REG, offsetof(ThreadContext, memory));
+        
+        // Call jit_mmio_write_u32(memory, addr, value)
+        u64 write_func = reinterpret_cast<u64>(&jit_mmio_write_u32);
+        emit.MOV_imm(arm64::X16, write_func);
+        emit.BLR(arm64::X16);
+    }
+    
+    emit.patch_branch(reinterpret_cast<u32*>(done), emit.current());
 }
 
 //=============================================================================
@@ -1496,10 +1703,35 @@ void JitCompiler::compile_atomic_load(ARM64Emitter& emit, const DecodedInst& ins
     // Save untranslated address for reservation
     emit.ORR(arm64::X2, arm64::XZR, arm64::X0);
     
-    emit_translate_address(emit, arm64::X0);
+    // === Address routing (v4 - correct mirror handling) ===
+    // Check for kernel addresses (>= 0xA0000000)
+    emit.MOV_imm(arm64::X16, 0xA0000000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* kernel_addr = emit.current();
+    emit.B_cond(arm64_cond::CS, 0);  // Branch to NOP path if kernel
+    
+    // Check for GPU MMIO physical range (0x7FC00000-0x7FFFFFFF)
+    emit.MOV_imm(arm64::X16, 0x7FC00000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* below_gpu = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch if addr < 0x7FC00000
+    
+    emit.MOV_imm(arm64::X16, 0x80000000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* is_gpu = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch to NOP if < 0x80000000 (in GPU MMIO)
+    
+    emit.patch_branch(reinterpret_cast<u32*>(below_gpu), emit.current());
+    
+    // For all other addresses, apply mask to get physical address in 512MB range
+    emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
+    emit.AND(arm64::X0, arm64::X0, arm64::X16);
+    
+    // Fastmem path - address is in main RAM
+    emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(fastmem_base_));
+    emit.ADD(arm64::X0, arm64::X0, arm64::X16);
     
     // Load the value with exclusive access
-    // ARM64: LDAXR for acquire semantics
     emit.LDR(arm64::X1, arm64::X0, 0);
     byteswap32(emit, arm64::X1);
     
@@ -1511,6 +1743,18 @@ void JitCompiler::compile_atomic_load(ARM64Emitter& emit, const DecodedInst& ins
     emit.STR(arm64::X3, arm64::CTX_REG, offsetof(ThreadContext, reservation_size));
     emit.MOV_imm(arm64::X3, 1);  // has_reservation = true
     emit.STRB(arm64::X3, arm64::CTX_REG, offsetof(ThreadContext, has_reservation));
+    
+    u8* done = emit.current();
+    emit.B(0);  // Jump to end
+    
+    // NOP path for unsupported addresses (kernel/GPU MMIO)
+    // Return 0 and don't set reservation
+    emit.patch_branch(reinterpret_cast<u32*>(kernel_addr), emit.current());
+    emit.patch_branch(reinterpret_cast<u32*>(is_gpu), emit.current());
+    emit.MOV_imm(arm64::X1, 0);
+    store_gpr(emit, inst.rd, arm64::X1);
+    
+    emit.patch_branch(reinterpret_cast<u32*>(done), emit.current());
 }
 
 void JitCompiler::compile_atomic_store(ARM64Emitter& emit, const DecodedInst& inst) {
@@ -1532,8 +1776,37 @@ void JitCompiler::compile_atomic_store(ARM64Emitter& emit, const DecodedInst& in
     u8* skip = emit.current();
     emit.B_cond(arm64_cond::NE, 0);
     
-    // Addresses match - translate and do the store
-    emit_translate_address(emit, arm64::X0);
+    // Addresses match - need proper address routing before store
+    // Save original address for potential failure path
+    emit.ORR(arm64::X4, arm64::XZR, arm64::X0);
+    
+    // === Address routing (v4 - correct mirror handling) ===
+    // Check for kernel addresses (>= 0xA0000000)
+    emit.MOV_imm(arm64::X16, 0xA0000000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* kernel_addr = emit.current();
+    emit.B_cond(arm64_cond::CS, 0);  // Branch to failure if kernel
+    
+    // Check for GPU MMIO physical range (0x7FC00000-0x7FFFFFFF)
+    emit.MOV_imm(arm64::X16, 0x7FC00000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* below_gpu = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch if addr < 0x7FC00000
+    
+    emit.MOV_imm(arm64::X16, 0x80000000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* is_gpu = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch to failure if < 0x80000000 (in GPU MMIO)
+    
+    emit.patch_branch(reinterpret_cast<u32*>(below_gpu), emit.current());
+    
+    // For all other addresses, apply mask to get physical address in 512MB range
+    emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
+    emit.AND(arm64::X0, arm64::X0, arm64::X16);
+    
+    // Fastmem path - address is in main RAM
+    emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(fastmem_base_));
+    emit.ADD(arm64::X0, arm64::X0, arm64::X16);
     
     load_gpr(emit, arm64::X1, inst.rs);
     byteswap32(emit, arm64::X1);
@@ -1555,6 +1828,10 @@ void JitCompiler::compile_atomic_store(ARM64Emitter& emit, const DecodedInst& in
     // Patch skip branch
     s64 skip_offset = emit.current() - skip;
     *reinterpret_cast<u32*>(skip) = 0x54000000 | ((skip_offset >> 2) << 5) | arm64_cond::NE;
+    
+    // Failure path for kernel/GPU MMIO addresses
+    emit.patch_branch(reinterpret_cast<u32*>(kernel_addr), emit.current());
+    emit.patch_branch(reinterpret_cast<u32*>(is_gpu), emit.current());
     
     // Set CR0.EQ=0 (failure)
     emit.STRB(arm64::XZR, arm64::CTX_REG, ctx_offset_cr(0) + 2); // EQ = 0
@@ -1583,15 +1860,50 @@ void JitCompiler::compile_dcbz(ARM64Emitter& emit, const DecodedInst& inst) {
     emit.MOV_imm(arm64::X16, ~31ULL);
     emit.AND(arm64::X0, arm64::X0, arm64::X16);
     
-    // Translate address and zero 32 bytes
-    emit_translate_address(emit, arm64::X0);
+    // === Address routing (v4 - correct mirror handling) ===
+    // Check for kernel addresses (>= 0xA0000000)
+    emit.MOV_imm(arm64::X16, 0xA0000000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* kernel_addr = emit.current();
+    emit.B_cond(arm64_cond::CS, 0);  // Skip dcbz for kernel addresses
     
-    // Zero 32 bytes (use 4x STP of XZR pairs = 4 * 16 = 64 bytes... wait, that's too much)
-    // Zero using 4 STR of 64-bit zeros = 4 * 8 = 32 bytes
+    // Check for GPU MMIO physical range (0x7FC00000-0x7FFFFFFF)
+    emit.MOV_imm(arm64::X16, 0x7FC00000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* below_gpu = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Branch if addr < 0x7FC00000
+    
+    emit.MOV_imm(arm64::X16, 0x80000000ULL);
+    emit.CMP(arm64::X0, arm64::X16);
+    u8* is_gpu = emit.current();
+    emit.B_cond(arm64_cond::CC, 0);  // Skip dcbz if < 0x80000000 (in GPU MMIO)
+    
+    emit.patch_branch(reinterpret_cast<u32*>(below_gpu), emit.current());
+    
+    // For all other addresses, apply mask to get physical address in 512MB range
+    emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
+    emit.AND(arm64::X0, arm64::X0, arm64::X16);
+    
+    // Fastmem path - address is in main RAM
+    emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(fastmem_base_));
+    emit.ADD(arm64::X0, arm64::X0, arm64::X16);
+    
+    // Zero 32 bytes using 4 STR of 64-bit zeros = 4 * 8 = 32 bytes
     emit.STR(arm64::XZR, arm64::X0, 0);
     emit.STR(arm64::XZR, arm64::X0, 8);
     emit.STR(arm64::XZR, arm64::X0, 16);
     emit.STR(arm64::XZR, arm64::X0, 24);
+    
+    // Done - skip NOP path
+    u8* done = emit.current();
+    emit.B(0);
+    
+    // NOP path for unsupported addresses (kernel/GPU MMIO)
+    emit.patch_branch(reinterpret_cast<u32*>(kernel_addr), emit.current());
+    emit.patch_branch(reinterpret_cast<u32*>(is_gpu), emit.current());
+    emit.NOP();  // Just skip for invalid addresses
+    
+    emit.patch_branch(reinterpret_cast<u32*>(done), emit.current());
 }
 
 //=============================================================================
@@ -2151,10 +2463,15 @@ void JitCompiler::calc_ea_indexed(ARM64Emitter& emit, int dest_reg, int ra, int 
 
 void JitCompiler::emit_translate_address(ARM64Emitter& emit, int addr_reg) {
     // Translate Xbox 360 address to host fastmem address
-    // Simple approach: ALWAYS mask with 0x1FFFFFFF to get physical offset (512MB)
-    // This works for both virtual (0x8XXXXXXX) and physical (0x0XXXXXXX) addresses
+    // Works for physical (0x0-0x1FFFFFFF) and usermode virtual (0x80000000-0x9FFFFFFF)
+    // 
+    // IMPORTANT: Kernel addresses (>= 0xA0000000) should NOT use this function!
+    // They should be routed through the MMIO/slow path instead.
+    // For legacy callers that still call this directly, we clamp to valid range.
     if (!fastmem_enabled_) return;
     
+    // Clamp addresses to 512MB range to avoid accessing unmapped memory
+    // This is a safety check - kernel addresses should be caught earlier
     // addr = addr & 0x1FFFFFFF (get physical offset within 512MB)
     emit.AND_imm(addr_reg, addr_reg, 0x1FFFFFFFULL);
     

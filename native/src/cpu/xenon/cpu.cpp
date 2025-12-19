@@ -239,6 +239,17 @@ void Cpu::execute_with_context(u32 thread_id, ThreadContext& external_ctx, u64 c
         return;
     }
     
+    // === DEBUG: Log PC periodically to see where the game is spinning ===
+    static u64 exec_call_count = 0;
+    static GuestAddr last_logged_pc = 0;
+    exec_call_count++;
+    // Log every 50000 calls, or when PC changes significantly
+    if (exec_call_count <= 10 || (exec_call_count % 50000 == 0)) {
+        LOGI("execute_with_context #%llu: tid=%u PC=0x%08llX LR=0x%08llX",
+             exec_call_count, thread_id, external_ctx.pc, external_ctx.lr);
+        last_logged_pc = external_ctx.pc;
+    }
+    
     // Lock the context for this thread
     std::lock_guard<std::mutex> lock(context_mutexes_[thread_id]);
     

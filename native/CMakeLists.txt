@@ -331,6 +331,7 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
         tests/cpu/test_interpreter.cpp
         tests/cpu/test_vmx128.cpp
         tests/memory/test_memory.cpp
+        tests/memory/test_address_mapping.cpp
         tests/kernel/test_xex_loader.cpp
         tests/kernel/test_filesystem.cpp
         tests/kernel/test_file_io.cpp
