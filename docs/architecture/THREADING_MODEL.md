@@ -202,6 +202,7 @@ void SetCurrentGuestThread(GuestThread* thread) {
 ```
 
 When a syscall happens:
+
 1. The host thread executing the syscall calls `GetCurrentGuestThread()`
 2. Returns the `GuestThread*` associated with THIS host thread
 3. Syscall handler uses the correct `ThreadContext`
@@ -223,7 +224,8 @@ GuestAddr Memory::translate_address(GuestAddr addr) {
 ```
 
 If translation differs:
-- JIT reads from physical `0x1003FC3C` 
+
+- JIT reads from physical `0x1003FC3C`
 - HLE writes to virtual `0x7003FC3C` (different location!)
 - Completion flags never seen by game code
 
