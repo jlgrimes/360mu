@@ -52,21 +52,26 @@ extern "C" void jit_mmio_write_u16(void* mem, GuestAddr addr, u16 value) {
 // Debug helper to trace store addresses
 extern "C" void jit_trace_store(GuestAddr addr) {
     static int trace_count = 0;
-    // Log stores to GPU-ish range
-    if (addr >= 0x7F000000 && addr < 0x80000000) {
-        if (trace_count < 20) {
-            LOGI("Store to potential MMIO: addr=0x%08llX", (unsigned long long)addr);
-            trace_count++;
+    // Log ALL high-address stores (above 0x90000000) - may include GPU virtual addresses
+    if (addr >= 0xA0000000) {
+        trace_count++;
+        if (trace_count <= 50 || (trace_count % 100000 == 0)) {
+            LOGI("High store #%d: addr=0x%08llX", trace_count, (unsigned long long)addr);
         }
+    }
+    // Also log stores in potential GPU virtual range (0xC0000000-0xCFFFFFFF)
+    if (addr >= 0xC0000000 && addr < 0xD0000000) {
+        LOGI("GPU virtual store: addr=0x%08llX", (unsigned long long)addr);
     }
 }
 
 extern "C" void jit_mmio_write_u32(void* mem, GuestAddr addr, u32 value) {
     static int call_count = 0;
     
-    if (call_count < 10) {
-        LOGI("MMIO write_u32: addr=0x%08X value=0x%08X", addr, value);
-        call_count++;
+    // Log ALL MMIO writes - we need to see if any GPU writes are happening
+    call_count++;
+    if (call_count <= 100 || (call_count % 10000 == 0)) {
+        LOGI("MMIO write_u32 #%d: addr=0x%08llX value=0x%08X", call_count, (unsigned long long)addr, value);
     }
     static_cast<Memory*>(mem)->write_u32(addr, value);
 }
@@ -1224,6 +1229,38 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
     // Save EA for update forms before translation
     if (is_update && inst.ra != 0) {
         emit.ORR(arm64::X3, arm64::XZR, arm64::X0);
+    }
+    
+    // DEBUG: Trace high-address stores to see what addresses the game is accessing
+    // Emit a call to jit_trace_store(X0) to log the address at runtime
+    // Only do this for addresses above 0x90000000 to reduce noise
+    {
+        // Check if addr >= 0xA0000000 before calling trace
+        u8* skip_trace_pos = nullptr;
+        emit.MOV_imm(arm64::X16, 0xA0000000ULL);
+        emit.CMP(arm64::X0, arm64::X16);
+        skip_trace_pos = emit.current();
+        emit.B_cond(arm64_cond::CC, 0);  // Skip trace if addr < 0xA0000000
+        
+        // Save registers on stack (decrement SP first, then store)
+        emit.SUB_imm(arm64::SP, arm64::SP, 48);
+        emit.STP(arm64::X0, arm64::X1, arm64::SP, 0);    // Save X0, X1
+        emit.STP(arm64::X2, arm64::X3, arm64::SP, 16);   // Save X2, X3
+        emit.STP(arm64::X30, arm64::XZR, arm64::SP, 32); // Save LR
+        
+        // X0 already has the address
+        u64 trace_func = reinterpret_cast<u64>(&jit_trace_store);
+        emit.MOV_imm(arm64::X16, trace_func);
+        emit.BLR(arm64::X16);
+        
+        // Restore registers (load then increment SP)
+        emit.LDP(arm64::X30, arm64::XZR, arm64::SP, 32); // Restore LR
+        emit.LDP(arm64::X2, arm64::X3, arm64::SP, 16);   // Restore X2, X3
+        emit.LDP(arm64::X0, arm64::X1, arm64::SP, 0);    // Restore X0, X1
+        emit.ADD_imm(arm64::SP, arm64::SP, 48);
+        
+        // Patch the skip branch
+        emit.patch_branch(reinterpret_cast<u32*>(skip_trace_pos), emit.current());
     }
     
     // Load value to store
