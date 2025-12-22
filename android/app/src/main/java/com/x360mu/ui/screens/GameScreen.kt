@@ -767,7 +767,20 @@ private fun InGameMenu(
                     Spacer(modifier = Modifier.width(8.dp))
                     Text("Reset")
                 }
-                
+
+                // Test Render
+                TextButton(
+                    onClick = {
+                        emulator.testRender()
+                        onDismiss()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Default.Build, contentDescription = null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Test Render (Cyan Screen)")
+                }
+
                 Divider()
                 
                 // Save state

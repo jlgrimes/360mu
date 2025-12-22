@@ -152,7 +152,10 @@ public:
     
     // Callbacks
     void set_frame_callback(FrameCallback callback);
-    
+
+    // Testing
+    void test_render();
+
     // State queries
     EmulatorState get_state() const { return state_; }
     bool is_running() const { return state_ == EmulatorState::Running; }

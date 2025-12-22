@@ -87,6 +87,8 @@ if(X360MU_USE_VULKAN)
         src/gpu/texture_cache.cpp
         src/gpu/descriptor_manager.cpp
         src/gpu/render_target.cpp
+        src/gpu/buffer_pool.cpp
+        src/gpu/default_shaders.cpp
     )
 else()
     set(GPU_SOURCES

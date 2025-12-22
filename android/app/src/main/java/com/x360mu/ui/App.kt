@@ -18,6 +18,7 @@ import com.x360mu.core.NativeEmulator
 import com.x360mu.ui.screens.GameScreen
 import com.x360mu.ui.screens.LibraryScreen
 import com.x360mu.ui.screens.SettingsScreen
+import com.x360mu.ui.screens.TestRenderScreen
 import java.io.File
 import java.net.URLDecoder
 import java.net.URLEncoder
@@ -27,6 +28,7 @@ private const val TAG = "360mu-App"
 sealed class Screen(val route: String) {
     object Library : Screen("library")
     object Settings : Screen("settings")
+    object TestRender : Screen("test_render")
     object Game : Screen("game/{gamePath}") {
         fun createRoute(gamePath: String) = "game/${URLEncoder.encode(gamePath, "UTF-8")}"
     }
@@ -97,6 +99,7 @@ fun App() {
             composable(Screen.Library.route) {
                 Log.i(TAG, "Navigated to Library screen")
                 LibraryScreen(
+                    emulator = emulator,
                     onGameSelected = { path ->
                         Log.i(TAG, "Game selected: $path")
                         navController.navigate(Screen.Game.createRoute(path))
@@ -104,6 +107,10 @@ fun App() {
                     onSettingsClick = {
                         Log.i(TAG, "Settings clicked")
                         navController.navigate(Screen.Settings.route)
+                    },
+                    onTestRenderClick = {
+                        Log.i(TAG, "Test Render clicked")
+                        navController.navigate(Screen.TestRender.route)
                     }
                 )
             }
@@ -117,7 +124,18 @@ fun App() {
                     }
                 )
             }
-            
+
+            composable(Screen.TestRender.route) {
+                Log.i(TAG, "Navigated to TestRender screen")
+                TestRenderScreen(
+                    emulator = emulator,
+                    onBack = {
+                        Log.i(TAG, "TestRender back clicked")
+                        navController.popBackStack()
+                    }
+                )
+            }
+
             composable(
                 route = Screen.Game.route,
                 arguments = listOf(

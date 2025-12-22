@@ -244,12 +244,30 @@ Java_com_x360mu_core_NativeEmulator_nativeSetSurface(
 JNIEXPORT void JNICALL
 Java_com_x360mu_core_NativeEmulator_nativeResizeSurface(
     JNIEnv* env, jobject /* this */, jlong handle, jint width, jint height) {
-    
+
     auto* emulator = reinterpret_cast<Emulator*>(handle);
     if (emulator) {
         LOGD("Resizing surface to %dx%d", width, height);
         emulator->resize_surface(static_cast<u32>(width), static_cast<u32>(height));
     }
+}
+
+JNIEXPORT void JNICALL
+Java_com_x360mu_core_NativeEmulator_nativeTestRender(
+    JNIEnv* env, jobject /* this */, jlong handle) {
+
+    LOGI("nativeTestRender called");
+
+    auto* emulator = reinterpret_cast<Emulator*>(handle);
+    if (!emulator) {
+        LOGE("nativeTestRender: invalid emulator handle!");
+        return;
+    }
+
+    // Call test render on the GPU
+    emulator->test_render();
+
+    LOGI("nativeTestRender completed");
 }
 
 // ============================================================================

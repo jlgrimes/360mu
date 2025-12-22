@@ -31,11 +31,13 @@
 #define LOG_TAG "360mu-cmdproc"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #else
 #include <cstdio>
 #define LOGI(...) printf("[CMDPROC] " __VA_ARGS__); printf("\n")
 #define LOGE(...) fprintf(stderr, "[CMDPROC ERROR] " __VA_ARGS__); fprintf(stderr, "\n")
+#define LOGW(...) fprintf(stderr, "[CMDPROC WARN] " __VA_ARGS__); fprintf(stderr, "\n")
 #define LOGD(...) /* debug disabled */
 #endif
 
@@ -1539,7 +1541,7 @@ void CommandProcessor::create_default_shaders() {
 
     // Create cached shader entries
     default_vertex_shader_ = new CachedShader();
-    default_vertex_shader_->hash = 0xDEFAULTVS;
+    default_vertex_shader_->hash = 0xDEFA017F5; // DEFAULT_VS as valid hex
     default_vertex_shader_->type = ShaderType::Vertex;
     default_vertex_shader_->module = vs_module;
     default_vertex_shader_->spirv = vs_spirv;
@@ -1550,7 +1552,7 @@ void CommandProcessor::create_default_shaders() {
     default_vertex_shader_->interpolant_mask = 0;
 
     default_pixel_shader_ = new CachedShader();
-    default_pixel_shader_->hash = 0xDEFAULTPS;
+    default_pixel_shader_->hash = 0xDEFA017F6; // DEFAULT_PS as valid hex
     default_pixel_shader_->type = ShaderType::Pixel;
     default_pixel_shader_->module = ps_module;
     default_pixel_shader_->spirv = ps_spirv;

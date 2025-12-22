@@ -178,6 +178,15 @@ class NativeEmulator : AutoCloseable {
         Log.i(TAG, "resizeSurface() called with ${width}x${height}")
         nativeResizeSurface(nativeHandle, width, height)
     }
+
+    /**
+     * Test render - draws a cyan screen to verify rendering pipeline works
+     */
+    fun testRender() {
+        Log.i(TAG, "testRender() called")
+        nativeTestRender(nativeHandle)
+        Log.i(TAG, "testRender() completed")
+    }
     
     // Input methods
     fun setButton(player: Int, button: Int, pressed: Boolean) {
@@ -274,6 +283,7 @@ class NativeEmulator : AutoCloseable {
     
     private external fun nativeSetSurface(handle: Long, surface: Surface?)
     private external fun nativeResizeSurface(handle: Long, width: Int, height: Int)
+    private external fun nativeTestRender(handle: Long)
     
     private external fun nativeSetButton(handle: Long, player: Int, button: Int, pressed: Boolean)
     private external fun nativeSetTrigger(handle: Long, player: Int, trigger: Int, value: Float)

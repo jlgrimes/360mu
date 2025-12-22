@@ -42,8 +42,10 @@ private const val TAG = "360mu-LibraryScreen"
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LibraryScreen(
+    emulator: com.x360mu.core.NativeEmulator,
     onGameSelected: (String) -> Unit,
-    onSettingsClick: () -> Unit
+    onSettingsClick: () -> Unit,
+    onTestRenderClick: () -> Unit = {}
 ) {
     Log.i(TAG, "LibraryScreen composable rendering")
     
@@ -125,6 +127,18 @@ fun LibraryScreen(
                     }
                 },
                 actions = {
+                    // Test Render button
+                    IconButton(
+                        onClick = {
+                            Log.i(TAG, "Test Render button clicked")
+                            onTestRenderClick()
+                        }
+                    ) {
+                        Icon(
+                            Icons.Default.Build,
+                            contentDescription = "Test Render"
+                        )
+                    }
                     // Refresh button
                     if (romsFolderConfigured) {
                         IconButton(

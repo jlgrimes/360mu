@@ -345,7 +345,13 @@ public:
      * Present the frame
      */
     void present();
-    
+
+    /**
+     * Test render - draws a simple colored triangle for testing
+     * Call this to verify the rendering pipeline works without loading a game
+     */
+    void test_render();
+
     /**
      * Register read/write (for MMIO)
      */

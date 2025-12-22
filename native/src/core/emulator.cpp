@@ -523,6 +523,15 @@ void Emulator::resize_surface(u32 width, u32 height) {
     }
 }
 
+void Emulator::test_render() {
+    LOGI("Emulator::test_render() called");
+    if (gpu_) {
+        gpu_->test_render();
+    } else {
+        LOGE("test_render: GPU not initialized!");
+    }
+}
+
 void Emulator::set_frame_callback(FrameCallback callback) {
     frame_callback_ = std::move(callback);
 }

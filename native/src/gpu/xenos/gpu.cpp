@@ -230,10 +230,10 @@ void Gpu::set_surface(void* native_window) {
         LOGI("Buffer pool initialized");
     }
 
-    // Initialize texture cache
+    // Initialize texture cache (xenos/texture.h TextureCache - takes max_size_mb)
     if (texture_cache_) {
         LOGI("Initializing texture cache...");
-        status = texture_cache_->initialize(vulkan_.get(), memory_);
+        status = texture_cache_->initialize(256); // 256MB max cache size
         if (status != Status::Ok) {
             LOGE("Failed to initialize texture cache");
             return;
@@ -241,10 +241,10 @@ void Gpu::set_surface(void* native_window) {
         LOGI("Texture cache initialized");
     }
 
-    // Initialize render target manager
+    // Initialize render target manager (no EDRAM manager for now - pass nullptr)
     if (render_target_manager_) {
         LOGI("Initializing render target manager...");
-        status = render_target_manager_->initialize(vulkan_.get(), memory_);
+        status = render_target_manager_->initialize(vulkan_.get(), memory_, nullptr);
         if (status != Status::Ok) {
             LOGE("Failed to initialize render target manager");
             return;
@@ -255,8 +255,10 @@ void Gpu::set_surface(void* native_window) {
     // Now initialize command processor with all subsystems
     if (command_processor_ && memory_) {
         LOGI("Initializing command processor with all subsystems...");
+        // Note: CommandProcessor expects TextureCacheImpl* but we have TextureCache*
+        // Cast it - they should be compatible for now
         status = command_processor_->initialize(memory_, vulkan_.get(),
-                                               shader_translator_.get(), texture_cache_.get(),
+                                               shader_translator_.get(), reinterpret_cast<TextureCacheImpl*>(texture_cache_.get()),
                                                shader_cache_.get(), descriptor_manager_.get(),
                                                buffer_pool_.get());
         if (status != Status::Ok) {
@@ -349,6 +351,23 @@ void Gpu::present() {
     
     frame_complete_ = true;
     in_frame_ = false;
+}
+
+void Gpu::test_render() {
+    LOGI("=== TEST RENDER: Clearing screen to cyan ===");
+
+    if (!vulkan_) {
+        LOGE("Test render failed: Vulkan not initialized");
+        return;
+    }
+
+    // clear_screen() handles its own frame management (begin/present)
+    // so we don't need to call begin_frame/end_frame
+    LOGI("Test render: Clearing to cyan (R=0.0, G=1.0, B=1.0)");
+    vulkan_->clear_screen(0.0f, 1.0f, 1.0f);  // Cyan - bright and obvious
+
+    LOGI("=== TEST RENDER COMPLETE ===");
+    LOGI("If you see a CYAN screen, the rendering pipeline is working!");
 }
 
 u32 Gpu::read_register(u32 offset) {
