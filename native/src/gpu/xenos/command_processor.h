@@ -29,6 +29,7 @@ class ShaderTranslator;
 class TextureCacheImpl;
 class ShaderCache;
 class DescriptorManager;
+class BufferPool;
 struct CachedShader;
 struct CachedTexture;
 
@@ -177,7 +178,8 @@ public:
                      ShaderTranslator* shader_translator,
                      TextureCacheImpl* texture_cache,
                      ShaderCache* shader_cache = nullptr,
-                     DescriptorManager* descriptor_manager = nullptr);
+                     DescriptorManager* descriptor_manager = nullptr,
+                     BufferPool* buffer_pool = nullptr);
     
     /**
      * Shutdown
@@ -255,6 +257,7 @@ private:
     TextureCacheImpl* texture_cache_ = nullptr;
     ShaderCache* shader_cache_ = nullptr;
     DescriptorManager* descriptor_manager_ = nullptr;
+    BufferPool* buffer_pool_ = nullptr;
     
     // Current frame index for descriptor management
     u32 current_frame_index_ = 0;
@@ -263,6 +266,10 @@ private:
     const CachedShader* current_vertex_shader_ = nullptr;
     const CachedShader* current_pixel_shader_ = nullptr;
     VkPipeline current_pipeline_ = VK_NULL_HANDLE;
+
+    // Default fallback shaders (created once, used when game shaders fail)
+    CachedShader* default_vertex_shader_ = nullptr;
+    CachedShader* default_pixel_shader_ = nullptr;
     
     // GPU registers (complete register file)
     std::array<u32, 0x10000> registers_;
@@ -343,6 +350,11 @@ private:
     void bind_index_buffer(const DrawCommand& cmd);
     void update_constants();
     void bind_textures();
+
+    // Default shader management
+    void create_default_shaders();
+    void use_default_shaders();
+    void cleanup_default_shaders();
     
     // Register side effects
     void on_register_write(u32 index, u32 value);

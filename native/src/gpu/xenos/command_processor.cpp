@@ -19,6 +19,8 @@
 #include "gpu/shader_cache.h"
 #include "gpu/texture_cache.h"
 #include "gpu/descriptor_manager.h"
+#include "gpu/buffer_pool.h"
+#include "gpu/default_shaders.h"
 #include "memory/memory.h"
 #include "kernel/xobject.h"  // For GPU interrupt signaling
 #include <cstring>
@@ -134,28 +136,35 @@ Status CommandProcessor::initialize(Memory* memory, VulkanBackend* vulkan,
                                     ShaderTranslator* shader_translator,
                                     TextureCacheImpl* texture_cache,
                                     ShaderCache* shader_cache,
-                                    DescriptorManager* descriptor_manager) {
+                                    DescriptorManager* descriptor_manager,
+                                    BufferPool* buffer_pool) {
     memory_ = memory;
     vulkan_ = vulkan;
     shader_translator_ = shader_translator;
     texture_cache_ = texture_cache;
     shader_cache_ = shader_cache;
     descriptor_manager_ = descriptor_manager;
-    
+    buffer_pool_ = buffer_pool;
+
     reset();
-    
-    LOGI("Command processor initialized (shader_cache=%s, descriptors=%s)",
-         shader_cache ? "yes" : "no", descriptor_manager ? "yes" : "no");
+
+    LOGI("Command processor initialized (shader_cache=%s, descriptors=%s, buffer_pool=%s)",
+         shader_cache ? "yes" : "no", descriptor_manager ? "yes" : "no",
+         buffer_pool ? "yes" : "no");
     return Status::Ok;
 }
 
 void CommandProcessor::shutdown() {
+    // Clean up default shaders before clearing pointers
+    cleanup_default_shaders();
+
     memory_ = nullptr;
     vulkan_ = nullptr;
     shader_translator_ = nullptr;
     texture_cache_ = nullptr;
     shader_cache_ = nullptr;
     descriptor_manager_ = nullptr;
+    buffer_pool_ = nullptr;
     current_vertex_shader_ = nullptr;
     current_pixel_shader_ = nullptr;
     current_pipeline_ = VK_NULL_HANDLE;
@@ -1126,108 +1135,143 @@ void CommandProcessor::update_gpu_state() {
 }
 
 void CommandProcessor::execute_draw(const DrawCommand& cmd) {
-    if (!vulkan_) return;
-    
+    if (!vulkan_) {
+        LOGE("Draw skipped: no Vulkan backend");
+        return;
+    }
+
+    LOGD("=== DRAW CALL #%llu ===", (unsigned long long)draws_this_frame_ + 1);
+    LOGD("  Type: %s", cmd.indexed ? "Indexed" : "Non-indexed");
+    LOGD("  Primitive: %u", (u32)cmd.primitive_type);
+    if (cmd.indexed) {
+        LOGD("  Index count: %u, base: %08x, size: %u bytes",
+             cmd.index_count, cmd.index_base, cmd.index_size);
+    } else {
+        LOGD("  Vertex count: %u", cmd.vertex_count);
+    }
+
     // Start frame if not already in one
     if (!in_frame_) {
+        LOGD("  Starting new frame %u", current_frame_index_ + 1);
         if (vulkan_->begin_frame() != Status::Ok) {
-            LOGE("Failed to begin frame");
+            LOGE("  Failed to begin frame - aborting draw");
             return;
         }
         in_frame_ = true;
         current_frame_index_ = (current_frame_index_ + 1) % 3;
     }
-    
+
     // Prepare shaders from current GPU state
+    LOGD("  Preparing shaders...");
     if (!prepare_shaders()) {
-        LOGD("Draw skipped: shader preparation failed");
+        LOGW("  Draw skipped: shader preparation failed");
         return;
     }
-    
+    LOGD("  Shaders ready (vs=%p, ps=%p)",
+         (void*)current_vertex_shader_, (void*)current_pixel_shader_);
+
     // Prepare pipeline for the draw
+    LOGD("  Preparing pipeline...");
     if (!prepare_pipeline(cmd)) {
-        LOGD("Draw skipped: pipeline preparation failed");
+        LOGW("  Draw skipped: pipeline preparation failed");
         return;
     }
-    
+    LOGD("  Pipeline ready (%p)", (void*)current_pipeline_);
+
     // Update shader constants
+    LOGD("  Updating shader constants...");
     update_constants();
-    
+
     // Bind textures
+    LOGD("  Binding textures...");
     bind_textures();
-    
+
     // Bind descriptor set
     if (descriptor_manager_) {
+        LOGD("  Binding descriptor set...");
         VkDescriptorSet desc_set = descriptor_manager_->begin_frame(current_frame_index_);
         if (desc_set != VK_NULL_HANDLE) {
             vulkan_->bind_descriptor_set(desc_set);
+            LOGD("  Descriptor set bound");
+        } else {
+            LOGW("  No descriptor set available");
         }
     }
-    
+
     // Bind vertex and index buffers
-    bind_vertex_buffers(cmd);
     if (cmd.indexed) {
+        LOGD("  Binding index buffer...");
         bind_index_buffer(cmd);
     }
-    
+    bind_vertex_buffers(cmd);
+
     // Execute draw
+    LOGD("  Issuing Vulkan draw call...");
     if (cmd.indexed) {
-        vulkan_->draw_indexed(cmd.index_count, cmd.instance_count, cmd.start_index, 
+        vulkan_->draw_indexed(cmd.index_count, cmd.instance_count, cmd.start_index,
                              cmd.base_vertex, 0);
     } else {
         u32 vertex_count = cmd.vertex_count > 0 ? cmd.vertex_count : cmd.index_count;
         vulkan_->draw(vertex_count, cmd.instance_count, 0, 0);
     }
-    
+
     draws_this_frame_++;
-    
-    LOGD("Draw: %s, %u %s (pipeline=%p)", 
+
+    LOGI("Draw #%llu complete: %s, %u %s",
+         (unsigned long long)draws_this_frame_,
          cmd.indexed ? "indexed" : "non-indexed",
          cmd.indexed ? cmd.index_count : cmd.vertex_count,
-         cmd.indexed ? "indices" : "vertices",
-         (void*)current_pipeline_);
+         cmd.indexed ? "indices" : "vertices");
 }
 
 bool CommandProcessor::prepare_shaders() {
+    // If no shader cache or memory, use default shaders
     if (!shader_cache_ || !memory_) {
-        // No shader cache - use fallback behavior
-        current_vertex_shader_ = nullptr;
-        current_pixel_shader_ = nullptr;
-        return true;  // Allow draw to proceed without shaders for testing
+        LOGD("No shader cache/memory, using default shaders");
+        use_default_shaders();
+        return true;
     }
-    
+
     // Get shader addresses from GPU state
     GuestAddr vs_addr = render_state_.vertex_shader_address;
     GuestAddr ps_addr = render_state_.pixel_shader_address;
-    
+
+    // If shader addresses are not set yet, use defaults
     if (vs_addr == 0 || ps_addr == 0) {
-        LOGD("No shader addresses set (vs=%08x, ps=%08x)", vs_addr, ps_addr);
-        return false;
+        LOGD("No shader addresses set (vs=%08x, ps=%08x), using defaults", vs_addr, ps_addr);
+        use_default_shaders();
+        return true;
     }
-    
+
     // Get shader microcode from guest memory
     const void* vs_microcode = memory_->get_host_ptr(vs_addr);
     const void* ps_microcode = memory_->get_host_ptr(ps_addr);
-    
+
+    // Validate memory pointers
     if (!vs_microcode || !ps_microcode) {
-        LOGE("Failed to translate shader addresses");
-        return false;
+        LOGW("Failed to translate shader addresses (vs=%08x, ps=%08x), using defaults",
+             vs_addr, ps_addr);
+        use_default_shaders();
+        return true;
     }
-    
+
     // Get shader size from registers (or use default)
     // The size is typically determined by control flow instructions
     u32 vs_size = 2048;  // Default size, would be parsed from headers
     u32 ps_size = 2048;
-    
-    // Get or compile shaders
+
+    // Try to compile shaders from game microcode
     current_vertex_shader_ = shader_cache_->get_shader(vs_microcode, vs_size, ShaderType::Vertex);
     current_pixel_shader_ = shader_cache_->get_shader(ps_microcode, ps_size, ShaderType::Pixel);
-    
+
+    // If shader compilation failed, fall back to defaults
     if (!current_vertex_shader_ || !current_pixel_shader_) {
-        LOGD("Failed to get shaders");
-        return false;
+        LOGW("Shader compilation failed, using defaults");
+        use_default_shaders();
+        return true;
     }
-    
+
+    LOGD("Using game shaders (vs=%08x, ps=%08x)", vs_addr, ps_addr);
     return true;
 }
 
@@ -1313,50 +1357,64 @@ bool CommandProcessor::prepare_pipeline(const DrawCommand& cmd) {
 }
 
 void CommandProcessor::bind_vertex_buffers(const DrawCommand& cmd) {
-    // For now, vertex data comes through fetch constants
+    // Xbox 360 vertex data comes through fetch constants
+    // For now, we don't bind explicit vertex buffers - the shader uses
+    // vfetch instructions that read from fetch constants in the uniform buffer
+    //
     // A full implementation would:
     // 1. Parse vertex fetch constants to get buffer addresses and formats
-    // 2. Create/upload vertex buffers to GPU
+    // 2. Create/upload vertex buffers to GPU using buffer_pool_
     // 3. Bind them with vkCmdBindVertexBuffers
-    
-    // The vertex shader uses vfetch instructions that read from fetch constants
-    // This is handled by the shader constants uniform buffer
+    //
+    // This is Phase 2 work (shader translation needs vfetch support first)
+
+    if (!buffer_pool_ || !memory_ || !vulkan_) {
+        return;
+    }
+
+    // TODO: Implement vertex buffer binding once shader translator supports vfetch
+    // For now, vertex data is accessed directly in shaders via storage buffers
 }
 
 void CommandProcessor::bind_index_buffer(const DrawCommand& cmd) {
-    if (!cmd.indexed || cmd.index_base == 0 || !memory_) {
+    if (!cmd.indexed || cmd.index_base == 0 || !memory_ || !buffer_pool_) {
         return;
     }
-    
+
     // Get index data from guest memory
     const void* index_data = memory_->get_host_ptr(cmd.index_base);
     if (!index_data) {
-        LOGE("Failed to get host pointer for index buffer address %08x", cmd.index_base);
+        LOGW("Failed to get host pointer for index buffer address %08x", cmd.index_base);
         return;
     }
-    
+
     // Calculate index buffer size
-    u64 index_size = cmd.index_count * cmd.index_size;
-    
-    // Create and upload index buffer
-    // For now, this is a placeholder - a full implementation would
-    // cache index buffers and upload them efficiently
-    VulkanBuffer ib = vulkan_->create_buffer(
-        index_size,
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-    );
-    
-    if (ib.buffer != VK_NULL_HANDLE && ib.mapped) {
-        memcpy(ib.mapped, index_data, index_size);
-        
-        VkIndexType index_type = (cmd.index_size == 4) ? 
-                                  VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
-        vulkan_->bind_index_buffer(ib.buffer, 0, index_type);
-        
-        // Note: In production, we'd cache this buffer and destroy it later
-        // For now, we're leaking it - a proper implementation needs buffer pooling
+    size_t index_size = cmd.index_count * cmd.index_size;
+
+    // Allocate buffer from pool (automatically reuses old buffers)
+    VkBuffer index_buffer = buffer_pool_->allocate(index_size, current_frame_index_);
+    if (index_buffer == VK_NULL_HANDLE) {
+        LOGE("Failed to allocate index buffer from pool (size=%zu)", index_size);
+        return;
     }
+
+    // Get mapped pointer and copy index data
+    void* mapped = buffer_pool_->get_mapped_ptr(index_buffer);
+    if (!mapped) {
+        LOGE("Failed to get mapped pointer for index buffer");
+        return;
+    }
+
+    memcpy(mapped, index_data, index_size);
+
+    // Bind the index buffer
+    VkIndexType index_type = (cmd.index_size == 4) ?
+                              VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+    vulkan_->bind_index_buffer(index_buffer, 0, index_type);
+
+    LOGD("Bound index buffer: count=%u, size=%u, type=%s",
+         cmd.index_count, cmd.index_size,
+         index_type == VK_INDEX_TYPE_UINT32 ? "uint32" : "uint16");
 }
 
 void CommandProcessor::update_constants() {
@@ -1437,9 +1495,110 @@ void CommandProcessor::bind_textures() {
     }
 }
 
+//=============================================================================
+// Default Shader Management
+//=============================================================================
+
+void CommandProcessor::create_default_shaders() {
+    if (!vulkan_ || default_vertex_shader_ || default_pixel_shader_) {
+        return;  // Already created or no Vulkan backend
+    }
+
+    LOGI("Creating default fallback shaders");
+
+    // Get SPIR-V for default shaders
+    const std::vector<u32>& vs_spirv = get_default_vertex_shader_spirv();
+    const std::vector<u32>& ps_spirv = get_default_pixel_shader_spirv();
+
+    // Create vertex shader module
+    VkShaderModule vs_module = VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo vs_create_info{};
+    vs_create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    vs_create_info.codeSize = vs_spirv.size() * sizeof(u32);
+    vs_create_info.pCode = vs_spirv.data();
+
+    VkResult result = vkCreateShaderModule(vulkan_->device(), &vs_create_info, nullptr, &vs_module);
+    if (result != VK_SUCCESS) {
+        LOGE("Failed to create default vertex shader module");
+        return;
+    }
+
+    // Create pixel shader module
+    VkShaderModule ps_module = VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo ps_create_info{};
+    ps_create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    ps_create_info.codeSize = ps_spirv.size() * sizeof(u32);
+    ps_create_info.pCode = ps_spirv.data();
+
+    result = vkCreateShaderModule(vulkan_->device(), &ps_create_info, nullptr, &ps_module);
+    if (result != VK_SUCCESS) {
+        LOGE("Failed to create default pixel shader module");
+        vkDestroyShaderModule(vulkan_->device(), vs_module, nullptr);
+        return;
+    }
+
+    // Create cached shader entries
+    default_vertex_shader_ = new CachedShader();
+    default_vertex_shader_->hash = 0xDEFAULTVS;
+    default_vertex_shader_->type = ShaderType::Vertex;
+    default_vertex_shader_->module = vs_module;
+    default_vertex_shader_->spirv = vs_spirv;
+    default_vertex_shader_->uses_textures = false;
+    default_vertex_shader_->uses_vertex_fetch = false;
+    default_vertex_shader_->texture_bindings = 0;
+    default_vertex_shader_->vertex_fetch_bindings = 0;
+    default_vertex_shader_->interpolant_mask = 0;
+
+    default_pixel_shader_ = new CachedShader();
+    default_pixel_shader_->hash = 0xDEFAULTPS;
+    default_pixel_shader_->type = ShaderType::Pixel;
+    default_pixel_shader_->module = ps_module;
+    default_pixel_shader_->spirv = ps_spirv;
+    default_pixel_shader_->uses_textures = false;
+    default_pixel_shader_->uses_vertex_fetch = false;
+    default_pixel_shader_->texture_bindings = 0;
+    default_pixel_shader_->vertex_fetch_bindings = 0;
+    default_pixel_shader_->interpolant_mask = 0;
+
+    LOGI("Default shaders created successfully");
+}
+
+void CommandProcessor::use_default_shaders() {
+    // Create default shaders if they don't exist yet
+    if (!default_vertex_shader_ || !default_pixel_shader_) {
+        create_default_shaders();
+    }
+
+    // Use default shaders for current draw
+    current_vertex_shader_ = default_vertex_shader_;
+    current_pixel_shader_ = default_pixel_shader_;
+}
+
+void CommandProcessor::cleanup_default_shaders() {
+    if (vulkan_ && default_vertex_shader_) {
+        if (default_vertex_shader_->module != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(vulkan_->device(), default_vertex_shader_->module, nullptr);
+        }
+        delete default_vertex_shader_;
+        default_vertex_shader_ = nullptr;
+    }
+
+    if (vulkan_ && default_pixel_shader_) {
+        if (default_pixel_shader_->module != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(vulkan_->device(), default_pixel_shader_->module, nullptr);
+        }
+        delete default_pixel_shader_;
+        default_pixel_shader_ = nullptr;
+    }
+}
+
+//=============================================================================
+// Register Write Side Effects
+//=============================================================================
+
 void CommandProcessor::on_register_write(u32 index, u32 value) {
     // Handle side effects of register writes
-    
+
     switch (index) {
         case xenos_reg::CP_RB_WPTR:
             // Ring buffer write pointer updated - may need to process commands
