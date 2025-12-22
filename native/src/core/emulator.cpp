@@ -214,38 +214,73 @@ Status Emulator::load_game(const std::string& path) {
         LOGE("Emulator not initialized");
         return Status::Error;
     }
-    
+
     if (state_ == EmulatorState::Running) {
         LOGE("Cannot load game while running");
         return Status::Error;
     }
-    
-    LOGI("Loading game: %s", path.c_str());
-    
+
+    LOGI("========================================");
+    LOGI("LOAD GAME: %s", path.c_str());
+    LOGI("========================================");
+
     // Determine file type and mount appropriately
     std::string extension = path.substr(path.find_last_of('.'));
-    
+    LOGI("File extension: %s", extension.c_str());
+
     if (extension == ".xex" || extension == ".XEX") {
-        // Direct XEX file
-        Status status = kernel_->load_xex(path);
-        if (status != Status::Ok) {
-            LOGE("Failed to load XEX: %s", status_to_string(status));
-            return status;
+        // Check if this is a LIVE package or raw XEX
+        FILE* file = fopen(path.c_str(), "rb");
+        if (!file) {
+            LOGE("Failed to open file: %s", path.c_str());
+            return Status::IoError;
+        }
+
+        // Read first 4 bytes to check magic
+        u8 magic[4];
+        fread(magic, 1, 4, file);
+        fclose(file);
+
+        u32 magic_val = (magic[0] << 24) | (magic[1] << 16) | (magic[2] << 8) | magic[3];
+
+        if (magic_val == 0x4C495645 || magic_val == 0x50495253 || magic_val == 0x434F4E20) { // 'LIVE', 'PIRS', 'CON '
+            // STFS package (LIVE/PIRS/CON) - these contain encrypted metadata but the XEX data might be readable
+            LOGI("Detected STFS package (LIVE/PIRS/CON), attempting to find XEX...");
+
+            // For now, STFS packages with encrypted filenames are not supported
+            // The XEX loader can decrypt XEX files, but we need to extract them from STFS first
+            LOGE("STFS packages are not currently supported - filenames are encrypted");
+            LOGE("Please extract the default.xex file from the package using wxPirs, Velocity, or Horizon");
+            LOGE("Then load the extracted .xex file directly");
+            return Status::NotImplemented;
+        } else {
+            // Raw XEX file
+            LOGI("Loading direct XEX file...");
+            Status status = kernel_->load_xex(path);
+            if (status != Status::Ok) {
+                LOGE("Failed to load XEX: %s", status_to_string(status));
+                return status;
+            }
+            LOGI("XEX loaded successfully");
         }
     } else if (extension == ".iso" || extension == ".ISO") {
         // ISO image
+        LOGI("Mounting ISO image...");
         Status status = vfs_->mount_iso("\\Device\\Cdrom0", path);
         if (status != Status::Ok) {
             LOGE("Failed to mount ISO: %s", status_to_string(status));
             return status;
         }
-        
+        LOGI("ISO mounted successfully");
+
         // Look for default.xex in root
+        LOGI("Looking for default.xex in ISO...");
         status = kernel_->load_xex("\\Device\\Cdrom0\\default.xex");
         if (status != Status::Ok) {
             LOGE("Failed to load default.xex from ISO: %s", status_to_string(status));
             return status;
         }
+        LOGI("default.xex loaded successfully from ISO");
     } else {
         LOGE("Unknown file format: %s", extension.c_str());
         return Status::InvalidFormat;
@@ -273,24 +308,30 @@ Status Emulator::run() {
         LOGE("No game loaded");
         return Status::Error;
     }
-    
+
     if (state_ == EmulatorState::Running) {
         return Status::Ok; // Already running
     }
-    
-    LOGI("Starting emulation");
-    
+
+    LOGI("========================================");
+    LOGI("STARTING EMULATION");
+    LOGI("========================================");
+
     // Prepare the entry point (start main thread)
+    LOGI("Preparing entry point (main guest thread)...");
     kernel_->prepare_entry();
-    
+    LOGI("Entry point prepared");
+
     // Start emulation thread if not already started
     if (!emu_thread_->thread.joinable()) {
+        LOGI("Creating emulation thread...");
         emu_thread_->should_stop = false;
         emu_thread_->thread = std::thread([this]() {
             emulation_thread_main();
         });
+        LOGI("Emulation thread created");
     }
-    
+
     // Unpause
     {
         std::lock_guard<std::mutex> lock(emu_thread_->mutex);
@@ -298,8 +339,10 @@ Status Emulator::run() {
         emu_thread_->paused = false;
     }
     emu_thread_->cv.notify_all();
-    
+    LOGI("Emulation thread signaled to start");
+
     state_ = EmulatorState::Running;
+    LOGI("Emulation state set to RUNNING");
     return Status::Ok;
 }
 
@@ -365,33 +408,39 @@ void Emulator::step_frame() {
 }
 
 void Emulator::emulation_thread_main() {
-    LOGI("=== Emulation thread started ===");
-    
+    LOGI("========================================");
+    LOGI("=== EMULATION THREAD STARTED ===");
+    LOGI("========================================");
+
     using Clock = std::chrono::high_resolution_clock;
     auto last_frame_time = Clock::now();
     auto last_log_time = Clock::now();
     auto target_frame_time = FRAME_TIME_30FPS; // TODO: configurable
-    
+
     u64 loop_iterations = 0;
     u64 frames_since_log = 0;
-    
+
     while (!emu_thread_->should_stop) {
         // Wait for run signal or step
         {
             std::unique_lock<std::mutex> lock(emu_thread_->mutex);
-            LOGI("Emulation thread waiting (running=%d, paused=%d, stop=%d)",
-                 emu_thread_->running.load(), emu_thread_->paused.load(), 
-                 emu_thread_->should_stop.load());
-            
+            if (loop_iterations < 5) {  // Verbose logging for first 5 iterations
+                LOGI("Emulation thread waiting (iteration %llu, running=%d, paused=%d, stop=%d)",
+                     loop_iterations, emu_thread_->running.load(), emu_thread_->paused.load(),
+                     emu_thread_->should_stop.load());
+            }
+
             emu_thread_->cv.wait(lock, [this]() {
                 return emu_thread_->should_stop ||
                        (emu_thread_->running && !emu_thread_->paused) ||
                        emu_thread_->step_frame;
             });
-            
-            LOGI("Emulation thread woke up (running=%d, paused=%d, stop=%d)",
-                 emu_thread_->running.load(), emu_thread_->paused.load(),
-                 emu_thread_->should_stop.load());
+
+            if (loop_iterations < 5) {
+                LOGI("Emulation thread woke up (iteration %llu, running=%d, paused=%d, stop=%d)",
+                     loop_iterations, emu_thread_->running.load(), emu_thread_->paused.load(),
+                     emu_thread_->should_stop.load());
+            }
         }
         
         if (emu_thread_->should_stop) {
@@ -401,52 +450,73 @@ void Emulator::emulation_thread_main() {
         
         bool single_step = emu_thread_->step_frame.exchange(false);
         loop_iterations++;
-        
+
+        // Detailed logging for first few frames
+        bool verbose_log = (loop_iterations <= 5);
+
+        if (verbose_log) {
+            LOGI("========================================");
+            LOGI("Frame %llu starting...", loop_iterations);
+            LOGI("========================================");
+        }
+
         // Log periodically
         auto now = Clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 2) {
-            LOGI("Emulation loop: %llu iterations, %llu frames, %.1f FPS", 
+            LOGI("Emulation loop: %llu iterations, %llu frames, %.1f FPS",
                  loop_iterations, frames_since_log, stats_.fps);
             last_log_time = now;
             frames_since_log = 0;
         }
-        
+
         // Execute one frame
         auto frame_start = Clock::now();
-        
+
         // Start new frame - reset frame_complete flag
+        if (verbose_log) LOGI("  [Frame %llu] Beginning new frame on GPU...", loop_iterations);
         gpu_->begin_new_frame();
-        
+        if (verbose_log) LOGI("  [Frame %llu] GPU frame begun", loop_iterations);
+
         // Run CPU via the scheduler for multi-threaded execution
         bool frame_complete = false;
         u32 cpu_batches = 0;
-        
+
+        if (verbose_log) LOGI("  [Frame %llu] Starting CPU execution loop...", loop_iterations);
+
         while (!frame_complete && !emu_thread_->paused && !emu_thread_->should_stop) {
             // Execute via scheduler - this wakes host threads that run guest threads
+            if (verbose_log && cpu_batches < 3) LOGI("    [Batch %u] Running scheduler...", cpu_batches);
             scheduler_->run(cpu::CLOCK_SPEED / 60 / 100); // ~1/100th of a frame
             cpu_batches++;
-            
+
             // Process kernel work items (DPCs, timers, APCs)
             // This is critical for game initialization - DPCs signal completion events
             // that the main thread waits for before proceeding to GPU init
+            if (verbose_log && cpu_batches <= 3) LOGI("    [Batch %u] Processing kernel work items...", cpu_batches - 1);
             XKernel::instance().run_for(cpu::CLOCK_SPEED / 60 / 100);
-            
+
             // Process GPU command buffer
+            if (verbose_log && cpu_batches <= 3) LOGI("    [Batch %u] Processing GPU commands...", cpu_batches - 1);
             gpu_->process_commands();
-            
+
             // Check if GPU finished a frame
             frame_complete = gpu_->frame_complete();
-            
+
             // Process audio
             if (apu_) {
                 apu_->process();
             }
-            
+
             // Safety: if we've run too many batches without a frame, break
             if (cpu_batches >= 1000) {
                 LOGI("Frame taking too long, CPU executed %u batches", cpu_batches);
                 break;
             }
+        }
+
+        if (verbose_log) {
+            LOGI("  [Frame %llu] CPU execution complete: %u batches, frame_complete=%d",
+                 loop_iterations, cpu_batches, frame_complete);
         }
         
         // Present frame

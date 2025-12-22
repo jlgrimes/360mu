@@ -246,8 +246,20 @@ void Cpu::execute_with_context(u32 thread_id, ThreadContext& external_ctx, u64 c
     exec_call_count++;
     
     // Special tracking for the known stuck PC
+    static u64 stuck_lr_count = 0;
+    static GuestAddr last_stuck_lr = 0;
+
     if (external_ctx.pc == 0x825FB308) {
         stuck_pc_count++;
+
+        // Track if we're being called from the same LR repeatedly
+        if (external_ctx.lr == last_stuck_lr) {
+            stuck_lr_count++;
+        } else {
+            last_stuck_lr = external_ctx.lr;
+            stuck_lr_count = 1;
+        }
+
         if (stuck_pc_count == 1) {
             // Dump all registers on first hit
             LOGI("STUCK PC 0x825FB308 FIRST HIT:");
@@ -264,7 +276,7 @@ void Cpu::execute_with_context(u32 thread_id, ThreadContext& external_ctx, u64 c
             LOGI("  r13(PCR)=0x%08X", pcr);
             if (pcr > 0 && pcr < 0x20000000) {
                 u32 tls_ptr = memory_->read_u32(pcr + 0);  // PCR[0] = TLS pointer
-                
+
                 // Also read directly from fastmem for comparison
                 u8* fastmem = static_cast<u8*>(memory_->get_fastmem_base());
                 u32 tls_ptr_direct = 0;
@@ -273,7 +285,7 @@ void Cpu::execute_with_context(u32 thread_id, ThreadContext& external_ctx, u64 c
                     memcpy(&raw, fastmem + (pcr & 0x1FFFFFFF), sizeof(u32));
                     tls_ptr_direct = __builtin_bswap32(raw);  // Big-endian swap
                 }
-                
+
                 LOGI("  PCR[0](TLS ptr)=0x%08X, direct_fastmem=0x%08X", tls_ptr, tls_ptr_direct);
                 if (tls_ptr > 0 && tls_ptr < 0x20000000) {
                     LOGI("  TLS[0-7]: 0x%X 0x%X 0x%X 0x%X 0x%X 0x%X 0x%X 0x%X",
@@ -282,24 +294,30 @@ void Cpu::execute_with_context(u32 thread_id, ThreadContext& external_ctx, u64 c
                 }
             }
         } else if (stuck_pc_count == 100 || stuck_pc_count == 1000) {
-            LOGI("STUCK PC 0x825FB308: count=%llu, LR=0x%08llX, r3=0x%llX",
-                 stuck_pc_count, external_ctx.lr, external_ctx.gpr[3]);
+            LOGI("STUCK PC 0x825FB308: count=%llu, LR=0x%08llX, r3=0x%llX, LR_count=%llu",
+                 stuck_pc_count, external_ctx.lr, external_ctx.gpr[3], stuck_lr_count);
         }
-        
+
         // WORKAROUND: If the loop is stuck with an invalid destination pointer (r3 < 0x1000),
-        // force CTR to 0 to exit the loop. This happens when the game passes a bad pointer
-        // to a memset-like function.
-        if (stuck_pc_count >= 100 && external_ctx.gpr[3] < 0x1000) {
-            LOGI("WORKAROUND: Forcing CTR=0 to skip stuck memset loop with invalid ptr r3=0x%llX",
-                 external_ctx.gpr[3]);
-            external_ctx.ctr = 0;
+        // just pretend the memset succeeded by returning to the caller immediately.
+        // Don't actually write anything since the pointer is invalid.
+        if (stuck_pc_count >= 10 && external_ctx.gpr[3] < 0x1000) {
+            LOGI("WORKAROUND: Memset loop with invalid ptr r3=0x%llX - returning success to LR=0x%08llX",
+                 external_ctx.gpr[3], external_ctx.lr);
+            // Set r3 to the original destination pointer (memset returns dst)
+            // This makes it look like the function succeeded
+            external_ctx.pc = external_ctx.lr;  // Return to caller
+            external_ctx.ctr = 0;  // Reset CTR
             stuck_pc_count = 0;
+            stuck_lr_count = 0;
         }
     } else {
         if (stuck_pc_count > 0) {
-            LOGI("Left stuck PC after %llu iterations, now at PC=0x%08llX", 
+            LOGI("Left stuck PC after %llu iterations, now at PC=0x%08llX",
                  stuck_pc_count, external_ctx.pc);
             stuck_pc_count = 0;
+            stuck_lr_count = 0;
+            last_stuck_lr = 0;
         }
     }
     

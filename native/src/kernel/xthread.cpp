@@ -6,6 +6,7 @@
 
 #include "xthread.h"
 #include "xobject.h"
+#include "xkernel.h"
 #include "../cpu/xenon/cpu.h"
 #include "../memory/memory.h"
 #include <algorithm>
@@ -85,13 +86,19 @@ std::shared_ptr<XThread> XThread::create(
     
     // Assign to a CPU hardware thread (round-robin)
     thread->cpu_thread_id_ = thread->thread_id_ % 6;
-    
+
+    // Get the KPCR address for this CPU
+    GuestAddr kpcr = XKernel::instance().get_kpcr_address(thread->cpu_thread_id_);
+
+    // Write TLS address into KPCR[0] (games read TLS from PCR[0])
+    memory->write_u32(kpcr + 0x00, thread->tls_address_);
+
     // Set initial CPU state
     auto& ctx = cpu->get_context(thread->cpu_thread_id_);
     ctx.pc = entry_point;
     ctx.gpr[1] = thread->stack_limit_ - 0x100;  // Stack pointer (r1)
     ctx.gpr[3] = parameter;                      // First argument (r3)
-    ctx.gpr[13] = thread->tls_address_;          // TLS pointer (r13)
+    ctx.gpr[13] = kpcr;                          // PCR pointer (r13) - games read TLS from PCR[0]
     ctx.lr = 0;                                   // Return to kernel
     ctx.thread_id = thread->cpu_thread_id_;
     ctx.running = false;

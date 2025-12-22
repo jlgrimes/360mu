@@ -17,15 +17,31 @@ data class RomFile(
     val displayName: String,
     val extension: String,
     val size: Long,
-    val realPath: String? // Resolved file system path if available
+    val realPath: String?, // Resolved file system path if available
+    val type: GameType = when (extension.lowercase()) {
+        "iso" -> GameType.DISC
+        "xex" -> GameType.XBLA
+        else -> GameType.UNKNOWN
+    }
 )
+
+/**
+ * Type of game
+ */
+enum class GameType {
+    DISC,  // Full disc image (ISO)
+    XBLA,  // Xbox Live Arcade / Digital / Executable
+    UNKNOWN
+}
 
 /**
  * Scans folders for Xbox 360 ROM files
  */
 object RomScanner {
-    
-    // Supported ROM extensions
+
+    // Supported ROM extensions:
+    // - iso: Full game disc images
+    // - xex: Xbox executables (XBLA games, homebrew, direct executables)
     private val SUPPORTED_EXTENSIONS = setOf("iso", "xex")
     
     /**

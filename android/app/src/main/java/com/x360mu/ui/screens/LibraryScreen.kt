@@ -30,12 +30,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.x360mu.BuildConfig
 import com.x360mu.util.PreferencesManager
 import com.x360mu.util.RomFile
 import com.x360mu.util.RomScanner
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.*
 
 private const val TAG = "360mu-LibraryScreen"
 
@@ -123,6 +126,17 @@ fun LibraryScreen(
                             text = "Xbox 360 Emulator",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        // Version info
+                        val buildTime = remember {
+                            val timestamp = BuildConfig.BUILD_TIME.toLongOrNull() ?: 0L
+                            val sdf = SimpleDateFormat("MMM dd, HH:mm", Locale.US)
+                            sdf.format(Date(timestamp))
+                        }
+                        Text(
+                            text = "v${BuildConfig.VERSION_NAME} • Build ${BuildConfig.VERSION_CODE} • $buildTime",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
                         )
                     }
                 },
@@ -498,16 +512,27 @@ private fun GameCard(
                 
                 Spacer(modifier = Modifier.height(4.dp))
                 
-                Surface(
-                    shape = RoundedCornerShape(4.dp),
-                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.8f)
-                ) {
-                    Text(
-                        text = game.extension,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = Color.White,
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                    )
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    // Game type badge
+                    Surface(
+                        shape = RoundedCornerShape(4.dp),
+                        color = when (game.type) {
+                            com.x360mu.util.GameType.DISC -> MaterialTheme.colorScheme.primary.copy(alpha = 0.8f)
+                            com.x360mu.util.GameType.XBLA -> MaterialTheme.colorScheme.tertiary.copy(alpha = 0.8f)
+                            else -> MaterialTheme.colorScheme.secondary.copy(alpha = 0.8f)
+                        }
+                    ) {
+                        Text(
+                            text = when (game.type) {
+                                com.x360mu.util.GameType.DISC -> "DISC"
+                                com.x360mu.util.GameType.XBLA -> "XBLA"
+                                else -> game.extension
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color.White,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
                 }
             }
         }

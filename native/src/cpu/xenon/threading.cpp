@@ -262,12 +262,15 @@ GuestThread* ThreadScheduler::create_thread(GuestAddr entry_point, GuestAddr par
     thread->pcr_address = pcr_address;
     
     // Setup initial context
-    // r13 = TLS data address directly (games write to r13-relative addresses)
-    // The PCR model doesn't work because games zero their TLS area through r13
+    // Xbox 360 uses r13 to point to PCR (Processor Control Region)
+    // PCR[0] contains the TLS (Thread Local Storage) pointer
+    // Write TLS pointer into PCR[0]
+    memory_->write_u32(pcr_address + 0x00, tls_address);
+
     thread->context.pc = entry_point;
     thread->context.gpr[1] = thread->stack_limit - 0x100;  // Stack pointer (r1)
     thread->context.gpr[3] = param;                         // First argument (r3)
-    thread->context.gpr[13] = tls_address;                  // TLS data directly (NOT PCR!)
+    thread->context.gpr[13] = pcr_address;                  // PCR pointer (r13) - games read TLS from PCR[0]
     thread->context.lr = 0;                                 // Return to kernel on exit
     thread->context.running = false;
     thread->context.thread_id = thread->thread_id;
