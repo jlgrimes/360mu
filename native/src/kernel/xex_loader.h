@@ -214,9 +214,13 @@ struct XexModule {
     // Encryption/compression
     u32 encryption_type = 0;  // 0=none, 1=encrypted
     u32 compression_type = 0; // 0=none, 1=basic, 2=LZX
-    
+
     // Basic compression blocks (data_size, zero_size pairs)
     std::vector<std::pair<u32, u32>> compression_blocks;
+
+    // LZX compression info
+    u32 lzx_window_size = 0;  // Window size in bytes (for compression type 2)
+    u32 lzx_first_block_offset = 0;  // Offset to first LZX block data
     
     // Module handle for HLE
     u32 handle;

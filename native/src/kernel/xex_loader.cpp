@@ -263,13 +263,13 @@ Status XexLoader::parse_optional_headers(const u8* data, u32 size, u32 count) {
                     module_->compression_type = enc_comp & 0xFFFF;
                     LOGI("File format: size=%u, encryption=%u, compression=%u",
                          info_size, module_->encryption_type, module_->compression_type);
-                    
-                    // Store compression blocks if present (for basic compression)
+
+                    // Parse compression-specific data
                     if (module_->compression_type == 1 && info_size > 8) {
-                        // Parse compression blocks - each block is 8 bytes (data_size, zero_size)
+                        // Basic compression: parse blocks (data_size, zero_size pairs)
                         u32 block_count = (info_size - 8) / 8;
                         const u8* blocks = fmt + 8;
-                        LOGI("Parsing %u compression blocks:", block_count);
+                        LOGI("Parsing %u basic compression blocks:", block_count);
                         for (u32 b = 0; b < block_count && blocks + 8 <= data + size; b++) {
                             u32 data_size = read_u32_be(blocks);
                             u32 zero_size = read_u32_be(blocks + 4);
@@ -278,6 +278,10 @@ Status XexLoader::parse_optional_headers(const u8* data, u32 size, u32 count) {
                                  b, data_size, data_size, zero_size, zero_size);
                             blocks += 8;
                         }
+                    } else if (module_->compression_type == 2 && info_size >= 12) {
+                        // LZX compression: parse window size and first block offset
+                        module_->lzx_window_size = read_u32_be(fmt + 8);
+                        module_->lzx_first_block_offset = value + 12;
                     }
                 }
                 break;
@@ -431,11 +435,17 @@ Status XexLoader::parse_import_libraries(const u8* data, u32 offset, u32 data_si
             
             // Read the ordinal/type value
             u32 ordinal_value = read_u32_be(ptr); ptr += 4;
-            
-            // The ordinal value format:
-            // - High byte (bits 31-24): type/flags
-            // - Bits 23-0: ordinal number
-            entry.ordinal = ordinal_value & 0x00FFFFFF;
+
+            // The ordinal value format (based on Xenia):
+            // - High 16 bits (31-16): thunk address offset / table index
+            // - Low 16 bits (15-0): actual ordinal number
+            entry.ordinal = ordinal_value & 0x0000FFFF;  // Only use low 16 bits
+
+            // Debug: log suspicious ordinals
+            if (entry.ordinal > 1000) {
+                LOGW("Import ordinal %u (0x%X) is unusually high (raw: 0x%08X)",
+                     entry.ordinal, entry.ordinal, ordinal_value);
+            }
             
             // Check if there's a thunk address following (8-byte format)
             // The thunk address should be in the executable's address space
@@ -490,7 +500,7 @@ Status XexLoader::parse_pe_image(const u8* data, u32 offset, u32 raw_size) {
     
     // Make a copy of the encrypted data to work with
     std::vector<u8> working_data(data + offset, data + offset + raw_size);
-    
+
     // For basic compression, decryption happens block-by-block below
     // For other modes, decrypt the whole image first
     if (module_->encryption_type == 1 && module_->compression_type != 1) {
@@ -515,12 +525,15 @@ Status XexLoader::parse_pe_image(const u8* data, u32 offset, u32 raw_size) {
     if (module_->compression_type == 2) {
         // LZX compression
         LOGI("Decompressing LZX image...");
-        
+
+        // For LZX compression, the entire decrypted data is the LZX stream
+        // No block structure to parse - just decompress directly
         XexDecryptor decryptor;
         Status status = decryptor.decompress_lzx(
             working_data.data(), working_data.size(),
-            module_->image_data.data(), module_->image_size);
-        
+            module_->image_data.data(), module_->image_size,
+            module_->lzx_window_size);
+
         if (status != Status::Ok) {
             LOGW("LZX decompression failed, using raw data");
             // Fall back to copying raw data

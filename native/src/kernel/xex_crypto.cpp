@@ -204,7 +204,7 @@ void XexDecryptor::derive_key(const u8* file_key, u8* derived_key) {
     // Decrypt file key with retail key
     Aes128 master_aes;
     master_aes.set_key(retail_key_);
-    
+
     memcpy(derived_key, file_key, 16);
     master_aes.decrypt_ecb(derived_key, 16);
 }
@@ -224,7 +224,7 @@ Status XexDecryptor::decrypt_image(u8* data, u32 size, const u8* iv) {
         LOGE("XEX key not set");
         return Status::Error;
     }
-    
+
     aes_.decrypt_cbc(data, size, iv);
     return Status::Ok;
 }
@@ -286,17 +286,32 @@ Status XexDecryptor::decompress_lzx(const u8* src, u32 src_size,
                                      u8* dst, u32 dst_size,
                                      u32 window_size) {
     LzxDecompressor lzx;
-    
-    u32 window_bits = 17;
-    while ((1u << window_bits) < window_size && window_bits < 21) {
-        window_bits++;
+
+    // Convert window size (bytes) to window bits (power of 2)
+    // Find the highest bit set in window_size
+    u32 window_bits = 15;  // Minimum LZX window size
+    if (window_size > 0) {
+        window_bits = 0;
+        u32 temp = window_size;
+        while (temp > 1) {
+            temp >>= 1;
+            window_bits++;
+        }
+        // Ensure we have enough bits (round up if not exact power of 2)
+        if ((1u << window_bits) < window_size) {
+            window_bits++;
+        }
     }
-    
+
+    // Clamp to valid LZX range (15-21 bits)
+    if (window_bits < 15) window_bits = 15;
+    if (window_bits > 21) window_bits = 21;
+
     Status status = lzx.initialize(window_bits);
     if (status != Status::Ok) {
         return status;
     }
-    
+
     return lzx.decompress(src, src_size, dst, dst_size);
 }
 
@@ -443,19 +458,17 @@ Status LzxDecompressor::decompress(const u8* src, u32 src_size,
     MemoryFile input_file = { src, nullptr, src_size, 0, false };
     MemoryFile output_file = { nullptr, dst, dst_size, 0, true };
     
-    LOGD("LZX decompress: src=%u bytes -> dst=%u bytes, window_bits=%u",
-         src_size, dst_size, window_bits_);
-    
     // Initialize LZX decompressor
+    // Match Xenia's parameters: window_bits, reset_interval=0, input_buffer=0x8000
     struct lzxd_stream* lzx = lzxd_init(
         &mem_system,
         reinterpret_cast<struct mspack_file*>(&input_file),
         reinterpret_cast<struct mspack_file*>(&output_file),
         static_cast<int>(window_bits_),
-        0,              // reset_interval (0 = no reset)
-        4096,           // input buffer size
+        0,              // reset_interval (0 = no reset, frame_size * 32768)
+        0x8000,         // input buffer size (32KB, matching Xenia)
         static_cast<off_t>(dst_size),  // output length
-        0               // is_delta (0 = normal LZX)
+        0               // is_delta (0 = normal LZX, not DELTA compression)
     );
     
     if (!lzx) {
