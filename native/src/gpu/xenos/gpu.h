@@ -24,6 +24,10 @@ class VulkanBackend;
 class ShaderTranslator;
 class TextureCache;
 class CommandProcessor;
+class ShaderCache;
+class DescriptorManager;
+class BufferPool;
+class RenderTargetManager;
 
 /**
  * GPU configuration
@@ -419,7 +423,11 @@ private:
     // Subsystems
     std::unique_ptr<VulkanBackend> vulkan_;
     std::unique_ptr<ShaderTranslator> shader_translator_;
+    std::unique_ptr<ShaderCache> shader_cache_;
+    std::unique_ptr<DescriptorManager> descriptor_manager_;
+    std::unique_ptr<BufferPool> buffer_pool_;
     std::unique_ptr<TextureCache> texture_cache_;
+    std::unique_ptr<RenderTargetManager> render_target_manager_;
     std::unique_ptr<CommandProcessor> command_processor_;
     
     // Statistics

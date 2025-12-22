@@ -15,6 +15,11 @@
 #include "shader_translator.h"
 #include "texture.h"
 #include "gpu/vulkan/vulkan_backend.h"
+#include "gpu/shader_cache.h"
+#include "gpu/descriptor_manager.h"
+#include "gpu/buffer_pool.h"
+#include "gpu/texture_cache.h"
+#include "gpu/render_target.h"
 #include "memory/memory.h"
 #include <cstring>
 #include <cstdio>
@@ -50,13 +55,29 @@ Status Gpu::initialize(Memory* memory, const GpuConfig& config) {
     
     // Create Vulkan backend (defer full initialization until set_surface)
     vulkan_ = std::make_unique<VulkanBackend>();
-    
+
     // Create shader translator
     shader_translator_ = std::make_unique<ShaderTranslator>();
-    
+    if (shader_translator_->initialize(config.cache_path) != Status::Ok) {
+        LOGE("Failed to initialize shader translator");
+        return Status::ErrorInit;
+    }
+
+    // Create shader cache
+    shader_cache_ = std::make_unique<ShaderCache>();
+
+    // Create descriptor manager
+    descriptor_manager_ = std::make_unique<DescriptorManager>();
+
+    // Create buffer pool
+    buffer_pool_ = std::make_unique<BufferPool>();
+
     // Create texture cache
     texture_cache_ = std::make_unique<TextureCache>();
-    
+
+    // Create render target manager
+    render_target_manager_ = std::make_unique<RenderTargetManager>();
+
     // Create command processor
     command_processor_ = std::make_unique<CommandProcessor>();
     
@@ -80,15 +101,42 @@ void Gpu::shutdown() {
         command_processor_->shutdown();
         command_processor_.reset();
     }
-    
-    texture_cache_.reset();
-    shader_translator_.reset();
-    
+
+    if (render_target_manager_) {
+        render_target_manager_->shutdown();
+        render_target_manager_.reset();
+    }
+
+    if (texture_cache_) {
+        texture_cache_->shutdown();
+        texture_cache_.reset();
+    }
+
+    if (buffer_pool_) {
+        buffer_pool_->shutdown();
+        buffer_pool_.reset();
+    }
+
+    if (descriptor_manager_) {
+        descriptor_manager_->shutdown();
+        descriptor_manager_.reset();
+    }
+
+    if (shader_cache_) {
+        shader_cache_->shutdown();
+        shader_cache_.reset();
+    }
+
+    if (shader_translator_) {
+        shader_translator_->shutdown();
+        shader_translator_.reset();
+    }
+
     if (vulkan_) {
         vulkan_->shutdown();
         vulkan_.reset();
     }
-    
+
     memory_ = nullptr;
     LOGI("GPU shutdown complete");
 }
@@ -148,16 +196,73 @@ void Gpu::set_surface(void* native_window) {
         return;
     }
     LOGI("Vulkan initialized successfully");
-    
-    // Now initialize command processor with Vulkan backend
+
+    // Initialize shader cache
+    if (shader_cache_) {
+        LOGI("Initializing shader cache...");
+        status = shader_cache_->initialize(vulkan_.get(), shader_translator_.get(), config_.cache_path);
+        if (status != Status::Ok) {
+            LOGE("Failed to initialize shader cache");
+            return;
+        }
+        LOGI("Shader cache initialized");
+    }
+
+    // Initialize descriptor manager
+    if (descriptor_manager_) {
+        LOGI("Initializing descriptor manager...");
+        status = descriptor_manager_->initialize(vulkan_.get());
+        if (status != Status::Ok) {
+            LOGE("Failed to initialize descriptor manager");
+            return;
+        }
+        LOGI("Descriptor manager initialized");
+    }
+
+    // Initialize buffer pool
+    if (buffer_pool_) {
+        LOGI("Initializing buffer pool...");
+        status = buffer_pool_->initialize(vulkan_.get(), 3);  // 3 frames until reuse
+        if (status != Status::Ok) {
+            LOGE("Failed to initialize buffer pool");
+            return;
+        }
+        LOGI("Buffer pool initialized");
+    }
+
+    // Initialize texture cache
+    if (texture_cache_) {
+        LOGI("Initializing texture cache...");
+        status = texture_cache_->initialize(vulkan_.get(), memory_);
+        if (status != Status::Ok) {
+            LOGE("Failed to initialize texture cache");
+            return;
+        }
+        LOGI("Texture cache initialized");
+    }
+
+    // Initialize render target manager
+    if (render_target_manager_) {
+        LOGI("Initializing render target manager...");
+        status = render_target_manager_->initialize(vulkan_.get(), memory_);
+        if (status != Status::Ok) {
+            LOGE("Failed to initialize render target manager");
+            return;
+        }
+        LOGI("Render target manager initialized");
+    }
+
+    // Now initialize command processor with all subsystems
     if (command_processor_ && memory_) {
-        LOGI("Initializing command processor...");
-        status = command_processor_->initialize(memory_, vulkan_.get(), 
-                                           shader_translator_.get(), nullptr);
+        LOGI("Initializing command processor with all subsystems...");
+        status = command_processor_->initialize(memory_, vulkan_.get(),
+                                               shader_translator_.get(), texture_cache_.get(),
+                                               shader_cache_.get(), descriptor_manager_.get(),
+                                               buffer_pool_.get());
         if (status != Status::Ok) {
             LOGE("Failed to initialize command processor! Status=%d", static_cast<int>(status));
         } else {
-            LOGI("Command processor initialized");
+            LOGI("Command processor initialized with all subsystems");
         }
     }
     
