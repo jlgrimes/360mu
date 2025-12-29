@@ -70,7 +70,9 @@
       "Bash(powershell:*)",
       "Bash(git commit -m \"$\\(cat <<''EOF''\nImprove XEX LZX decompression infrastructure\n\n- Fix window_bits calculation to properly convert window size to bits\n- Add LZX compression info parsing \\(window_size, first_block_offset\\)\n- Match Xenia''s LZX decompressor parameters \\(0x8000 input buffer\\)\n- Add support for parsing compression type 2 \\(LZX\\) header data\n\nNote: LZX decompression still fails with MSPACK_ERR_DATAFORMAT.\nFurther investigation needed for proper block/chunk structure handling.\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\n\nCo-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
       "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd STFS package detection and Black Ops debugging improvements\n\n- Add STFS/LIVE package detection with helpful error message\n- Improve Black Ops stuck PC debugging \\(track LR call counts\\)\n- Add enhanced logging for game loading\n- Minor UI and scanner improvements\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\n\nCo-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
-      "Bash(rm:*)"
+      "Bash(rm:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd Windows build scripts and Black Ops debugging documentation\n\n## Build Scripts\n- Add build_temp.bat: Quick build script for Windows\n- Add rebuild_native.bat: Clean native rebuild script for Windows\n\n## Documentation\n- Add black_ops_debug_notes.md: Complete analysis of Black Ops issues\n  - Documents memset loop issue and workarounds\n  - Documents syscall spin loop blocker\n  - Explains why Black Ops is too complex for current emulator state\n  - Recommends testing simpler games first\n\n## Configuration\n- Update .claude/settings.local.json with build/debug command permissions\n\nThese scripts make Windows development easier and the Black Ops docs\nexplain why we''re pivoting to simpler test games like Kameo.\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\n\nCo-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git commit:*)"
     ]
   }
 }
