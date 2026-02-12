@@ -329,8 +329,16 @@ GuestThread* ThreadScheduler::create_thread(GuestAddr entry_point, GuestAddr par
     memory_->write_u8(kthread_addr + 0xBF, thread->thread_id % 6); // current_cpu
     memory_->write_u32(kthread_addr + 0xD0, thread->stack_base);   // stack_alloc_base
     
-    // 0x130: create_time
-    memory_->write_u64(kthread_addr + 0x130, 0);  // TODO: proper time
+    // 0x130: create_time (Windows FILETIME: 100ns intervals since Jan 1, 1601)
+    {
+        auto now = std::chrono::system_clock::now();
+        auto unix_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now.time_since_epoch()).count();
+        // Windows epoch offset: 11644473600 seconds between 1601 and 1970
+        constexpr u64 WINDOWS_EPOCH_OFFSET = 116444736000000000ULL;
+        u64 filetime = static_cast<u64>(unix_ns / 100) + WINDOWS_EPOCH_OFFSET;
+        memory_->write_u64(kthread_addr + 0x130, filetime);
+    }
     
     // 0x144-0x148: More list entries
     memory_->write_u32(kthread_addr + 0x144, kthread_addr + 0x144);
@@ -825,11 +833,18 @@ void ThreadScheduler::yield(GuestThread* thread) {
 
 void ThreadScheduler::sleep(GuestThread* thread, u64 nanoseconds) {
     if (!thread) return;
-    
+
     thread->state = ThreadState::Waiting;
     thread->wait_timeout = current_time_ + (nanoseconds / 100);  // Convert to ~cycles
-    
-    // TODO: Add to timer queue for wakeup
+
+    // 1:1 threading: actually block the host thread for the sleep duration
+    u64 timeout_ms = nanoseconds / 1000000;
+    if (timeout_ms == 0 && nanoseconds > 0) timeout_ms = 1;  // Minimum 1ms for non-zero sleeps
+    thread->block_until_signaled(timeout_ms);
+
+    // Wake up: restore thread to ready state
+    thread->state = ThreadState::Ready;
+    enqueue_thread(thread);
 }
 
 u32 ThreadScheduler::wait_for_object(GuestThread* thread, GuestAddr object, u64 timeout_ns) {

@@ -13,6 +13,7 @@
  */
 
 #include "command_processor.h"
+#include "edram.h"
 #include "shader_translator.h"
 #include "texture.h"
 #include "gpu/vulkan/vulkan_backend.h"
@@ -174,7 +175,8 @@ Status CommandProcessor::initialize(Memory* memory, VulkanBackend* vulkan,
                                     TextureCacheImpl* texture_cache,
                                     ShaderCache* shader_cache,
                                     DescriptorManager* descriptor_manager,
-                                    BufferPool* buffer_pool) {
+                                    BufferPool* buffer_pool,
+                                    EdramManager* edram) {
     memory_ = memory;
     vulkan_ = vulkan;
     shader_translator_ = shader_translator;
@@ -182,6 +184,7 @@ Status CommandProcessor::initialize(Memory* memory, VulkanBackend* vulkan,
     shader_cache_ = shader_cache;
     descriptor_manager_ = descriptor_manager;
     buffer_pool_ = buffer_pool;
+    edram_ = edram;
 
     // When descriptor_manager provides its own pipeline layout, override the
     // backend's layout so that pipeline creation and descriptor binding are
@@ -219,6 +222,7 @@ void CommandProcessor::shutdown() {
     shader_cache_ = nullptr;
     descriptor_manager_ = nullptr;
     buffer_pool_ = nullptr;
+    edram_ = nullptr;
     current_vertex_shader_ = nullptr;
     current_pixel_shader_ = nullptr;
     current_pipeline_ = VK_NULL_HANDLE;
@@ -1395,19 +1399,33 @@ void CommandProcessor::handle_cond_write(GuestAddr data_addr, u32 count) {
 
 void CommandProcessor::handle_surface_sync(GuestAddr data_addr, u32 count) {
     if (count < 1) return;
-    
-    // SURFACE_SYNC ensures all pending surface operations complete
-    // This is used for synchronization between render passes
-    
-    u32 sync_info = read_cmd(data_addr);
-    (void)sync_info;  // Currently a no-op in emulation
-    
-    // In a real implementation, this would:
-    // - Flush render target caches
-    // - Wait for outstanding draws to complete
-    // - Invalidate texture caches if needed
-    
-    LOGD("Surface sync");
+
+    u32 coher_cntl = read_cmd(data_addr);
+
+    // SURFACE_SYNC coher_cntl flags:
+    // bit 25: CB_ACTION_ENA (color buffer action - triggers resolve)
+    // bit 26: DB_ACTION_ENA (depth buffer action)
+    // bit 31: CB_DEST_BASE_ENA (destination base valid)
+    constexpr u32 CB_ACTION_ENA = 1u << 25;
+    constexpr u32 DB_ACTION_ENA = 1u << 26;
+    constexpr u32 CB_DEST_BASE_ENA = 1u << 31;
+
+    // Flush pending draws before any surface sync
+    flush_draw_batch();
+
+    if (coher_cntl & (CB_ACTION_ENA | CB_DEST_BASE_ENA)) {
+        // Color buffer resolve requested
+        execute_resolve();
+        LOGD("Surface sync: resolve (coher_cntl=%08X)", coher_cntl);
+    } else if (coher_cntl & DB_ACTION_ENA) {
+        // Depth buffer action
+        if (edram_) {
+            edram_->resolve_depth_stencil(memory_);
+        }
+        LOGD("Surface sync: depth action (coher_cntl=%08X)", coher_cntl);
+    } else {
+        LOGD("Surface sync: coher_cntl=%08X", coher_cntl);
+    }
 }
 
 void CommandProcessor::handle_event_write_shd(GuestAddr data_addr, u32 count) {
@@ -2655,6 +2673,75 @@ void CommandProcessor::cleanup_default_shaders() {
 // Register Write Side Effects
 //=============================================================================
 
+void CommandProcessor::execute_resolve() {
+    // Flush any pending draw calls before resolving
+    flush_draw_batch();
+
+    u32 copy_control = registers_[xenos_reg::RB_COPY_CONTROL];
+    u32 copy_src_select = copy_control & 0x7;        // bits 0-2: source (0-3=color RT, 4=depth)
+    u32 copy_command = (copy_control >> 20) & 0x3;   // bits 20-21: 0=resolve, 1=convert, 2=clear
+
+    u32 copy_dest_base = registers_[xenos_reg::RB_COPY_DEST_BASE];
+    u32 copy_dest_pitch_reg = registers_[xenos_reg::RB_COPY_DEST_PITCH];
+    u32 dest_pitch = copy_dest_pitch_reg & 0x3FFF;
+    u32 dest_height = (copy_dest_pitch_reg >> 16) & 0x3FFF;
+
+    if (copy_command == 2) {
+        // Clear command
+        if (edram_) {
+            if (copy_src_select < 4) {
+                edram_->clear_render_target(copy_src_select, 0.0f, 0.0f, 0.0f, 0.0f);
+            } else if (copy_src_select == 4) {
+                edram_->clear_depth_stencil(1.0f, 0);
+            }
+        }
+        LOGD("Resolve: clear src=%u", copy_src_select);
+        return;
+    }
+
+    // Resolve / convert command
+    if (copy_dest_base == 0 || dest_pitch == 0) {
+        LOGD("Resolve: invalid dest (addr=%08X, pitch=%u)", copy_dest_base, dest_pitch);
+        return;
+    }
+
+    u32 width = dest_pitch;
+    u32 height = dest_height > 0 ? dest_height : 720;
+
+    if (copy_src_select < 4 && edram_) {
+        // Color RT resolve: eDRAM → main memory
+        RenderTargetConfig rt_cfg = edram_->get_render_target(copy_src_select);
+        if (rt_cfg.enabled) {
+            u32 bpp = EdramManager::get_bytes_per_pixel(rt_cfg.format);
+            rt_cfg.resolve_address = copy_dest_base;
+            rt_cfg.resolve_pitch = width * bpp;
+            rt_cfg.resolve_width = width;
+            rt_cfg.resolve_height = height;
+            edram_->set_render_target(copy_src_select, rt_cfg);
+            edram_->resolve_render_target(copy_src_select, memory_);
+            LOGI("Resolve RT%u → %08X (%ux%u, bpp=%u)", copy_src_select,
+                 copy_dest_base, width, height, bpp);
+        }
+    } else if (copy_src_select == 4 && edram_) {
+        // Depth resolve
+        edram_->resolve_depth_stencil(memory_);
+        LOGD("Resolve depth → %08X (%ux%u)", copy_dest_base, width, height);
+    }
+
+    // Present after resolve - resolves typically mark end of a rendering pass
+    if (in_frame_ && vulkan_) {
+        GPU_END_FRAME();
+        if (vulkan_->has_debug_utils()) {
+            vulkan_->cmd_end_label();
+        }
+        vulkan_->end_frame();
+        frame_complete_ = true;
+        in_frame_ = false;
+        LOGD("Frame complete (resolve): %llu draws", (unsigned long long)draws_this_frame_);
+        draws_this_frame_ = 0;
+    }
+}
+
 void CommandProcessor::on_register_write(u32 index, u32 value) {
     // Trace register writes for GPU debug
     u32 old_val = (index < registers_.size()) ? registers_[index] : 0;
@@ -2724,11 +2811,8 @@ void CommandProcessor::on_register_write(u32 index, u32 value) {
             break;
             
         case xenos_reg::RB_COPY_CONTROL:
-            // Resolve initiated
-            if (value & 1) {
-                // TODO: Implement resolve
-                LOGD("Resolve triggered");
-            }
+            // Resolve initiated - copy eDRAM to main memory
+            execute_resolve();
             break;
             
         default:

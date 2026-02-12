@@ -8,6 +8,8 @@
 
 #include "xobject.h"
 #include <atomic>
+#include <condition_variable>
+#include <chrono>
 
 namespace x360mu {
 
@@ -109,6 +111,7 @@ private:
     std::atomic<s32> recursion_count_{0};
     bool abandoned_ = false;
     std::mutex acquire_mutex_;
+    std::condition_variable acquire_cv_;
 };
 
 /**

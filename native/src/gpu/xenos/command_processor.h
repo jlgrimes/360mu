@@ -31,6 +31,7 @@ class TextureCacheImpl;
 class ShaderCache;
 class DescriptorManager;
 class BufferPool;
+class EdramManager;
 struct CachedShader;
 struct CachedTexture;
 
@@ -188,7 +189,8 @@ public:
                      TextureCacheImpl* texture_cache,
                      ShaderCache* shader_cache = nullptr,
                      DescriptorManager* descriptor_manager = nullptr,
-                     BufferPool* buffer_pool = nullptr);
+                     BufferPool* buffer_pool = nullptr,
+                     EdramManager* edram = nullptr);
     
     /**
      * Shutdown
@@ -308,6 +310,7 @@ private:
     ShaderCache* shader_cache_ = nullptr;
     DescriptorManager* descriptor_manager_ = nullptr;
     BufferPool* buffer_pool_ = nullptr;
+    EdramManager* edram_ = nullptr;
     
     // Current frame index for descriptor management
     u32 current_frame_index_ = 0;
@@ -495,6 +498,9 @@ private:
     void tessellate_tri_patch(std::vector<f32>& out_vertices, u32 tess_level);
     void tessellate_quad_patch(std::vector<f32>& out_vertices, u32 tess_level);
     DrawCommand expand_rect_list(const DrawCommand& cmd);
+
+    // Resolve operations
+    void execute_resolve();
 
     // Register side effects
     void on_register_write(u32 index, u32 value);

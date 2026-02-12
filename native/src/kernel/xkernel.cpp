@@ -8,6 +8,7 @@
 #include "kernel.h"
 #include "../cpu/xenon/cpu.h"
 #include "../memory/memory.h"
+#include <chrono>
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -439,19 +440,33 @@ u32 XKernel::wait_for_single_object(GuestAddr object, u64 timeout_100ns) {
         return WAIT_TIMEOUT;
     }
     
-    // For now, do a simple poll/yield approach
-    // TODO: Implement proper blocking wait via XThread
+    // Try proper blocking wait via XThread
     auto current = get_current_thread();
     if (current) {
-        // Use the thread's wait mechanism
         auto event = get_or_create_event(object);
         if (event) {
             return current->wait(event.get(), timeout_100ns);
         }
     }
-    
-    // Fallback - brief yield then timeout
-    std::this_thread::yield();
+
+    // Fallback: poll with bounded spin for short timeouts
+    if (timeout_100ns != UINT64_MAX) {
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::microseconds(timeout_100ns / 10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            s32 sig = static_cast<s32>(memory_->read_u32(object + 4));
+            if (sig != 0) {
+                if (type == static_cast<u8>(XObjectType::SynchronizationEvent)) {
+                    memory_->write_u32(object + 4, 0);
+                } else if (type == static_cast<u8>(XObjectType::Semaphore)) {
+                    memory_->write_u32(object + 4, static_cast<u32>(sig - 1));
+                }
+                return WAIT_OBJECT_0;
+            }
+            std::this_thread::yield();
+        }
+    }
+
     return WAIT_TIMEOUT;
 }
 

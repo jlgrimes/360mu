@@ -152,41 +152,65 @@ XMutant::~XMutant() {
 }
 
 bool XMutant::acquire(XThread* thread, u64 timeout_100ns) {
-    (void)timeout_100ns;  // TODO: Implement timeout
-    
-    std::lock_guard<std::mutex> lock(acquire_mutex_);
-    
+    std::unique_lock<std::mutex> lock(acquire_mutex_);
+
     XThread* current_owner = owner_.load();
-    
+
     if (current_owner == nullptr) {
         // Not owned - acquire it
         owner_ = thread;
         recursion_count_ = 1;
         return true;
     }
-    
+
     if (current_owner == thread) {
         // Already owned by this thread - increment recursion
         recursion_count_++;
         return true;
     }
-    
-    // Owned by another thread - would need to wait
+
+    // Owned by another thread - wait with timeout
+    if (timeout_100ns == 0) {
+        return false;  // No wait requested
+    }
+
+    // Use condition variable to wait for release
+    auto predicate = [this]() { return owner_.load() == nullptr; };
+
+    bool acquired = false;
+    if (timeout_100ns == UINT64_MAX) {
+        // Infinite wait
+        acquire_cv_.wait(lock, predicate);
+        acquired = true;
+    } else {
+        // Convert 100ns units to chrono duration
+        auto timeout_us = std::chrono::microseconds(timeout_100ns / 10);
+        acquired = acquire_cv_.wait_for(lock, timeout_us, predicate);
+    }
+
+    if (acquired) {
+        owner_ = thread;
+        recursion_count_ = 1;
+        return true;
+    }
+
     return false;
 }
 
 s32 XMutant::release() {
     s32 prev_count = recursion_count_.load();
-    
+
     if (prev_count > 0) {
         recursion_count_--;
-        
+
         if (recursion_count_ == 0) {
             owner_ = nullptr;
             wake_waiters(1);
+            // Notify any threads blocked in acquire()
+            acquire_cv_.notify_one();
         }
     }
-    
+
     return prev_count;
 }
 

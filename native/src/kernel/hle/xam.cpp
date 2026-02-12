@@ -1038,19 +1038,159 @@ static void HLE_XamTaskCloseHandle(Cpu* cpu, Memory* memory, u64* args, u64* res
 //=============================================================================
 
 static void HLE_XSessionCreate(Cpu* cpu, Memory* memory, u64* args, u64* result) {
-    LOGD("XSessionCreate called - multiplayer disabled");
-    *result = ERROR_FUNCTION_FAILED;
+    // DWORD XSessionCreate(DWORD dwFlags, DWORD dwUserIndex, DWORD dwMaxPublicSlots,
+    //   DWORD dwMaxPrivateSlots, PXSESSION_INFO pSessionInfo, PXOVERLAPPED pOverlapped,
+    //   PHANDLE phSession)
+    u32 flags = static_cast<u32>(args[0]);
+    GuestAddr session_info_ptr = static_cast<GuestAddr>(args[4]);
+    GuestAddr overlapped = static_cast<GuestAddr>(args[5]);
+    GuestAddr handle_ptr = static_cast<GuestAddr>(args[6]);
+
+    LOGD("XSessionCreate: flags=0x%X", flags);
+
+    // Return a valid fake session handle so games don't crash
+    static u32 next_session_handle = 0x5000;
+    u32 session_handle = next_session_handle++;
+    if (handle_ptr) {
+        memory->write_u32(handle_ptr, session_handle);
+    }
+
+    // Fill session info with dummy XNKID
+    if (session_info_ptr) {
+        memory->zero_bytes(session_info_ptr, 0x30);
+        // Write a fake session ID
+        memory->write_u32(session_info_ptr, 0xDEADBEEF);
+    }
+
+    if (overlapped) {
+        memory->write_u32(overlapped + 0, ERROR_SUCCESS);
+        memory->write_u32(overlapped + 4, 0);
+        memory->write_u32(overlapped + 8, 0);
+    }
+
+    *result = ERROR_SUCCESS;
 }
 
 static void HLE_XSessionDelete(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr overlapped = static_cast<GuestAddr>(args[1]);
+    if (overlapped) {
+        memory->write_u32(overlapped + 0, ERROR_SUCCESS);
+        memory->write_u32(overlapped + 4, 0);
+        memory->write_u32(overlapped + 8, 0);
+    }
     *result = ERROR_SUCCESS;
 }
 
 static void HLE_XSessionStart(Cpu* cpu, Memory* memory, u64* args, u64* result) {
-    *result = ERROR_FUNCTION_FAILED;
+    GuestAddr overlapped = static_cast<GuestAddr>(args[2]);
+    if (overlapped) {
+        memory->write_u32(overlapped + 0, ERROR_SUCCESS);
+        memory->write_u32(overlapped + 4, 0);
+        memory->write_u32(overlapped + 8, 0);
+    }
+    *result = ERROR_SUCCESS;
 }
 
 static void HLE_XSessionEnd(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr overlapped = static_cast<GuestAddr>(args[1]);
+    if (overlapped) {
+        memory->write_u32(overlapped + 0, ERROR_SUCCESS);
+        memory->write_u32(overlapped + 4, 0);
+        memory->write_u32(overlapped + 8, 0);
+    }
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_XSessionSearchByID(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // Return no results - offline mode
+    GuestAddr overlapped = static_cast<GuestAddr>(args[4]);
+    if (overlapped) {
+        memory->write_u32(overlapped + 0, ERROR_SUCCESS);
+        memory->write_u32(overlapped + 4, 0);
+        memory->write_u32(overlapped + 8, 0);
+    }
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_XSessionSearch(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr results_ptr = static_cast<GuestAddr>(args[6]);
+    GuestAddr overlapped = static_cast<GuestAddr>(args[7]);
+
+    // Return 0 search results
+    if (results_ptr) {
+        memory->write_u32(results_ptr, 0);  // SearchResultsCount = 0
+    }
+    if (overlapped) {
+        memory->write_u32(overlapped + 0, ERROR_SUCCESS);
+        memory->write_u32(overlapped + 4, 0);
+        memory->write_u32(overlapped + 8, 0);
+    }
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_XSessionModify(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_XSessionJoinLocal(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr overlapped = static_cast<GuestAddr>(args[3]);
+    if (overlapped) {
+        memory->write_u32(overlapped + 0, ERROR_SUCCESS);
+        memory->write_u32(overlapped + 4, 0);
+        memory->write_u32(overlapped + 8, 0);
+    }
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_XSessionJoinRemote(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr overlapped = static_cast<GuestAddr>(args[3]);
+    if (overlapped) {
+        memory->write_u32(overlapped + 0, ERROR_SUCCESS);
+        memory->write_u32(overlapped + 4, 0);
+        memory->write_u32(overlapped + 8, 0);
+    }
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_XSessionLeaveLocal(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_XSessionLeaveRemote(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_XSessionFlushStats(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr overlapped = static_cast<GuestAddr>(args[1]);
+    if (overlapped) {
+        memory->write_u32(overlapped + 0, ERROR_SUCCESS);
+        memory->write_u32(overlapped + 4, 0);
+        memory->write_u32(overlapped + 8, 0);
+    }
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_XSessionWriteStats(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_XSessionGetDetails(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr buffer_ptr = static_cast<GuestAddr>(args[2]);
+    GuestAddr overlapped = static_cast<GuestAddr>(args[3]);
+
+    // Zero the output buffer
+    if (buffer_ptr) {
+        memory->zero_bytes(buffer_ptr, 0x100);
+    }
+    if (overlapped) {
+        memory->write_u32(overlapped + 0, ERROR_SUCCESS);
+        memory->write_u32(overlapped + 4, 0);
+        memory->write_u32(overlapped + 8, 0);
+    }
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_XSessionArbitrationRegister(Cpu* cpu, Memory* memory, u64* args, u64* result) {
     *result = ERROR_SUCCESS;
 }
 
@@ -1161,6 +1301,38 @@ static void HLE_NetDll_ntohl(Cpu* cpu, Memory* memory, u64* args, u64* result) {
 
 static void HLE_NetDll_inet_addr(Cpu* cpu, Memory* memory, u64* args, u64* result) {
     *result = 0;
+}
+
+static void HLE_NetDll_getpeername(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = static_cast<u64>(-1);  // SOCKET_ERROR
+}
+
+static void HLE_NetDll_getsockname(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = static_cast<u64>(-1);  // SOCKET_ERROR
+}
+
+static void HLE_NetDll_getsockopt(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = static_cast<u64>(-1);  // SOCKET_ERROR
+}
+
+static void HLE_NetDll_shutdown(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_NetDll_WSASetLastError(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // No-op - we don't track WSA error state
+}
+
+static void HLE_NetDll_XNetGetConnectStatus(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = 0;  // XNET_CONNECT_STATUS_IDLE
+}
+
+static void HLE_NetDll_XNetDnsLookup(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = static_cast<u64>(-1);  // Fail - no network
+}
+
+static void HLE_NetDll_XNetDnsRelease(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = ERROR_SUCCESS;
 }
 
 //=============================================================================
@@ -1333,6 +1505,17 @@ void Kernel::register_xam() {
     hle_functions_[make_import_key(1, 121)] = HLE_XSessionDelete;
     hle_functions_[make_import_key(1, 122)] = HLE_XSessionStart;
     hle_functions_[make_import_key(1, 123)] = HLE_XSessionEnd;
+    hle_functions_[make_import_key(1, 124)] = HLE_XSessionSearchByID;
+    hle_functions_[make_import_key(1, 125)] = HLE_XSessionSearch;
+    hle_functions_[make_import_key(1, 126)] = HLE_XSessionModify;
+    hle_functions_[make_import_key(1, 127)] = HLE_XSessionJoinLocal;
+    hle_functions_[make_import_key(1, 128)] = HLE_XSessionJoinRemote;
+    hle_functions_[make_import_key(1, 129)] = HLE_XSessionLeaveLocal;
+    hle_functions_[make_import_key(1, 133)] = HLE_XSessionLeaveRemote;
+    hle_functions_[make_import_key(1, 134)] = HLE_XSessionFlushStats;
+    hle_functions_[make_import_key(1, 135)] = HLE_XSessionWriteStats;
+    hle_functions_[make_import_key(1, 136)] = HLE_XSessionGetDetails;
+    hle_functions_[make_import_key(1, 137)] = HLE_XSessionArbitrationRegister;
     
     // Stats
     hle_functions_[make_import_key(1, 130)] = HLE_XamUserReadStats;
@@ -1360,7 +1543,15 @@ void Kernel::register_xam() {
     hle_functions_[make_import_key(2, 18)] = HLE_NetDll_htonl;
     hle_functions_[make_import_key(2, 19)] = HLE_NetDll_ntohl;
     hle_functions_[make_import_key(2, 20)] = HLE_NetDll_inet_addr;
+    hle_functions_[make_import_key(2, 21)] = HLE_NetDll_getpeername;
+    hle_functions_[make_import_key(2, 22)] = HLE_NetDll_getsockname;
+    hle_functions_[make_import_key(2, 23)] = HLE_NetDll_getsockopt;
     hle_functions_[make_import_key(2, 24)] = HLE_NetDll_WSAGetLastError;
+    hle_functions_[make_import_key(2, 25)] = HLE_NetDll_shutdown;
+    hle_functions_[make_import_key(2, 26)] = HLE_NetDll_WSASetLastError;
+    hle_functions_[make_import_key(2, 51)] = HLE_NetDll_XNetGetConnectStatus;
+    hle_functions_[make_import_key(2, 52)] = HLE_NetDll_XNetDnsLookup;
+    hle_functions_[make_import_key(2, 53)] = HLE_NetDll_XNetDnsRelease;
 
     // Also register NetDll_* under XAM ordinals (some games import them via xam.xex)
     hle_functions_[make_import_key(1, 651)] = HLE_NetDll_WSAStartup;
@@ -1378,7 +1569,10 @@ void Kernel::register_xam() {
     hle_functions_[make_import_key(1, 663)] = HLE_NetDll_select;
     hle_functions_[make_import_key(1, 664)] = HLE_NetDll_setsockopt;
     hle_functions_[make_import_key(1, 665)] = HLE_NetDll_ioctlsocket;
+    hle_functions_[make_import_key(1, 666)] = HLE_NetDll_getsockopt;
     hle_functions_[make_import_key(1, 667)] = HLE_NetDll_WSAGetLastError;
+    hle_functions_[make_import_key(1, 668)] = HLE_NetDll_WSASetLastError;
+    hle_functions_[make_import_key(1, 669)] = HLE_NetDll_shutdown;
 
     // Additional XAM functions
     hle_functions_[make_import_key(1, 25)] = HLE_XamContentFlush;

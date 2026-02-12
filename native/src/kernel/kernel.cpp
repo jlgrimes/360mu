@@ -419,8 +419,6 @@ void Kernel::set_scheduler(ThreadScheduler* scheduler) {
 }
 
 u32 Kernel::create_thread(GuestAddr entry, GuestAddr stack, u64 stack_size, u32 priority) {
-    (void)priority; // TODO: use priority
-    
     ThreadInfo info;
     info.handle = next_handle_++;
     info.thread_id = info.handle & 0xFFFF;
@@ -430,9 +428,28 @@ u32 Kernel::create_thread(GuestAddr entry, GuestAddr stack, u64 stack_size, u32 
     info.priority = priority;
     info.suspended = false;
     info.terminated = false;
-    
+
     threads_[info.handle] = info;
-    
+
+    // Apply priority to the scheduler if available
+    if (scheduler_) {
+        GuestThread* guest = scheduler_->get_thread_by_handle(info.handle);
+        if (guest) {
+            // Map Xbox 360 priority (0-31, lower=higher) to our ThreadPriority enum
+            if (priority <= 8) {
+                guest->priority = ThreadPriority::Highest;
+            } else if (priority <= 15) {
+                guest->priority = ThreadPriority::AboveNormal;
+            } else if (priority == 16) {
+                guest->priority = ThreadPriority::Normal;
+            } else if (priority <= 23) {
+                guest->priority = ThreadPriority::BelowNormal;
+            } else {
+                guest->priority = ThreadPriority::Lowest;
+            }
+        }
+    }
+
     return info.handle;
 }
 

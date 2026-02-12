@@ -871,9 +871,17 @@ static void HLE_RtlEnterCriticalSection(Cpu* cpu, Memory* memory, u64* args, u64
     s32 recursion_count = static_cast<s32>(memory->read_u32(cs + 8));
     u32 owning_thread = memory->read_u32(cs + 12);
     
-    // Get current thread ID (simplified)
-    u32 current_thread = 1;  // TODO: Get actual thread ID
-    
+    // Get current thread ID from scheduler
+    u32 current_thread = 0;
+    GuestThread* guest = GetCurrentGuestThread();
+    if (guest) {
+        current_thread = guest->thread_id;
+    } else if (g_scheduler) {
+        GuestThread* sched_thread = g_scheduler->get_current_thread(0);
+        if (sched_thread) current_thread = sched_thread->thread_id;
+    }
+    if (current_thread == 0) current_thread = 1;  // Fallback for main thread
+
     if (lock_count == -1) {
         // Unlocked - acquire
         memory->write_u32(cs + 4, 0);
@@ -909,8 +917,11 @@ static void HLE_RtlLeaveCriticalSection(Cpu* cpu, Memory* memory, u64* args, u64
         memory->write_u32(cs + 4, -1);
         memory->write_u32(cs + 8, 0);
         memory->write_u32(cs + 12, 0);
-        
-        // TODO: Wake waiting thread if any
+
+        // Wake waiting thread via scheduler signal on the CS address
+        if (g_scheduler) {
+            g_scheduler->signal_object(cs);
+        }
     }
     
     *result = STATUS_SUCCESS;
@@ -921,7 +932,15 @@ static void HLE_RtlTryEnterCriticalSection(Cpu* cpu, Memory* memory, u64* args, 
     
     s32 lock_count = static_cast<s32>(memory->read_u32(cs + 4));
     u32 owning_thread = memory->read_u32(cs + 12);
-    u32 current_thread = 1;  // TODO: Get actual thread ID
+    u32 current_thread = 0;
+    GuestThread* guest_try = GetCurrentGuestThread();
+    if (guest_try) {
+        current_thread = guest_try->thread_id;
+    } else if (g_scheduler) {
+        GuestThread* sched_thread = g_scheduler->get_current_thread(0);
+        if (sched_thread) current_thread = sched_thread->thread_id;
+    }
+    if (current_thread == 0) current_thread = 1;
     
     if (lock_count == -1) {
         // Unlocked - acquire

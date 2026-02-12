@@ -311,7 +311,7 @@ void Gpu::set_surface(void* native_window) {
         status = command_processor_->initialize(memory_, vulkan_.get(),
                                                shader_translator_.get(), reinterpret_cast<TextureCacheImpl*>(texture_cache_.get()),
                                                shader_cache_.get(), descriptor_manager_.get(),
-                                               buffer_pool_.get());
+                                               buffer_pool_.get(), edram_manager_.get());
         if (status != Status::Ok) {
             LOGE("Failed to initialize command processor! Status=%d", static_cast<int>(status));
         } else {
