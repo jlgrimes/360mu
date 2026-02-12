@@ -439,9 +439,9 @@ TEST_F(InterpreterExtTest, LoadStore_Sequence) {
 //=============================================================================
 
 TEST_F(InterpreterExtTest, Rlwinm_ExtractByte) {
-    // Extract byte 1 (bits 16-23): rlwinm rA, rS, 16, 24, 31
+    // Extract MSB byte (bits 0-7): rlwinm rA, rS, 8, 24, 31
     ctx.gpr[3] = 0xAABBCCDD;
-    execute_instruction(encode_rlwinm(5, 3, 16, 24, 31));
+    execute_instruction(encode_rlwinm(5, 3, 8, 24, 31));
     EXPECT_EQ(ctx.gpr[5], 0xAAULL);
 }
 

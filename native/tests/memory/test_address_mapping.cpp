@@ -71,7 +71,7 @@ AddressRouting route_address(GuestAddr addr) {
     if (addr >= KERNEL_SPACE_START) {
         // GPU virtual range (0xC0000000-0xC3FFFFFF) -> maps to GPU MMIO
         if (addr >= GPU_VIRT_START && addr < GPU_VIRT_END) {
-            u64 phys = GPU_MMIO_START + (addr - GPU_VIRT_START);
+            u64 phys = GPU_MMIO_START + ((addr - GPU_VIRT_START) & 0x3FFFFF);
             return {MemoryPath::MMIO, phys};
         }
         // All other kernel addresses -> MMIO (Memory class handles translation)

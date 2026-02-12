@@ -259,13 +259,13 @@ GuestAddr Memory::translate_address(GuestAddr addr) {
     // GPU MMIO virtual mapping: 0xC0000000-0xC3FFFFFF -> 0x7FC00000-0x7FFFFFFF
     // Common mapping used by Xbox 360 kernel for GPU register access
     if (addr >= 0xC0000000 && addr < 0xC4000000) {
-        return 0x7FC00000 + (addr - 0xC0000000);
+        return 0x7FC00000 + ((addr - 0xC0000000) & 0x3FFFFF);
     }
-    
+
     // Alternate GPU MMIO mapping: 0xEC800000+ -> 0x7FC00000+
     // Used by some games/engines
     if (addr >= 0xEC800000 && addr < 0xED000000) {
-        return 0x7FC00000 + (addr - 0xEC800000);
+        return 0x7FC00000 + ((addr - 0xEC800000) & 0x3FFFFF);
     }
     
     // Direct physical GPU MMIO access (already in range)

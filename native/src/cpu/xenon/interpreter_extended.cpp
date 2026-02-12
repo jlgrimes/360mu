@@ -215,44 +215,44 @@ void Interpreter::exec_integer_ext31(ThreadContext& ctx, const DecodedInst& d) {
             ctx.gpr[d.rd] = result;
             break;
             
-        // --- Logical ---
+        // --- Logical (X-form: RS=d.rd is source, RA=d.ra is destination) ---
         case 28: // and
-            result = ra & rb;
+            result = ctx.gpr[d.rd] & rb;
             ctx.gpr[d.ra] = result;
             break;
-            
+
         case 60: // andc
-            result = ra & ~rb;
+            result = ctx.gpr[d.rd] & ~rb;
             ctx.gpr[d.ra] = result;
             break;
-            
+
         case 444: // or
-            result = ra | rb;
+            result = ctx.gpr[d.rd] | rb;
             ctx.gpr[d.ra] = result;
             break;
-            
+
         case 412: // orc
-            result = ra | ~rb;
+            result = ctx.gpr[d.rd] | ~rb;
             ctx.gpr[d.ra] = result;
             break;
-            
+
         case 316: // xor
-            result = ra ^ rb;
+            result = ctx.gpr[d.rd] ^ rb;
             ctx.gpr[d.ra] = result;
             break;
-            
+
         case 124: // nor
-            result = ~(ra | rb);
+            result = ~(ctx.gpr[d.rd] | rb);
             ctx.gpr[d.ra] = result;
             break;
-            
+
         case 476: // nand
-            result = ~(ra & rb);
+            result = ~(ctx.gpr[d.rd] & rb);
             ctx.gpr[d.ra] = result;
             break;
-            
+
         case 284: // eqv
-            result = ~(ra ^ rb);
+            result = ~(ctx.gpr[d.rd] ^ rb);
             ctx.gpr[d.ra] = result;
             break;
             
