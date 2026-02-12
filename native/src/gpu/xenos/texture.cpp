@@ -99,6 +99,8 @@ u32 TextureDecompressor::get_bytes_per_block(TextureFormat format) {
         case TextureFormat::k_16_FLOAT:
             return 2;
             
+        case TextureFormat::k_Cr_Y1_Cb_Y0:
+        case TextureFormat::k_Y1_Cr_Y0_Cb:
         case TextureFormat::k_8_8_8_8:
         case TextureFormat::k_8_8_8_8_A:
         case TextureFormat::k_8_8_8_8_GAMMA:
@@ -642,6 +644,59 @@ void TextureFormatConverter::convert_to_rgba8(const u8* src, u8* dst,
             convert_rgba16f_to_rgba8(src, dst, pixel_count);
             break;
             
+        case TextureFormat::k_Cr_Y1_Cb_Y0:
+            // YUV 4:2:2 packed: each 32-bit word = [Cr, Y1, Cb, Y0] → 2 pixels
+            // pixel_count is the number of output RGBA pixels (width*height)
+            for (u32 i = 0; i < pixel_count / 2; i++) {
+                u8 cr = src[i * 4 + 0];
+                u8 y1 = src[i * 4 + 1];
+                u8 cb = src[i * 4 + 2];
+                u8 y0 = src[i * 4 + 3];
+                // Pixel 0 (Y0, Cb, Cr)
+                s32 r0 = y0 + ((s32)(1.402f * (cr - 128)));
+                s32 g0 = y0 - ((s32)(0.344f * (cb - 128))) - ((s32)(0.714f * (cr - 128)));
+                s32 b0 = y0 + ((s32)(1.772f * (cb - 128)));
+                dst[(i * 2) * 4 + 0] = static_cast<u8>(std::clamp(r0, 0, 255));
+                dst[(i * 2) * 4 + 1] = static_cast<u8>(std::clamp(g0, 0, 255));
+                dst[(i * 2) * 4 + 2] = static_cast<u8>(std::clamp(b0, 0, 255));
+                dst[(i * 2) * 4 + 3] = 255;
+                // Pixel 1 (Y1, Cb, Cr)
+                s32 r1 = y1 + ((s32)(1.402f * (cr - 128)));
+                s32 g1 = y1 - ((s32)(0.344f * (cb - 128))) - ((s32)(0.714f * (cr - 128)));
+                s32 b1 = y1 + ((s32)(1.772f * (cb - 128)));
+                dst[(i * 2 + 1) * 4 + 0] = static_cast<u8>(std::clamp(r1, 0, 255));
+                dst[(i * 2 + 1) * 4 + 1] = static_cast<u8>(std::clamp(g1, 0, 255));
+                dst[(i * 2 + 1) * 4 + 2] = static_cast<u8>(std::clamp(b1, 0, 255));
+                dst[(i * 2 + 1) * 4 + 3] = 255;
+            }
+            break;
+
+        case TextureFormat::k_Y1_Cr_Y0_Cb:
+            // YUV 4:2:2 packed: each 32-bit word = [Y1, Cr, Y0, Cb] → 2 pixels
+            for (u32 i = 0; i < pixel_count / 2; i++) {
+                u8 y1 = src[i * 4 + 0];
+                u8 cr = src[i * 4 + 1];
+                u8 y0 = src[i * 4 + 2];
+                u8 cb = src[i * 4 + 3];
+                // Pixel 0 (Y0, Cb, Cr)
+                s32 r0 = y0 + ((s32)(1.402f * (cr - 128)));
+                s32 g0 = y0 - ((s32)(0.344f * (cb - 128))) - ((s32)(0.714f * (cr - 128)));
+                s32 b0 = y0 + ((s32)(1.772f * (cb - 128)));
+                dst[(i * 2) * 4 + 0] = static_cast<u8>(std::clamp(r0, 0, 255));
+                dst[(i * 2) * 4 + 1] = static_cast<u8>(std::clamp(g0, 0, 255));
+                dst[(i * 2) * 4 + 2] = static_cast<u8>(std::clamp(b0, 0, 255));
+                dst[(i * 2) * 4 + 3] = 255;
+                // Pixel 1 (Y1, Cb, Cr)
+                s32 r1 = y1 + ((s32)(1.402f * (cr - 128)));
+                s32 g1 = y1 - ((s32)(0.344f * (cb - 128))) - ((s32)(0.714f * (cr - 128)));
+                s32 b1 = y1 + ((s32)(1.772f * (cb - 128)));
+                dst[(i * 2 + 1) * 4 + 0] = static_cast<u8>(std::clamp(r1, 0, 255));
+                dst[(i * 2 + 1) * 4 + 1] = static_cast<u8>(std::clamp(g1, 0, 255));
+                dst[(i * 2 + 1) * 4 + 2] = static_cast<u8>(std::clamp(b1, 0, 255));
+                dst[(i * 2 + 1) * 4 + 3] = 255;
+            }
+            break;
+
         case TextureFormat::k_32_FLOAT:
             // Single float channel
             for (u32 i = 0; i < pixel_count; i++) {

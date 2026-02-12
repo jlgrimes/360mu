@@ -1017,9 +1017,35 @@ void ShaderTranslator::translate_control_flow(TranslationContext& ctx, const Sha
                 }
                 break;
 
-            case xenos_cf::COND_CALL:
-                LOGD("COND_CALL: addr=%d (not supported in structured CF)", cf.address);
+            case xenos_cf::COND_CALL: {
+                // Conditional call: if bool constant matches condition, execute
+                // the exec clause at the target address. In structured SPIR-V we
+                // cannot do a real call, so we inline the target clause guarded
+                // by the bool constant condition (same pattern as COND_EXEC).
+                u32 bool_val = get_bool_constant(ctx, cf.bool_index);
+                if (!cf.condition) {
+                    bool_val = ctx.builder.logical_not(ctx.bool_type, bool_val);
+                }
+
+                u32 then_label = ctx.builder.allocate_id();
+                u32 merge_label = ctx.builder.allocate_id();
+
+                ctx.builder.selection_merge(merge_label, 0);
+                ctx.builder.branch_conditional(bool_val, then_label, merge_label);
+                ctx.builder.label(then_label);
+
+                // Execute the clause at cf.address - find matching CF instruction
+                const auto& cfs = microcode.cf_instructions();
+                if (cf.address < cfs.size()) {
+                    translate_exec_clause(ctx, cfs[cf.address], microcode);
+                }
+
+                ctx.builder.branch(merge_label);
+                ctx.builder.label(merge_label);
+
+                LOGD("COND_CALL: addr=%d, bool=%d, cond=%d", cf.address, cf.bool_index, cf.condition);
                 break;
+            }
 
             case xenos_cf::RETURN: {
                 // Early return from shader
@@ -1031,9 +1057,37 @@ void ShaderTranslator::translate_control_flow(TranslationContext& ctx, const Sha
                 break;
             }
 
-            case xenos_cf::COND_JMP:
-                LOGD("COND_JMP: addr=%d (approximated as noop)", cf.address);
+            case xenos_cf::COND_JMP: {
+                // Conditional jump: if condition matches, break out of
+                // current execution. In structured SPIR-V, we implement this
+                // as a conditional branch to end-of-shader (return) when
+                // inside a loop, or as a selection that skips the rest.
+                u32 bool_val = get_bool_constant(ctx, cf.bool_index);
+                if (!cf.condition) {
+                    bool_val = ctx.builder.logical_not(ctx.bool_type, bool_val);
+                }
+
+                if (!ctx.loop_stack.empty()) {
+                    // Inside a loop - emit conditional break
+                    auto& loop_info = ctx.loop_stack.back();
+                    u32 cont_label = ctx.builder.allocate_id();
+                    ctx.builder.selection_merge(cont_label, 0);
+                    ctx.builder.branch_conditional(bool_val, loop_info.merge_label, cont_label);
+                    ctx.builder.label(cont_label);
+                } else {
+                    // Outside loop - emit conditional early return
+                    u32 ret_label = ctx.builder.allocate_id();
+                    u32 cont_label = ctx.builder.allocate_id();
+                    ctx.builder.selection_merge(cont_label, 0);
+                    ctx.builder.branch_conditional(bool_val, ret_label, cont_label);
+                    ctx.builder.label(ret_label);
+                    ctx.builder.return_void();
+                    ctx.builder.label(cont_label);
+                }
+
+                LOGD("COND_JMP: addr=%d, bool=%d, cond=%d", cf.address, cf.bool_index, cf.condition);
                 break;
+            }
 
             case xenos_cf::MARK_VS_FETCH_DONE:
                 break;

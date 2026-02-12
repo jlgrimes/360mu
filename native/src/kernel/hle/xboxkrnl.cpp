@@ -1990,21 +1990,31 @@ static void HLE_MmSetAddressProtect(Cpu* cpu, Memory* memory, u64* args, u64* re
     LOGD("MmSetAddressProtect: 0x%08X, size=0x%X, prot=0x%X", addr, size, new_protect);
 }
 
+static void HLE_MmGetPhysicalAddress(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // PHYSICAL_ADDRESS MmGetPhysicalAddress(PVOID VirtualAddress);
+    // Simple identity mapping for emulation
+    GuestAddr virtual_addr = static_cast<GuestAddr>(args[0]);
+    *result = virtual_addr;
+}
+
 //=============================================================================
 // Registration
 //=============================================================================
 
 void Kernel::register_xboxkrnl() {
-    // Memory management
+    // Memory management - canonical ordinals (most games use these)
+    hle_functions_[make_import_key(0, 1)] = HLE_NtAllocateVirtualMemory;
+    hle_functions_[make_import_key(0, 10)] = HLE_NtFreeVirtualMemory;
     hle_functions_[make_import_key(0, 186)] = HLE_NtAllocateVirtualMemory;
     hle_functions_[make_import_key(0, 199)] = HLE_NtFreeVirtualMemory;
     hle_functions_[make_import_key(0, 206)] = HLE_NtQueryVirtualMemory;
     hle_functions_[make_import_key(0, 205)] = HLE_NtProtectVirtualMemory;
 
-    // IO space mapping
+    // IO space / memory mapping
     hle_functions_[make_import_key(0, 174)] = HLE_MmMapIoSpace;
     hle_functions_[make_import_key(0, 178)] = HLE_MmUnmapIoSpace;
-    hle_functions_[make_import_key(0, 172)] = HLE_MmQueryAddressProtect;
+    hle_functions_[make_import_key(0, 172)] = HLE_MmGetPhysicalAddress;
+    hle_functions_[make_import_key(0, 175)] = HLE_MmQueryAddressProtect;
     hle_functions_[make_import_key(0, 177)] = HLE_MmSetAddressProtect;
 
     // Section / memory-mapped file support
@@ -2017,6 +2027,7 @@ void Kernel::register_xboxkrnl() {
     hle_functions_[make_import_key(0, 84)] = HLE_KeSetAffinityThread;
     hle_functions_[make_import_key(0, 102)] = HLE_KeQueryPerformanceCounter;
     hle_functions_[make_import_key(0, 103)] = HLE_KeQueryPerformanceFrequency;
+    hle_functions_[make_import_key(0, 176)] = HLE_KeQueryPerformanceFrequency;
     hle_functions_[make_import_key(0, 40)] = HLE_KeDelayExecutionThread;
     
     // Synchronization - Events
@@ -2063,6 +2074,7 @@ void Kernel::register_xboxkrnl() {
     
     // Debug
     hle_functions_[make_import_key(0, 7)] = HLE_DbgPrint;
+    hle_functions_[make_import_key(0, 36)] = HLE_DbgPrint;
     
     // Exception handling
     hle_functions_[make_import_key(0, 284)] = HLE_RtlRaiseException;

@@ -182,6 +182,13 @@ public:
      * This converts from eDRAM tiled format to linear format in main memory
      */
     void resolve_render_target(u32 index, class Memory* memory);
+
+    /**
+     * Resolve a sub-rectangle of a render target to main memory
+     * (x, y) = top-left corner in pixels, (w, h) = dimensions in pixels
+     */
+    void resolve_render_target(u32 index, class Memory* memory,
+                               u32 src_x, u32 src_y, u32 w, u32 h);
     
     /**
      * Resolve depth buffer to main memory

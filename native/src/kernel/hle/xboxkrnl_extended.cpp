@@ -1913,8 +1913,34 @@ static void HLE_VdInitializeRingBuffer(Cpu* cpu, Memory* memory, u64* args, u64*
     // DWORD VdInitializeRingBuffer(PVOID RingBuffer, DWORD Size)
     GuestAddr ring_buffer = static_cast<GuestAddr>(args[0]);
     u32 size = static_cast<u32>(args[1]);
-    
+
     LOGI("VdInitializeRingBuffer: buffer=0x%08X, size=0x%X", ring_buffer, size);
+
+    // Configure GPU ring buffer registers via MMIO writes
+    // These writes go through the memory MMIO handler -> gpu_->write_register()
+    constexpr u32 CP_RB_BASE = 0x0700;
+    constexpr u32 CP_RB_CNTL = 0x0701;
+    constexpr u32 CP_RB_RPTR = 0x070D;
+    constexpr u32 CP_RB_WPTR = 0x070E;
+
+    // Set ring buffer base address
+    memory->write_u32(memory::GPU_REGS_BASE + CP_RB_BASE * 4, ring_buffer);
+
+    // Compute CP_RB_CNTL size order: GPU decodes as 1 << (val + 1) dwords
+    u32 dwords = size / 4;
+    u32 order = 0;
+    u32 tmp = dwords;
+    while (tmp > 1) { tmp >>= 1; order++; }
+    if (order > 0) order--;
+    memory->write_u32(memory::GPU_REGS_BASE + CP_RB_CNTL * 4, order);
+
+    // Reset read/write pointers
+    memory->write_u32(memory::GPU_REGS_BASE + CP_RB_RPTR * 4, 0);
+    memory->write_u32(memory::GPU_REGS_BASE + CP_RB_WPTR * 4, 0);
+
+    LOGI("VdInitializeRingBuffer: configured GPU rb_base=0x%08X, %u dwords (order=%u)",
+         ring_buffer, dwords, order);
+
     *result = 0;  // Success
 }
 
@@ -2017,8 +2043,15 @@ static void HLE_VdEnableRingBufferRPtrWriteBack(Cpu* cpu, Memory* memory, u64* a
     // void VdEnableRingBufferRPtrWriteBack(PVOID Address, DWORD BlockSize)
     GuestAddr addr = static_cast<GuestAddr>(args[0]);
     u32 block_size = static_cast<u32>(args[1]);
-    
+
     LOGI("VdEnableRingBufferRPtrWriteBack: addr=0x%08X, blockSize=%u", addr, block_size);
+
+    // Write RPTR writeback address to GPU register via MMIO
+    // The GPU will write its read pointer to this address so the CPU can track progress
+    constexpr u32 CP_RB_RPTR_ADDR = 0x070C;
+    memory->write_u32(memory::GPU_REGS_BASE + CP_RB_RPTR_ADDR * 4, addr);
+
+    LOGI("VdEnableRingBufferRPtrWriteBack: RPTR writeback at 0x%08X", addr);
     *result = 0;
 }
 
@@ -2079,10 +2112,12 @@ void Kernel::register_xboxkrnl_extended() {
     // Initialize extended HLE state
     g_ext_hle.init();
     
-    // Memory
+    // Memory - canonical ordinals
     hle_functions_[make_import_key(0, 113)] = HLE_MmAllocatePhysicalMemory;
     hle_functions_[make_import_key(0, 114)] = HLE_MmAllocatePhysicalMemoryEx;
+    hle_functions_[make_import_key(0, 164)] = HLE_MmAllocatePhysicalMemoryEx;
     hle_functions_[make_import_key(0, 116)] = HLE_MmFreePhysicalMemory;
+    hle_functions_[make_import_key(0, 165)] = HLE_MmFreePhysicalMemory;
     hle_functions_[make_import_key(0, 117)] = HLE_MmGetPhysicalAddress;
     hle_functions_[make_import_key(0, 118)] = HLE_MmMapIoSpace;
     hle_functions_[make_import_key(0, 119)] = HLE_MmUnmapIoSpace;
@@ -2111,6 +2146,7 @@ void Kernel::register_xboxkrnl_extended() {
     hle_functions_[make_import_key(0, 215)] = HLE_NtSuspendThread;
     
     // Time
+    hle_functions_[make_import_key(0, 48)] = HLE_KeQuerySystemTime;
     hle_functions_[make_import_key(0, 104)] = HLE_KeQuerySystemTime;
     hle_functions_[make_import_key(0, 101)] = HLE_KeQueryInterruptTime;
     hle_functions_[make_import_key(0, 208)] = HLE_NtQuerySystemTime;
@@ -2127,6 +2163,8 @@ void Kernel::register_xboxkrnl_extended() {
     hle_functions_[make_import_key(0, 41)] = HLE_InterlockedAnd;
     
     // Object
+    hle_functions_[make_import_key(0, 80)] = HLE_ObDereferenceObject;
+    hle_functions_[make_import_key(0, 81)] = HLE_ObReferenceObjectByHandle;
     hle_functions_[make_import_key(0, 140)] = HLE_ObReferenceObjectByHandle;
     hle_functions_[make_import_key(0, 139)] = HLE_ObDereferenceObject;
     hle_functions_[make_import_key(0, 138)] = HLE_ObCreateObject;

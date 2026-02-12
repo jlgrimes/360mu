@@ -510,6 +510,60 @@ void EdramManager::resolve_render_target(u32 index, Memory* memory) {
     LOGD("Resolved RT%u: %ux%u to %08X", index, width, height, rt.resolve_address);
 }
 
+void EdramManager::resolve_render_target(u32 index, Memory* memory,
+                                          u32 src_x, u32 src_y, u32 w, u32 h) {
+    if (index >= render_targets_.size() || !render_targets_[index].enabled || !memory) return;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    const auto& rt = render_targets_[index];
+    if (rt.resolve_address == 0) return;
+
+    u32 bpp = get_bytes_per_pixel(rt.format);
+    u32 full_w = rt.resolve_width;
+
+    // Clamp rect to surface bounds
+    u32 x0 = std::min(src_x, full_w);
+    u32 y0 = std::min(src_y, rt.resolve_height);
+    u32 x1 = std::min(src_x + w, full_w);
+    u32 y1 = std::min(src_y + h, rt.resolve_height);
+    u32 rect_w = x1 - x0;
+    u32 rect_h = y1 - y0;
+    if (rect_w == 0 || rect_h == 0) return;
+
+    std::vector<u8> temp(rect_w * rect_h * bpp);
+    u32 edram_start = rt.edram_base * 4;
+
+    for (u32 y = 0; y < rect_h; y++) {
+        for (u32 x = 0; x < rect_w; x++) {
+            u32 tile_offset = calculate_tile_offset(x0 + x, y0 + y, rt.edram_pitch, rt.msaa);
+            u32 src_offset = edram_start + tile_offset * bpp;
+            u32 dst_offset = (y * rect_w + x) * bpp;
+
+            if (src_offset + bpp <= data_.size()) {
+                if (rt.msaa != EdramMsaaMode::k1X) {
+                    u32 sample_count = (rt.msaa == EdramMsaaMode::k2X) ? 2 : 4;
+                    resolve_pixel(data_.data() + src_offset, temp.data() + dst_offset,
+                                 bpp, sample_count);
+                } else {
+                    memcpy(temp.data() + dst_offset, data_.data() + src_offset, bpp);
+                }
+            }
+        }
+    }
+
+    // Write to main memory at the correct offset within the destination surface
+    void* base_dst = memory->get_host_ptr(rt.resolve_address);
+    if (base_dst) {
+        for (u32 y = 0; y < rect_h; y++) {
+            u8* row_dst = static_cast<u8*>(base_dst) + (y0 + y) * rt.resolve_pitch + x0 * bpp;
+            memcpy(row_dst, temp.data() + y * rect_w * bpp, rect_w * bpp);
+        }
+    }
+
+    LOGD("Resolved RT%u subrect: (%u,%u) %ux%u to %08X", index, x0, y0, rect_w, rect_h, rt.resolve_address);
+}
+
 void EdramManager::resolve_depth_stencil(Memory* memory) {
     if (!depth_stencil_.enabled || !memory) return;
 

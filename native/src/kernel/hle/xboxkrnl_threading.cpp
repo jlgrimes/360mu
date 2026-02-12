@@ -1369,6 +1369,52 @@ static void HLE_KeCancelTimer(Cpu* cpu, Memory* memory, u64* args, u64* result) 
 }
 
 //=============================================================================
+// Additional Ordinal Aliases
+// Some games import these functions under alternate ordinal numbers.
+//=============================================================================
+
+/**
+ * NtWaitForSingleObjectEx - Wait for object with timeout (Ex variant)
+ *
+ * Ordinal: 32
+ * Same signature as NtWaitForSingleObject; the "Ex" just adds alertable semantics
+ * which our implementation already supports.
+ */
+static void HLE_NtWaitForSingleObjectEx(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // Identical to NtWaitForSingleObject - our impl already handles alertable
+    HLE_NtWaitForSingleObject(cpu, memory, args, result);
+}
+
+/**
+ * RtlInitAnsiString - Initialize ANSI_STRING from char*
+ *
+ * Ordinal: 182
+ *
+ * VOID RtlInitAnsiString(
+ *   PANSI_STRING DestString,  // arg[0] - pointer to ANSI_STRING { USHORT Length, USHORT MaxLength, PCHAR Buffer }
+ *   PCSTR SourceString        // arg[1] - null-terminated source string (or NULL)
+ * );
+ */
+static void HLE_RtlInitAnsiString_Alt(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr ansi_string = static_cast<GuestAddr>(args[0]);
+    GuestAddr source = static_cast<GuestAddr>(args[1]);
+
+    u16 length = 0;
+    if (source) {
+        while (memory->read_u8(source + length) != 0 && length < 0xFFFE) {
+            length++;
+        }
+    }
+
+    // ANSI_STRING: { USHORT Length, USHORT MaximumLength, PCHAR Buffer }
+    memory->write_u16(ansi_string, length);
+    memory->write_u16(ansi_string + 2, source ? (length + 1) : 0);
+    memory->write_u32(ansi_string + 4, source);
+
+    *result = 0;
+}
+
+//=============================================================================
 // Registration
 //=============================================================================
 
@@ -1460,6 +1506,14 @@ void register_xboxkrnl_threading(Kernel* kernel) {
     funcs[make_key(0, 134)] = HLE_KeRemoveQueueDpc;
     funcs[make_key(0, 153)] = HLE_KeSetImportanceDpc;
     funcs[make_key(0, 154)] = HLE_KeSetTargetProcessorDpc;
+
+    // Alternate ordinal aliases - some games import under different ordinal numbers.
+    // Only register if the ordinal is not already taken by another function.
+    funcs[make_key(0, 5)]   = HLE_NtClearEvent;              // alt ordinal for NtClearEvent
+    funcs[make_key(0, 11)]  = HLE_ExCreateThread;            // alt ordinal for ExCreateThread
+    funcs[make_key(0, 26)]  = HLE_NtSetEvent;                // alt ordinal for NtSetEvent
+    funcs[make_key(0, 32)]  = HLE_NtWaitForSingleObjectEx;   // NtWaitForSingleObjectEx
+    funcs[make_key(0, 182)] = HLE_RtlInitAnsiString_Alt;     // alt ordinal for RtlInitAnsiString
 
     LOGI("Registered xboxkrnl.exe threading HLE functions (%zu total)", funcs.size());
 }
