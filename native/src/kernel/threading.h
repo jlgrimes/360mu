@@ -20,8 +20,10 @@
 #include <unordered_map>
 #include <array>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <string>
 
 namespace x360mu {
@@ -86,6 +88,7 @@ enum class KernelWaitableType : u32 {
     Mutant = 3,
     Thread = 4,
     Timer = 5,
+    IoCompletion = 6,
 };
 
 //=============================================================================
@@ -96,10 +99,14 @@ struct KernelWaitable {
     KernelWaitableType type = KernelWaitableType::None;
     u32 handle = 0;
     std::string name;
-    
+
     // List of threads waiting on this object
     std::vector<GuestThread*> waiters;
-    
+
+    // Condition variable for proper blocking waits (avoids busy-wait)
+    std::mutex wait_mutex;
+    std::condition_variable wait_cv;
+
     virtual ~KernelWaitable() = default;
     virtual bool is_signaled() const = 0;
     virtual void on_wait_satisfied(GuestThread* thread) = 0;
@@ -165,6 +172,62 @@ struct KernelMutant : public KernelWaitable {
 // RTL_CRITICAL_SECTION Layout
 // 
 // Fast user-mode synchronization primitive stored in guest memory
+//=============================================================================
+
+//=============================================================================
+// Kernel Timer
+//=============================================================================
+
+struct KernelTimer : public KernelWaitable {
+    bool signaled = false;
+    bool active = false;
+    bool periodic = false;
+    u64 due_time_100ns = 0;      // Absolute time when timer fires
+    u64 period_100ns = 0;        // Period for periodic timers (0 = one-shot)
+    GuestAddr dpc_routine = 0;   // Optional DPC to fire when timer expires
+    GuestAddr dpc_context = 0;
+    GuestAddr dpc_arg1 = 0;
+    GuestAddr dpc_arg2 = 0;
+
+    KernelTimer() { type = KernelWaitableType::Timer; }
+
+    bool is_signaled() const override { return signaled; }
+
+    void on_wait_satisfied(GuestThread* thread) override {
+        // Auto-reset for synchronization timers
+        signaled = false;
+    }
+};
+
+//=============================================================================
+// I/O Completion Port
+//=============================================================================
+
+struct IoCompletionPacket {
+    GuestAddr key_context;
+    GuestAddr apc_context;
+    u32 status;
+    u32 bytes_transferred;
+};
+
+struct KernelIoCompletion : public KernelWaitable {
+    u32 max_concurrent_threads = 0;
+    std::deque<IoCompletionPacket> packet_queue;
+    std::mutex queue_mutex;
+
+    KernelIoCompletion() { type = KernelWaitableType::IoCompletion; }
+
+    bool is_signaled() const override {
+        return !packet_queue.empty();
+    }
+
+    void on_wait_satisfied(GuestThread* thread) override {
+        // Packet is dequeued by the caller
+    }
+};
+
+//=============================================================================
+// RTL_CRITICAL_SECTION Layout
 //=============================================================================
 
 struct RTL_CRITICAL_SECTION_LAYOUT {
@@ -435,7 +498,59 @@ public:
      * Duplicate a handle
      */
     u32 duplicate_handle(u32 source_handle, u32* target_handle);
-    
+
+    //=========================================================================
+    // Timer Management
+    //=========================================================================
+
+    /**
+     * Create a timer (NtCreateTimer)
+     */
+    u32 create_timer(u32* handle_out, u32 access_mask, GuestAddr obj_attr,
+                     u32 timer_type);
+
+    /**
+     * Set a timer (NtSetTimer)
+     * @param due_time Absolute or relative time in 100ns units
+     * @param period Period in milliseconds (0 = one-shot)
+     * @param dpc_routine Optional DPC routine
+     * @return Previous state, or error
+     */
+    u32 set_timer(u32 handle, s64 due_time, u32 period_ms,
+                  GuestAddr dpc_routine, GuestAddr dpc_context,
+                  bool resume, bool* prev_state);
+
+    /**
+     * Cancel a timer (NtCancelTimer)
+     */
+    u32 cancel_timer(u32 handle, bool* was_set);
+
+    /**
+     * Process expired timers (called from main loop)
+     */
+    void process_timer_queue();
+
+    //=========================================================================
+    // I/O Completion Port Management
+    //=========================================================================
+
+    /**
+     * Create an I/O completion port (NtCreateIoCompletion)
+     */
+    u32 create_io_completion(u32* handle_out, u32 access_mask, GuestAddr obj_attr,
+                             u32 max_concurrent_threads);
+
+    /**
+     * Set I/O completion (post a packet)
+     */
+    u32 set_io_completion(u32 handle, GuestAddr key_context, GuestAddr apc_context,
+                          u32 status, u32 bytes_transferred);
+
+    /**
+     * Remove I/O completion (dequeue a packet)
+     */
+    u32 remove_io_completion(u32 handle, IoCompletionPacket* packet_out, s64* timeout_100ns);
+
     //=========================================================================
     // Statistics
     //=========================================================================
@@ -445,6 +560,8 @@ public:
         u64 events_created;
         u64 semaphores_created;
         u64 mutants_created;
+        u64 timers_created;
+        u64 io_completions_created;
         u64 total_waits;
         u64 wait_timeouts;
     };

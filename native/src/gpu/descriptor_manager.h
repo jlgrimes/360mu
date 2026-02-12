@@ -103,10 +103,15 @@ public:
                       const VkSampler* samplers, u32 count);
     
     /**
-     * Get descriptor set layout
+     * Get descriptor set layout (set 0: UBOs + samplers)
      */
     VkDescriptorSetLayout get_layout() const { return layout_; }
-    
+
+    /**
+     * Get SSBO descriptor set layout (set 2: memexport storage buffers)
+     */
+    VkDescriptorSetLayout get_ssbo_layout() const { return ssbo_layout_; }
+
     /**
      * Get pipeline layout
      */
@@ -125,6 +130,7 @@ private:
     // Descriptor pool and layout
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout layout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout ssbo_layout_ = VK_NULL_HANDLE;  // Set 2: memexport SSBO
     VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
     
     // Per-frame resources

@@ -624,12 +624,16 @@ bool Memory::is_mmio(GuestAddr addr) const {
 }
 
 Memory::MmioRange* Memory::find_mmio(GuestAddr addr) {
+    // Find the most specific (smallest) matching range
+    MmioRange* best = nullptr;
     for (auto& handler : mmio_handlers_) {
         if (addr >= handler.base && addr < handler.base + handler.size) {
-            return &handler;
+            if (!best || handler.size < best->size) {
+                best = &handler;
+            }
         }
     }
-    return nullptr;
+    return best;
 }
 
 void Memory::track_writes(GuestAddr base, u64 size, WriteCallback callback) {

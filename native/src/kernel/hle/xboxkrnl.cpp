@@ -14,6 +14,7 @@
  */
 
 #include "../kernel.h"
+#include "../xobject.h"
 #include "../filesystem/vfs.h"
 #include "../../cpu/xenon/cpu.h"
 #include "../../cpu/xenon/threading.h"
@@ -130,6 +131,11 @@ enum FileInformationClass : u32 {
 //=============================================================================
 // Global HLE State
 //=============================================================================
+// Memory state constants
+constexpr u32 MEM_FREE = 0x10000;
+constexpr u32 MEM_IMAGE = 0x1000000;
+constexpr u32 LARGE_PAGE_SIZE = 64 * 1024;  // 64KB large pages on Xbox 360
+
 static struct HleState {
     // Virtual memory allocator state
     struct VirtualAllocation {
@@ -138,10 +144,34 @@ static struct HleState {
         u32 alloc_type;
         u32 protect;
         bool committed;
+        bool large_pages;
+        bool physical;       // MEM_PHYSICAL contiguous allocation
+        bool dirty;          // Page dirty tracking for save state
     };
     std::unordered_map<GuestAddr, VirtualAllocation> virtual_allocations;
     GuestAddr next_virtual_addr = 0x10000000;
+    GuestAddr next_physical_addr = 0x01000000;  // Physical allocations start at 16MB
     std::mutex alloc_mutex;
+
+    // Section objects for memory-mapped files
+    struct SectionObject {
+        u32 handle;
+        u64 max_size;
+        u32 protect;
+        u32 attributes;     // SEC_COMMIT, SEC_RESERVE, SEC_IMAGE
+        u32 file_handle;    // Associated file handle (0 = pagefile-backed)
+    };
+    std::unordered_map<u32, SectionObject> section_objects;
+    u32 next_section_handle = 0x400;
+
+    // IoSpace mappings (physical addr -> virtual addr)
+    struct IoMapping {
+        GuestAddr physical_addr;
+        GuestAddr virtual_addr;
+        u64 size;
+    };
+    std::vector<IoMapping> io_mappings;
+    GuestAddr next_io_virtual_addr = 0xE0000000;  // High virtual space for IO
     
     // File handle state
     struct FileHandle {
@@ -299,19 +329,24 @@ static void HLE_NtAllocateVirtualMemory(Cpu* cpu, Memory* memory, u64* args, u64
     GuestAddr requested_base = memory->read_u32(base_addr_ptr);
     u32 requested_size = memory->read_u32(region_size_ptr);
     
-    // Align size to page boundary (64KB on Xbox 360)
-    u32 aligned_size = align_up(requested_size, static_cast<u32>(memory::MEM_PAGE_SIZE));
-    if (aligned_size == 0) aligned_size = memory::MEM_PAGE_SIZE;
-    
+    // Determine alignment based on allocation type
+    bool use_large_pages = (alloc_type & MEM_LARGE_PAGES) != 0;
+    bool use_physical = (alloc_type & MEM_PHYSICAL) != 0;
+    u32 page_size = use_large_pages ? LARGE_PAGE_SIZE : memory::MEM_PAGE_SIZE;
+
+    // Align size to page boundary
+    u32 aligned_size = align_up(requested_size, page_size);
+    if (aligned_size == 0) aligned_size = page_size;
+
     std::lock_guard<std::mutex> lock(g_hle.alloc_mutex);
-    
+
     GuestAddr base_addr;
-    
+
     if (requested_base != 0) {
         // Caller requested specific address
-        base_addr = align_down(requested_base, static_cast<GuestAddr>(memory::MEM_PAGE_SIZE));
-        
-        // Check if already allocated
+        base_addr = align_down(requested_base, static_cast<GuestAddr>(page_size));
+
+        // Check if already allocated (exact match or containing region)
         auto it = g_hle.virtual_allocations.find(base_addr);
         if (it != g_hle.virtual_allocations.end()) {
             if (alloc_type & MEM_COMMIT) {
@@ -323,6 +358,13 @@ static void HLE_NtAllocateVirtualMemory(Cpu* cpu, Memory* memory, u64* args, u64
                 *result = STATUS_SUCCESS;
                 LOGD("NtAllocateVirtualMemory: commit 0x%08X, size=0x%X", base_addr, aligned_size);
                 return;
+            } else if (alloc_type & MEM_RESET) {
+                // MEM_RESET: hint that memory contents are no longer needed
+                it->second.dirty = false;
+                memory->write_u32(base_addr_ptr, base_addr);
+                memory->write_u32(region_size_ptr, aligned_size);
+                *result = STATUS_SUCCESS;
+                return;
             } else {
                 // Address conflict
                 *result = STATUS_CONFLICTING_ADDRESSES;
@@ -330,47 +372,59 @@ static void HLE_NtAllocateVirtualMemory(Cpu* cpu, Memory* memory, u64* args, u64
             }
         }
     } else {
-        // Find free address
-        if (alloc_type & MEM_TOP_DOWN) {
+        if (use_physical) {
+            // MEM_PHYSICAL: contiguous physical allocation from low memory
+            base_addr = align_up(g_hle.next_physical_addr, static_cast<GuestAddr>(page_size));
+            g_hle.next_physical_addr = base_addr + aligned_size;
+        } else if (alloc_type & MEM_TOP_DOWN) {
             base_addr = 0x7FFF0000 - aligned_size;  // Top-down allocation
         } else {
-            base_addr = g_hle.next_virtual_addr;
-            g_hle.next_virtual_addr += aligned_size + memory::MEM_PAGE_SIZE;  // Leave gap
+            base_addr = align_up(g_hle.next_virtual_addr, static_cast<GuestAddr>(page_size));
+            g_hle.next_virtual_addr = base_addr + aligned_size + page_size;  // Leave gap
         }
     }
-    
+
     // Ensure address is within valid range
     if (base_addr + aligned_size > memory::MAIN_MEMORY_SIZE) {
         // Try a different region
-        base_addr = 0x40000000 + (g_hle.virtual_allocations.size() * memory::MEM_PAGE_SIZE);
+        base_addr = 0x40000000 + (g_hle.virtual_allocations.size() * page_size);
+        if (base_addr + aligned_size > memory::MAIN_MEMORY_SIZE) {
+            *result = STATUS_NO_MEMORY;
+            LOGW("NtAllocateVirtualMemory: FAILED (OOM), size=0x%X", requested_size);
+            return;
+        }
     }
-    
+
     // Perform allocation
     u32 flags = protection_to_flags(protect);
     Status status = memory->allocate(base_addr, aligned_size, flags);
-    
+
     if (status == Status::Ok) {
-        // Track allocation
+        // Track allocation with extended flags
         g_hle.virtual_allocations[base_addr] = {
             .base = base_addr,
             .size = aligned_size,
             .alloc_type = alloc_type,
             .protect = protect,
-            .committed = (alloc_type & MEM_COMMIT) != 0
+            .committed = (alloc_type & MEM_COMMIT) != 0,
+            .large_pages = use_large_pages,
+            .physical = use_physical,
+            .dirty = false,
         };
-        
+
         // Zero memory if committed
         if (alloc_type & MEM_COMMIT) {
             memory->zero_bytes(base_addr, aligned_size);
         }
-        
+
         // Write back results
         memory->write_u32(base_addr_ptr, base_addr);
         memory->write_u32(region_size_ptr, aligned_size);
-        
+
         *result = STATUS_SUCCESS;
-        LOGD("NtAllocateVirtualMemory: 0x%08X, size=0x%X, type=0x%X, prot=0x%X", 
-             base_addr, aligned_size, alloc_type, protect);
+        LOGD("NtAllocateVirtualMemory: 0x%08X, size=0x%X, type=0x%X, prot=0x%X%s%s",
+             base_addr, aligned_size, alloc_type, protect,
+             use_large_pages ? " [LARGE]" : "", use_physical ? " [PHYS]" : "");
     } else {
         *result = STATUS_NO_MEMORY;
         LOGW("NtAllocateVirtualMemory: FAILED, size=0x%X", requested_size);
@@ -419,38 +473,65 @@ static void HLE_NtQueryVirtualMemory(Cpu* cpu, Memory* memory, u64* args, u64* r
     //   SIZE_T MemoryInformationLength,
     //   PSIZE_T ReturnLength
     // );
-    
+
     GuestAddr base_addr = static_cast<GuestAddr>(args[1]);
+    u32 info_class = static_cast<u32>(args[2]);
     GuestAddr info_ptr = static_cast<GuestAddr>(args[3]);
-    
+    u32 info_length = static_cast<u32>(args[4]);
+    GuestAddr return_length_ptr = static_cast<GuestAddr>(args[5]);
+
+    // MEMORY_BASIC_INFORMATION is 28 bytes (7 x u32)
+    constexpr u32 MBI_SIZE = 28;
+
+    if (info_length < MBI_SIZE) {
+        if (return_length_ptr) memory->write_u32(return_length_ptr, MBI_SIZE);
+        *result = STATUS_BUFFER_TOO_SMALL;
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(g_hle.alloc_mutex);
-    
+
     // Find containing allocation
     for (const auto& [addr, alloc] : g_hle.virtual_allocations) {
         if (base_addr >= addr && base_addr < addr + alloc.size) {
-            // MEMORY_BASIC_INFORMATION structure
+            // MEMORY_BASIC_INFORMATION structure (Xbox 360 layout)
             memory->write_u32(info_ptr + 0, addr);           // BaseAddress
             memory->write_u32(info_ptr + 4, addr);           // AllocationBase
             memory->write_u32(info_ptr + 8, alloc.protect);  // AllocationProtect
             memory->write_u32(info_ptr + 12, static_cast<u32>(alloc.size)); // RegionSize
-            memory->write_u32(info_ptr + 16, alloc.committed ? MEM_COMMIT : MEM_RESERVE); // State
-            memory->write_u32(info_ptr + 20, alloc.protect); // Protect
-            memory->write_u32(info_ptr + 24, MEM_PRIVATE);   // Type
-            
+            u32 state = alloc.committed ? MEM_COMMIT : MEM_RESERVE;
+            memory->write_u32(info_ptr + 16, state);         // State
+            memory->write_u32(info_ptr + 20, alloc.protect); // Protect (current)
+            u32 type = alloc.physical ? MEM_PHYSICAL : MEM_PRIVATE;
+            memory->write_u32(info_ptr + 24, type);          // Type
+
+            if (return_length_ptr) memory->write_u32(return_length_ptr, MBI_SIZE);
             *result = STATUS_SUCCESS;
+            LOGD("NtQueryVirtualMemory: 0x%08X -> base=0x%08X, size=0x%X, state=0x%X",
+                 base_addr, addr, static_cast<u32>(alloc.size), state);
             return;
         }
     }
-    
+
     // Not found - return free memory info
-    memory->write_u32(info_ptr + 0, base_addr);
-    memory->write_u32(info_ptr + 4, 0);
-    memory->write_u32(info_ptr + 8, 0);
-    memory->write_u32(info_ptr + 12, memory::MEM_PAGE_SIZE);
-    memory->write_u32(info_ptr + 16, 0);  // MEM_FREE
-    memory->write_u32(info_ptr + 20, 0);
-    memory->write_u32(info_ptr + 24, 0);
-    
+    // Compute free region size (distance to next allocation or end of address space)
+    GuestAddr next_alloc = 0x80000000;  // Default: end of user space
+    for (const auto& [addr, alloc] : g_hle.virtual_allocations) {
+        if (addr > base_addr && addr < next_alloc) {
+            next_alloc = addr;
+        }
+    }
+    u32 free_size = static_cast<u32>(next_alloc - base_addr);
+
+    memory->write_u32(info_ptr + 0, base_addr);         // BaseAddress
+    memory->write_u32(info_ptr + 4, 0);                  // AllocationBase (none)
+    memory->write_u32(info_ptr + 8, 0);                  // AllocationProtect (none)
+    memory->write_u32(info_ptr + 12, free_size);         // RegionSize
+    memory->write_u32(info_ptr + 16, MEM_FREE);          // State
+    memory->write_u32(info_ptr + 20, PAGE_NOACCESS);     // Protect
+    memory->write_u32(info_ptr + 24, 0);                 // Type
+
+    if (return_length_ptr) memory->write_u32(return_length_ptr, MBI_SIZE);
     *result = STATUS_SUCCESS;
 }
 
@@ -470,25 +551,33 @@ static void HLE_NtProtectVirtualMemory(Cpu* cpu, Memory* memory, u64* args, u64*
     
     GuestAddr base_addr = memory->read_u32(base_addr_ptr);
     u32 size = memory->read_u32(size_ptr);
-    
+
     std::lock_guard<std::mutex> lock(g_hle.alloc_mutex);
-    
-    auto it = g_hle.virtual_allocations.find(base_addr);
-    if (it != g_hle.virtual_allocations.end()) {
-        if (old_protect_ptr) {
-            memory->write_u32(old_protect_ptr, it->second.protect);
-        }
-        it->second.protect = new_protect;
-        
-        // Update memory protection
-        u32 flags = protection_to_flags(new_protect);
-        memory->protect(base_addr, size, flags);
-    } else {
-        if (old_protect_ptr) {
-            memory->write_u32(old_protect_ptr, PAGE_READWRITE);
+
+    // Find containing allocation (not just exact base match)
+    u32 old_prot = PAGE_READWRITE;
+    bool found = false;
+    for (auto& [addr, alloc] : g_hle.virtual_allocations) {
+        if (base_addr >= addr && base_addr < addr + alloc.size) {
+            old_prot = alloc.protect;
+            alloc.protect = new_protect;
+            alloc.dirty = true;  // Mark dirty on protection change
+            found = true;
+            break;
         }
     }
-    
+
+    if (old_protect_ptr) {
+        memory->write_u32(old_protect_ptr, old_prot);
+    }
+
+    // Always update memory subsystem protection
+    u32 flags = protection_to_flags(new_protect);
+    memory->protect(base_addr, size, flags);
+
+    LOGD("NtProtectVirtualMemory: 0x%08X, size=0x%X, prot=0x%X->0x%X%s",
+         base_addr, size, old_prot, new_protect, found ? "" : " [no alloc]");
+
     *result = STATUS_SUCCESS;
 }
 
@@ -1258,25 +1347,39 @@ static void HLE_NtSetInformationFile(Cpu* cpu, Memory* memory, u64* args, u64* r
 
 static void HLE_NtClose(Cpu* cpu, Memory* memory, u64* args, u64* result) {
     u32 handle = static_cast<u32>(args[0]);
-    
-    // Try VFS first
+
+    // Try VFS (file handles) first
     if (g_hle.vfs) {
         if (g_hle.vfs->close_file(handle) == Status::Ok) {
             *result = STATUS_SUCCESS;
             return;
         }
     }
-    
-    // Fallback
-    std::lock_guard<std::mutex> lock(g_hle.file_mutex);
-    
-    auto it = g_hle.file_handles.find(handle);
-    if (it != g_hle.file_handles.end()) {
-        it->second.file.close();
-        g_hle.file_handles.erase(it);
-        LOGD("NtClose: closed handle=%u", handle);
+
+    // Try local file handles
+    {
+        std::lock_guard<std::mutex> lock(g_hle.file_mutex);
+        auto it = g_hle.file_handles.find(handle);
+        if (it != g_hle.file_handles.end()) {
+            it->second.file.close();
+            g_hle.file_handles.erase(it);
+            LOGD("NtClose: closed file handle=0x%X", handle);
+            *result = STATUS_SUCCESS;
+            return;
+        }
     }
-    
+
+    // Try the unified kernel object table
+    auto& obj_table = KernelState::instance().object_table();
+    u32 status = obj_table.close_handle(handle);
+    if (status == nt_obj::STATUS_SUCCESS) {
+        LOGD("NtClose: closed kernel object handle=0x%X", handle);
+        *result = STATUS_SUCCESS;
+        return;
+    }
+
+    // Handle not found anywhere - still return success (Xbox 360 behavior)
+    LOGD("NtClose: handle=0x%X not found, returning success", handle);
     *result = STATUS_SUCCESS;
 }
 
@@ -1448,6 +1551,427 @@ static void HLE_KeReleaseMutant(Cpu* cpu, Memory* memory, u64* args, u64* result
 }
 
 //=============================================================================
+// Volume Information
+//=============================================================================
+
+// Volume information classes
+enum FsInformationClass : u32 {
+    FileFsVolumeInformation = 1,
+    FileFsLabelInformation = 2,
+    FileFsSizeInformation = 3,
+    FileFsDeviceInformation = 4,
+    FileFsAttributeInformation = 5,
+    FileFsFullSizeInformation = 7,
+};
+
+static void HLE_NtQueryVolumeInformationFile(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // NTSTATUS NtQueryVolumeInformationFile(
+    //   HANDLE FileHandle,
+    //   PIO_STATUS_BLOCK IoStatusBlock,
+    //   PVOID FsInformation,
+    //   ULONG Length,
+    //   FS_INFORMATION_CLASS FsInformationClass
+    // );
+
+    u32 handle = static_cast<u32>(args[0]);
+    GuestAddr io_status_ptr = static_cast<GuestAddr>(args[1]);
+    GuestAddr info_ptr = static_cast<GuestAddr>(args[2]);
+    u32 length = static_cast<u32>(args[3]);
+    u32 info_class = static_cast<u32>(args[4]);
+
+    switch (info_class) {
+        case FileFsSizeInformation: {
+            // FILE_FS_SIZE_INFORMATION
+            if (length < 24) { *result = STATUS_BUFFER_TOO_SMALL; return; }
+            memory->write_u64(info_ptr + 0, 1048576);      // TotalAllocationUnits (4GB / 4096)
+            memory->write_u64(info_ptr + 8, 524288);        // AvailableAllocationUnits (2GB free)
+            memory->write_u32(info_ptr + 16, 8);            // SectorsPerAllocationUnit
+            memory->write_u32(info_ptr + 20, 512);          // BytesPerSector
+            break;
+        }
+
+        case FileFsDeviceInformation: {
+            // FILE_FS_DEVICE_INFORMATION
+            if (length < 8) { *result = STATUS_BUFFER_TOO_SMALL; return; }
+            memory->write_u32(info_ptr + 0, 0x07);  // DeviceType = FILE_DEVICE_DISK
+            memory->write_u32(info_ptr + 4, 0x20);  // Characteristics
+            break;
+        }
+
+        case FileFsAttributeInformation: {
+            // FILE_FS_ATTRIBUTE_INFORMATION
+            if (length < 16) { *result = STATUS_BUFFER_TOO_SMALL; return; }
+            memory->write_u32(info_ptr + 0, 0x06);  // FileSystemAttributes (case-preserved + unicode)
+            memory->write_u32(info_ptr + 4, 255);   // MaximumComponentNameLength
+            memory->write_u32(info_ptr + 8, 8);     // FileSystemNameLength (4 chars * 2 bytes)
+            // Write "FATX" as Unicode
+            memory->write_u16(info_ptr + 12, 'F');
+            memory->write_u16(info_ptr + 14, 'A');
+            memory->write_u16(info_ptr + 16, 'T');
+            memory->write_u16(info_ptr + 18, 'X');
+            break;
+        }
+
+        case FileFsVolumeInformation: {
+            // FILE_FS_VOLUME_INFORMATION
+            if (length < 24) { *result = STATUS_BUFFER_TOO_SMALL; return; }
+            memory->write_u64(info_ptr + 0, 0);     // VolumeCreationTime
+            memory->write_u32(info_ptr + 8, 0x1234); // VolumeSerialNumber
+            memory->write_u32(info_ptr + 12, 0);    // VolumeLabelLength
+            memory->write_u8(info_ptr + 16, 0);     // SupportsObjects
+            break;
+        }
+
+        case FileFsFullSizeInformation: {
+            // FILE_FS_FULL_SIZE_INFORMATION
+            if (length < 32) { *result = STATUS_BUFFER_TOO_SMALL; return; }
+            memory->write_u64(info_ptr + 0, 1048576);      // TotalAllocationUnits
+            memory->write_u64(info_ptr + 8, 524288);        // CallerAvailableAllocationUnits
+            memory->write_u64(info_ptr + 16, 524288);       // ActualAvailableAllocationUnits
+            memory->write_u32(info_ptr + 24, 8);            // SectorsPerAllocationUnit
+            memory->write_u32(info_ptr + 28, 512);          // BytesPerSector
+            break;
+        }
+
+        default:
+            LOGW("NtQueryVolumeInformationFile: unhandled class %u", info_class);
+            memory->zero_bytes(info_ptr, length);
+            break;
+    }
+
+    if (io_status_ptr) {
+        memory->write_u32(io_status_ptr, STATUS_SUCCESS);
+        memory->write_u32(io_status_ptr + 4, length);
+    }
+
+    *result = STATUS_SUCCESS;
+    LOGD("NtQueryVolumeInformationFile: handle=%u, class=%u", handle, info_class);
+}
+
+static void HLE_NtFlushBuffersFile(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // NTSTATUS NtFlushBuffersFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock);
+    u32 handle = static_cast<u32>(args[0]);
+    GuestAddr io_status_ptr = static_cast<GuestAddr>(args[1]);
+
+    // VFS flush is a no-op (files are written through immediately)
+    (void)handle;
+
+    // Fallback flush for internal handles
+    std::lock_guard<std::mutex> lock(g_hle.file_mutex);
+    auto it = g_hle.file_handles.find(handle);
+    if (it != g_hle.file_handles.end()) {
+        it->second.file.flush();
+    }
+
+    if (io_status_ptr) {
+        memory->write_u32(io_status_ptr, STATUS_SUCCESS);
+        memory->write_u32(io_status_ptr + 4, 0);
+    }
+
+    *result = STATUS_SUCCESS;
+}
+
+static void HLE_NtDeviceIoControlFile(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // Stub - device I/O control not needed for game compatibility
+    u32 handle = static_cast<u32>(args[0]);
+    GuestAddr io_status_ptr = static_cast<GuestAddr>(args[4]);
+    u32 io_control_code = static_cast<u32>(args[5]);
+
+    LOGD("NtDeviceIoControlFile: handle=%u, ioctl=0x%08X (stubbed)", handle, io_control_code);
+
+    if (io_status_ptr) {
+        memory->write_u32(io_status_ptr, STATUS_SUCCESS);
+        memory->write_u32(io_status_ptr + 4, 0);
+    }
+
+    *result = STATUS_SUCCESS;
+}
+
+//=============================================================================
+// Virtual Memory: MmMapIoSpace, NtCreateSection, NtMapViewOfSection
+//=============================================================================
+
+static void HLE_MmMapIoSpace(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // PVOID MmMapIoSpace(
+    //   PHYSICAL_ADDRESS PhysicalAddress,  // arg[0] (64-bit on Xbox 360)
+    //   ULONG NumberOfBytes,               // arg[1]
+    //   ULONG CacheType                    // arg[2]
+    // );
+
+    GuestAddr phys_addr = static_cast<GuestAddr>(args[0]);
+    u32 num_bytes = static_cast<u32>(args[1]);
+    u32 cache_type = static_cast<u32>(args[2]);
+
+    (void)cache_type;
+
+    std::lock_guard<std::mutex> lock(g_hle.alloc_mutex);
+
+    // Check if this physical address is already mapped
+    for (const auto& mapping : g_hle.io_mappings) {
+        if (phys_addr >= mapping.physical_addr &&
+            phys_addr + num_bytes <= mapping.physical_addr + mapping.size) {
+            // Already mapped - return existing virtual address + offset
+            GuestAddr offset = phys_addr - mapping.physical_addr;
+            *result = mapping.virtual_addr + offset;
+            LOGD("MmMapIoSpace: phys=0x%08X already mapped -> virt=0x%08X",
+                 phys_addr, static_cast<u32>(*result));
+            return;
+        }
+    }
+
+    // Assign a virtual address for this IO mapping
+    u32 aligned_size = align_up(num_bytes, static_cast<u32>(memory::MEM_PAGE_SIZE));
+    GuestAddr virt_addr = g_hle.next_io_virtual_addr;
+    g_hle.next_io_virtual_addr += aligned_size;
+
+    // Track the mapping
+    g_hle.io_mappings.push_back({
+        .physical_addr = phys_addr,
+        .virtual_addr = virt_addr,
+        .size = aligned_size,
+    });
+
+    // If this is GPU register space, the MMIO handler will route access
+    // For regular physical memory, map it in the memory subsystem
+    if (phys_addr < memory::MAIN_MEMORY_SIZE) {
+        memory->allocate(virt_addr, aligned_size,
+                         MemoryRegion::Read | MemoryRegion::Write);
+        // Copy physical memory content to the virtual mapping
+        void* phys_ptr = memory->get_host_ptr(phys_addr);
+        void* virt_ptr = memory->get_host_ptr(virt_addr);
+        if (phys_ptr && virt_ptr) {
+            memcpy(virt_ptr, phys_ptr, num_bytes);
+        }
+    }
+
+    *result = virt_addr;
+    LOGI("MmMapIoSpace: phys=0x%08X -> virt=0x%08X, size=0x%X, cache=%u",
+         phys_addr, virt_addr, num_bytes, cache_type);
+}
+
+static void HLE_MmUnmapIoSpace(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // VOID MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes);
+    GuestAddr base_addr = static_cast<GuestAddr>(args[0]);
+    u32 num_bytes = static_cast<u32>(args[1]);
+
+    (void)num_bytes;
+
+    std::lock_guard<std::mutex> lock(g_hle.alloc_mutex);
+
+    for (auto it = g_hle.io_mappings.begin(); it != g_hle.io_mappings.end(); ++it) {
+        if (it->virtual_addr == base_addr) {
+            memory->free(base_addr);
+            g_hle.io_mappings.erase(it);
+            LOGD("MmUnmapIoSpace: virt=0x%08X unmapped", base_addr);
+            break;
+        }
+    }
+
+    *result = 0;
+}
+
+// Section attributes
+constexpr u32 SEC_COMMIT = 0x8000000;
+constexpr u32 SEC_RESERVE = 0x4000000;
+constexpr u32 SEC_IMAGE = 0x1000000;
+
+static void HLE_NtCreateSection(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // NTSTATUS NtCreateSection(
+    //   PHANDLE SectionHandle,              // arg[0] - out handle ptr
+    //   ACCESS_MASK DesiredAccess,           // arg[1]
+    //   POBJECT_ATTRIBUTES ObjectAttributes, // arg[2]
+    //   PLARGE_INTEGER MaximumSize,          // arg[3]
+    //   ULONG SectionPageProtection,         // arg[4]
+    //   ULONG AllocationAttributes,          // arg[5] - SEC_COMMIT etc.
+    //   HANDLE FileHandle                    // arg[6] - 0 for pagefile-backed
+    // );
+
+    GuestAddr handle_ptr = static_cast<GuestAddr>(args[0]);
+    u32 protect = static_cast<u32>(args[4]);
+    u32 attributes = static_cast<u32>(args[5]);
+    u32 file_handle = static_cast<u32>(args[6]);
+
+    // Read maximum size
+    u64 max_size = memory::MEM_PAGE_SIZE;  // Default 1 page
+    GuestAddr max_size_ptr = static_cast<GuestAddr>(args[3]);
+    if (max_size_ptr) {
+        max_size = memory->read_u64(max_size_ptr);
+        if (max_size == 0) max_size = memory::MEM_PAGE_SIZE;
+    }
+
+    std::lock_guard<std::mutex> lock(g_hle.alloc_mutex);
+
+    u32 handle = g_hle.next_section_handle++;
+    g_hle.section_objects[handle] = {
+        .handle = handle,
+        .max_size = max_size,
+        .protect = protect,
+        .attributes = attributes,
+        .file_handle = file_handle,
+    };
+
+    memory->write_u32(handle_ptr, handle);
+
+    *result = STATUS_SUCCESS;
+    LOGD("NtCreateSection: handle=0x%X, maxsize=0x%llX, prot=0x%X, attr=0x%X, file=0x%X",
+         handle, static_cast<unsigned long long>(max_size), protect, attributes, file_handle);
+}
+
+static void HLE_NtMapViewOfSection(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // NTSTATUS NtMapViewOfSection(
+    //   HANDLE SectionHandle,       // arg[0]
+    //   HANDLE ProcessHandle,       // arg[1] - ignored
+    //   PVOID *BaseAddress,         // arg[2] - in/out
+    //   ULONG_PTR ZeroBits,         // arg[3]
+    //   SIZE_T CommitSize,          // arg[4]
+    //   PLARGE_INTEGER SectionOffset, // arg[5]
+    //   PSIZE_T ViewSize,           // arg[6] - in/out
+    //   SECTION_INHERIT InheritDisposition, // arg[7]
+    //   ULONG AllocationType,       // arg[8]
+    //   ULONG Win32Protect          // arg[9]
+    // );
+
+    u32 section_handle = static_cast<u32>(args[0]);
+    GuestAddr base_addr_ptr = static_cast<GuestAddr>(args[2]);
+    GuestAddr view_size_ptr = static_cast<GuestAddr>(args[6]);
+    u32 protect = static_cast<u32>(args[9]);
+
+    std::lock_guard<std::mutex> lock(g_hle.alloc_mutex);
+
+    auto it = g_hle.section_objects.find(section_handle);
+    if (it == g_hle.section_objects.end()) {
+        *result = STATUS_INVALID_HANDLE;
+        return;
+    }
+
+    auto& section = it->second;
+
+    // Determine view size
+    u32 view_size = 0;
+    if (view_size_ptr) {
+        view_size = memory->read_u32(view_size_ptr);
+    }
+    if (view_size == 0) {
+        view_size = static_cast<u32>(section.max_size);
+    }
+    u32 aligned_size = align_up(view_size, static_cast<u32>(memory::MEM_PAGE_SIZE));
+
+    // Determine base address
+    GuestAddr base_addr = 0;
+    if (base_addr_ptr) {
+        base_addr = memory->read_u32(base_addr_ptr);
+    }
+    if (base_addr == 0) {
+        base_addr = g_hle.next_virtual_addr;
+        g_hle.next_virtual_addr += aligned_size + memory::MEM_PAGE_SIZE;
+    }
+
+    // Ensure within bounds
+    if (base_addr + aligned_size > memory::MAIN_MEMORY_SIZE) {
+        *result = STATUS_NO_MEMORY;
+        return;
+    }
+
+    // Allocate the view
+    u32 flags = protection_to_flags(protect ? protect : section.protect);
+    Status status = memory->allocate(base_addr, aligned_size, flags);
+
+    if (status == Status::Ok) {
+        // Track as virtual allocation
+        g_hle.virtual_allocations[base_addr] = {
+            .base = base_addr,
+            .size = aligned_size,
+            .alloc_type = MEM_COMMIT | MEM_RESERVE,
+            .protect = protect ? protect : section.protect,
+            .committed = true,
+            .large_pages = false,
+            .physical = false,
+            .dirty = false,
+        };
+
+        // Zero the mapped view
+        memory->zero_bytes(base_addr, aligned_size);
+
+        // If file-backed, read file content into the mapping
+        if (section.file_handle != 0 && g_hle.vfs) {
+            std::vector<u8> buf(aligned_size);
+            u64 bytes_read = 0;
+            g_hle.vfs->read_file(section.file_handle, buf.data(), aligned_size, bytes_read);
+            if (bytes_read > 0) {
+                memory->write_bytes(base_addr, buf.data(), bytes_read);
+            }
+        }
+
+        // Write back results
+        if (base_addr_ptr) memory->write_u32(base_addr_ptr, base_addr);
+        if (view_size_ptr) memory->write_u32(view_size_ptr, aligned_size);
+
+        *result = STATUS_SUCCESS;
+        LOGD("NtMapViewOfSection: section=0x%X -> base=0x%08X, size=0x%X",
+             section_handle, base_addr, aligned_size);
+    } else {
+        *result = STATUS_NO_MEMORY;
+        LOGW("NtMapViewOfSection: FAILED, size=0x%X", aligned_size);
+    }
+}
+
+static void HLE_NtUnmapViewOfSection(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // NTSTATUS NtUnmapViewOfSection(HANDLE ProcessHandle, PVOID BaseAddress);
+    GuestAddr base_addr = static_cast<GuestAddr>(args[1]);
+
+    std::lock_guard<std::mutex> lock(g_hle.alloc_mutex);
+
+    auto it = g_hle.virtual_allocations.find(base_addr);
+    if (it != g_hle.virtual_allocations.end()) {
+        memory->free(base_addr);
+        g_hle.virtual_allocations.erase(it);
+        LOGD("NtUnmapViewOfSection: 0x%08X unmapped", base_addr);
+    }
+
+    *result = STATUS_SUCCESS;
+}
+
+static void HLE_MmQueryAddressProtect(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // ULONG MmQueryAddressProtect(PVOID Address);
+    GuestAddr addr = static_cast<GuestAddr>(args[0]);
+
+    std::lock_guard<std::mutex> lock(g_hle.alloc_mutex);
+
+    for (const auto& [base, alloc] : g_hle.virtual_allocations) {
+        if (addr >= base && addr < base + alloc.size) {
+            *result = alloc.protect;
+            return;
+        }
+    }
+
+    // Not found - return no access
+    *result = PAGE_NOACCESS;
+}
+
+static void HLE_MmSetAddressProtect(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // VOID MmSetAddressProtect(PVOID Address, ULONG Size, ULONG NewProtect);
+    GuestAddr addr = static_cast<GuestAddr>(args[0]);
+    u32 size = static_cast<u32>(args[1]);
+    u32 new_protect = static_cast<u32>(args[2]);
+
+    std::lock_guard<std::mutex> lock(g_hle.alloc_mutex);
+
+    for (auto& [base, alloc] : g_hle.virtual_allocations) {
+        if (addr >= base && addr < base + alloc.size) {
+            alloc.protect = new_protect;
+            alloc.dirty = true;
+            break;
+        }
+    }
+
+    u32 flags = protection_to_flags(new_protect);
+    memory->protect(addr, size, flags);
+
+    *result = 0;
+    LOGD("MmSetAddressProtect: 0x%08X, size=0x%X, prot=0x%X", addr, size, new_protect);
+}
+
+//=============================================================================
 // Registration
 //=============================================================================
 
@@ -1457,6 +1981,17 @@ void Kernel::register_xboxkrnl() {
     hle_functions_[make_import_key(0, 199)] = HLE_NtFreeVirtualMemory;
     hle_functions_[make_import_key(0, 206)] = HLE_NtQueryVirtualMemory;
     hle_functions_[make_import_key(0, 205)] = HLE_NtProtectVirtualMemory;
+
+    // IO space mapping
+    hle_functions_[make_import_key(0, 174)] = HLE_MmMapIoSpace;
+    hle_functions_[make_import_key(0, 178)] = HLE_MmUnmapIoSpace;
+    hle_functions_[make_import_key(0, 172)] = HLE_MmQueryAddressProtect;
+    hle_functions_[make_import_key(0, 177)] = HLE_MmSetAddressProtect;
+
+    // Section / memory-mapped file support
+    hle_functions_[make_import_key(0, 191)] = HLE_NtCreateSection;
+    hle_functions_[make_import_key(0, 200)] = HLE_NtMapViewOfSection;
+    hle_functions_[make_import_key(0, 213)] = HLE_NtUnmapViewOfSection;
     
     // Thread management
     hle_functions_[make_import_key(0, 55)] = HLE_KeGetCurrentProcessType;
@@ -1498,7 +2033,10 @@ void Kernel::register_xboxkrnl() {
     hle_functions_[make_import_key(0, 211)] = HLE_NtSetInformationFile;
     hle_functions_[make_import_key(0, 187)] = HLE_NtClose;
     hle_functions_[make_import_key(0, 203)] = HLE_NtQueryFullAttributesFile;
-    
+    hle_functions_[make_import_key(0, 210)] = HLE_NtQueryVolumeInformationFile;
+    hle_functions_[make_import_key(0, 195)] = HLE_NtFlushBuffersFile;
+    hle_functions_[make_import_key(0, 196)] = HLE_NtDeviceIoControlFile;
+
     // Strings
     hle_functions_[make_import_key(0, 276)] = HLE_RtlInitAnsiString;
     hle_functions_[make_import_key(0, 279)] = HLE_RtlInitUnicodeString;

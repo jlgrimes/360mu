@@ -7,6 +7,7 @@
 #pragma once
 
 #include "x360mu/types.h"
+#include "game_info.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -191,6 +192,11 @@ public:
      * Get HLE function table for registration
      */
     std::unordered_map<u64, HleFunction>& get_hle_functions() { return hle_functions_; }
+
+    /**
+     * Get game info for currently loaded XEX (available after load_xex)
+     */
+    const GameInfo* get_game_info() const { return game_info_ ? game_info_.get() : nullptr; }
     
     // Object management
     u32 create_handle(ObjectType type, void* object, const std::string& name = "");
@@ -219,6 +225,9 @@ private:
     VirtualFileSystem* vfs_ = nullptr;
     ThreadScheduler* scheduler_ = nullptr;
     
+    // Last loaded game info (compatibility analysis)
+    std::unique_ptr<GameInfo> game_info_;
+
     // Loaded modules
     std::vector<LoadedModule> modules_;
     
@@ -283,6 +292,9 @@ void xam_set_input_state(u32 user_index, u16 buttons, u8 lt, u8 rt,
 // XMA audio processor integration
 void set_xma_processor(class XmaProcessor* processor);
 class XmaProcessor* get_xma_processor();
+
+// Threading HLE functions (xboxkrnl_threading.cpp)
+void register_xboxkrnl_threading(Kernel* kernel);
 
 // File I/O HLE functions (xboxkrnl_io.cpp)
 void register_file_io_exports(std::unordered_map<u64, HleFunction>& hle_functions,

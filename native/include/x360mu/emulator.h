@@ -156,6 +156,11 @@ public:
     // Testing
     void test_render();
 
+    // Runtime settings
+    void set_vsync(bool enabled);
+    void set_frame_skip(u32 count);
+    void set_target_fps(u32 fps);
+
     // State queries
     EmulatorState get_state() const { return state_; }
     bool is_running() const { return state_ == EmulatorState::Running; }
@@ -178,6 +183,12 @@ public:
     Apu* apu() { return apu_.get(); }
     Memory* memory() { return memory_.get(); }
     Kernel* kernel() { return kernel_.get(); }
+
+    /**
+     * Get game info for the currently loaded title.
+     * Returns nullptr if no game is loaded.
+     */
+    const struct GameInfo* get_game_info() const;
     
 private:
     // Main emulation loop (runs on dedicated thread)

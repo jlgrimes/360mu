@@ -6,6 +6,7 @@
 
 #include "threading.h"
 #include "kernel.h"
+#include "xobject.h"
 #include "../memory/memory.h"
 #include "../cpu/xenon/cpu.h"
 #include "../cpu/xenon/threading.h"
@@ -200,25 +201,44 @@ u32 KernelThreadManager::resume_thread(u32 handle, u32* prev_count) {
 }
 
 u32 KernelThreadManager::get_current_thread_handle() {
+    // Use 1:1 TLS first, then fallback to scheduler
+    GuestThread* thread = GetCurrentGuestThread();
+    if (thread) return thread->handle;
+
     if (!scheduler_) return 0;
-    
-    GuestThread* thread = scheduler_->get_current_thread(0);  // Simplified: use hw thread 0
+    thread = scheduler_->get_current_thread(0);
     return thread ? thread->handle : 0;
 }
 
 u32 KernelThreadManager::get_current_thread_id() {
+    // Use 1:1 TLS first, then fallback to scheduler
+    GuestThread* thread = GetCurrentGuestThread();
+    if (thread) return thread->thread_id;
+
     if (!scheduler_) return 0;
-    
-    GuestThread* thread = scheduler_->get_current_thread(0);
+    thread = scheduler_->get_current_thread(0);
     return thread ? thread->thread_id : 0;
 }
 
 u32 KernelThreadManager::get_current_processor() {
     if (!scheduler_) return 0;
-    
-    GuestThread* thread = scheduler_->get_current_thread(0);
+
+    // Try thread-local current thread first (1:1 model)
+    GuestThread* thread = GetCurrentGuestThread();
+    if (!thread) {
+        thread = scheduler_->get_current_thread(0);
+    }
     if (thread) {
-        // Return which hardware thread this is assigned to
+        // Map thread affinity to a processor number (0-5)
+        // If affinity restricts to specific cores, return the lowest set bit
+        u32 aff = thread->affinity_mask;
+        if (aff != 0 && aff != 0x3F) {
+            // Return the lowest set bit position
+            for (u32 i = 0; i < 6; i++) {
+                if (aff & (1u << i)) return i;
+            }
+        }
+        // Default: distribute by thread ID
         return thread->context.thread_id % 6;
     }
     return 0;
@@ -484,15 +504,14 @@ u32 KernelThreadManager::wait_for_multiple_objects(u32 count, const u32* handles
 u32 KernelThreadManager::perform_wait(const std::vector<KernelWaitable*>& objects,
                                        WaitType wait_type, bool alertable, s64* timeout_100ns) {
     GuestThread* current = scheduler_ ? scheduler_->get_current_thread(0) : nullptr;
-    
+
     // Check for pending APCs if alertable
     if (alertable && current && current->has_pending_apcs()) {
-        // Process APCs and return STATUS_USER_APC
         current->in_alertable_wait = true;
         scheduler_->process_pending_apcs(current);
         return nt::STATUS_USER_APC;
     }
-    
+
     // Check if already alerted
     if (alertable && current && current->alerted) {
         current->alerted = false;
@@ -500,20 +519,19 @@ u32 KernelThreadManager::perform_wait(const std::vector<KernelWaitable*>& object
         scheduler_->process_pending_apcs(current);
         return nt::STATUS_ALERTED;
     }
-    
+
     // Calculate deadline
     bool infinite_wait = (timeout_100ns == nullptr);
     u64 deadline = 0;
-    
+
     if (!infinite_wait) {
         s64 timeout = *timeout_100ns;
         if (timeout < 0) {
-            // Relative timeout (negative)
+            // Relative timeout (negative value in 100ns units)
             deadline = get_current_time_100ns() + static_cast<u64>(-timeout);
         } else if (timeout == 0) {
             // No wait - just check
             if (check_wait_satisfied(objects, wait_type)) {
-                // Satisfy the wait
                 for (auto* obj : objects) {
                     if (obj->is_signaled()) {
                         obj->on_wait_satisfied(current);
@@ -529,46 +547,49 @@ u32 KernelThreadManager::perform_wait(const std::vector<KernelWaitable*>& object
             deadline = static_cast<u64>(timeout);
         }
     }
-    
+
     // Mark thread as in alertable wait if requested
     if (alertable && current) {
         current->in_alertable_wait = true;
     }
-    
-    // Wait loop
+
+    // Use condition variable-based waiting to avoid busy-wait.
+    // We pick the first object's CV for blocking (for WaitAny) or iterate for WaitAll.
+    // Each object's CV is notified when it becomes signaled via wake_waiters().
     while (true) {
-        // Check for pending APCs if alertable (APCs may have been queued during wait)
+        // Check for pending APCs if alertable
         if (alertable && current) {
             if (current->has_pending_apcs()) {
+                current->in_alertable_wait = false;
                 scheduler_->process_pending_apcs(current);
                 return nt::STATUS_USER_APC;
             }
             if (current->alerted) {
                 current->alerted = false;
+                current->in_alertable_wait = false;
                 scheduler_->process_pending_apcs(current);
                 return nt::STATUS_ALERTED;
             }
         }
-        
+
         // Check if wait is satisfied
         if (check_wait_satisfied(objects, wait_type)) {
             if (alertable && current) {
                 current->in_alertable_wait = false;
             }
-            
+
             u32 result = nt::STATUS_WAIT_0;
             for (size_t i = 0; i < objects.size(); i++) {
                 if (objects[i]->is_signaled()) {
-                    // Check for abandoned mutant
                     if (objects[i]->type == KernelWaitableType::Mutant) {
                         auto* mutant = static_cast<KernelMutant*>(objects[i]);
                         if (mutant->abandoned) {
                             result = nt::STATUS_ABANDONED_WAIT_0 + static_cast<u32>(i);
                         }
                     }
-                    
+
                     objects[i]->on_wait_satisfied(current);
-                    
+
                     if (wait_type == WaitType::WaitAny) {
                         return result + static_cast<u32>(i);
                     }
@@ -576,7 +597,7 @@ u32 KernelThreadManager::perform_wait(const std::vector<KernelWaitable*>& object
             }
             return result;
         }
-        
+
         // Check timeout
         if (!infinite_wait && get_current_time_100ns() >= deadline) {
             if (alertable && current) {
@@ -585,14 +606,36 @@ u32 KernelThreadManager::perform_wait(const std::vector<KernelWaitable*>& object
             stats_.wait_timeouts++;
             return nt::STATUS_TIMEOUT;
         }
-        
-        // Yield to allow other threads to run
-        if (scheduler_ && current) {
-            scheduler_->yield(current);
+
+        // Block on the first object's condition variable with a timeout.
+        // This avoids busy-waiting: we sleep until signaled or a short interval for
+        // APC checking and timeout rechecking.
+        if (!objects.empty()) {
+            auto* obj = objects[0];
+            std::unique_lock<std::mutex> lock(obj->wait_mutex);
+
+            // Calculate wait duration: use a bounded interval to allow
+            // periodic APC checks and timeout rechecks
+            auto wait_duration = std::chrono::milliseconds(5);
+            if (!infinite_wait) {
+                u64 now = get_current_time_100ns();
+                if (deadline > now) {
+                    u64 remaining_us = (deadline - now) / 10;
+                    auto remaining = std::chrono::microseconds(remaining_us);
+                    if (remaining < wait_duration) {
+                        wait_duration = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+                        if (wait_duration.count() == 0) {
+                            wait_duration = std::chrono::milliseconds(1);
+                        }
+                    }
+                }
+            }
+
+            obj->wait_cv.wait_for(lock, wait_duration);
+        } else {
+            // No objects - shouldn't happen but yield
+            std::this_thread::yield();
         }
-        
-        // Small sleep to prevent busy waiting
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
 }
 
@@ -918,14 +961,16 @@ u32 KernelThreadManager::delay_execution(bool alertable, s64* interval_100ns) {
 //=============================================================================
 
 u32 KernelThreadManager::close_handle(u32 handle) {
-    std::lock_guard<std::mutex> lock(objects_mutex_);
-    
-    auto it = objects_.find(handle);
-    if (it != objects_.end()) {
-        objects_.erase(it);
-        return nt::STATUS_SUCCESS;
+    // Try local waitable objects first
+    {
+        std::lock_guard<std::mutex> lock(objects_mutex_);
+        auto it = objects_.find(handle);
+        if (it != objects_.end()) {
+            objects_.erase(it);
+            return nt::STATUS_SUCCESS;
+        }
     }
-    
+
     // Check thread handles
     {
         std::lock_guard<std::mutex> th_lock(thread_handles_mutex_);
@@ -933,17 +978,29 @@ u32 KernelThreadManager::close_handle(u32 handle) {
             return nt::STATUS_SUCCESS;
         }
     }
-    
+
+    // Try the unified kernel object table (handles XObject-based objects)
+    auto& obj_table = KernelState::instance().object_table();
+    u32 status = obj_table.close_handle(handle);
+    if (status == nt_obj::STATUS_SUCCESS) {
+        return nt::STATUS_SUCCESS;
+    }
+
     return nt::STATUS_INVALID_HANDLE;
 }
 
 u32 KernelThreadManager::duplicate_handle(u32 source_handle, u32* target_handle) {
-    std::lock_guard<std::mutex> lock(objects_mutex_);
-    
-    // For simplicity, just return the same handle
-    // In a full implementation, we'd create a proper duplicate
+    // Try the unified kernel object table first
+    auto& obj_table = KernelState::instance().object_table();
+    u32 new_handle = 0;
+    u32 status = obj_table.duplicate_handle(source_handle, &new_handle);
+    if (status == nt_obj::STATUS_SUCCESS) {
+        if (target_handle) *target_handle = new_handle;
+        return nt::STATUS_SUCCESS;
+    }
+
+    // Fallback for local objects - return same handle
     if (target_handle) *target_handle = source_handle;
-    
     return nt::STATUS_SUCCESS;
 }
 
@@ -965,7 +1022,7 @@ KernelWaitable* KernelThreadManager::get_waitable(u32 handle) {
 
 void KernelThreadManager::wake_waiters(KernelWaitable* obj) {
     if (!obj || !scheduler_) return;
-    
+
     // Wake threads waiting on this object
     for (auto* thread : obj->waiters) {
         if (thread && thread->state == ThreadState::Waiting) {
@@ -974,12 +1031,231 @@ void KernelThreadManager::wake_waiters(KernelWaitable* obj) {
         }
     }
     obj->waiters.clear();
+
+    // Notify the condition variable to wake any threads blocked in perform_wait()
+    obj->wait_cv.notify_all();
 }
 
 u64 KernelThreadManager::get_current_time_100ns() const {
     auto now = std::chrono::steady_clock::now();
     auto duration = now.time_since_epoch();
     return std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count() / 100;
+}
+
+//=============================================================================
+// Timer Management
+//=============================================================================
+
+u32 KernelThreadManager::create_timer(u32* handle_out, u32 access_mask, GuestAddr obj_attr,
+                                       u32 timer_type) {
+    auto timer = std::make_unique<KernelTimer>();
+    timer->handle = allocate_handle();
+
+    u32 handle = timer->handle;
+
+    {
+        std::lock_guard<std::mutex> lock(objects_mutex_);
+        objects_[handle] = std::move(timer);
+    }
+
+    if (handle_out) *handle_out = handle;
+    stats_.timers_created++;
+
+    LOGD("Created timer: handle=0x%X, type=%u", handle, timer_type);
+    return nt::STATUS_SUCCESS;
+}
+
+u32 KernelThreadManager::set_timer(u32 handle, s64 due_time, u32 period_ms,
+                                    GuestAddr dpc_routine, GuestAddr dpc_context,
+                                    bool resume, bool* prev_state) {
+    std::lock_guard<std::mutex> lock(objects_mutex_);
+
+    auto it = objects_.find(handle);
+    if (it == objects_.end() || it->second->type != KernelWaitableType::Timer) {
+        return nt::STATUS_INVALID_HANDLE;
+    }
+
+    auto* timer = static_cast<KernelTimer*>(it->second.get());
+
+    if (prev_state) *prev_state = timer->active;
+
+    // Reset signal state
+    timer->signaled = false;
+
+    // Calculate absolute due time
+    if (due_time < 0) {
+        // Relative time (negative 100ns units)
+        timer->due_time_100ns = get_current_time_100ns() + static_cast<u64>(-due_time);
+    } else {
+        // Absolute time
+        timer->due_time_100ns = static_cast<u64>(due_time);
+    }
+
+    timer->period_100ns = static_cast<u64>(period_ms) * 10000ULL;  // ms to 100ns
+    timer->periodic = (period_ms > 0);
+    timer->dpc_routine = dpc_routine;
+    timer->dpc_context = dpc_context;
+    timer->active = true;
+
+    LOGD("Set timer 0x%X: due=%llu, period=%u ms, dpc=0x%08X",
+         handle, (unsigned long long)timer->due_time_100ns, period_ms, dpc_routine);
+
+    return nt::STATUS_SUCCESS;
+}
+
+u32 KernelThreadManager::cancel_timer(u32 handle, bool* was_set) {
+    std::lock_guard<std::mutex> lock(objects_mutex_);
+
+    auto it = objects_.find(handle);
+    if (it == objects_.end() || it->second->type != KernelWaitableType::Timer) {
+        return nt::STATUS_INVALID_HANDLE;
+    }
+
+    auto* timer = static_cast<KernelTimer*>(it->second.get());
+
+    if (was_set) *was_set = timer->active;
+    timer->active = false;
+    timer->signaled = false;
+
+    return nt::STATUS_SUCCESS;
+}
+
+void KernelThreadManager::process_timer_queue() {
+    u64 now = get_current_time_100ns();
+    std::lock_guard<std::mutex> lock(objects_mutex_);
+
+    for (auto& [h, obj] : objects_) {
+        if (obj->type != KernelWaitableType::Timer) continue;
+
+        auto* timer = static_cast<KernelTimer*>(obj.get());
+        if (!timer->active) continue;
+        if (now < timer->due_time_100ns) continue;
+
+        // Timer expired - signal it
+        timer->signaled = true;
+        wake_waiters(timer);
+
+        // Handle periodic timer
+        if (timer->periodic && timer->period_100ns > 0) {
+            timer->due_time_100ns = now + timer->period_100ns;
+            timer->signaled = false;  // Reset for next period
+        } else {
+            timer->active = false;
+        }
+
+        LOGD("Timer 0x%X fired", timer->handle);
+    }
+}
+
+//=============================================================================
+// I/O Completion Port Management
+//=============================================================================
+
+u32 KernelThreadManager::create_io_completion(u32* handle_out, u32 access_mask, GuestAddr obj_attr,
+                                               u32 max_concurrent_threads) {
+    auto iocp = std::make_unique<KernelIoCompletion>();
+    iocp->max_concurrent_threads = max_concurrent_threads;
+    iocp->handle = allocate_handle();
+
+    u32 handle = iocp->handle;
+
+    {
+        std::lock_guard<std::mutex> lock(objects_mutex_);
+        objects_[handle] = std::move(iocp);
+    }
+
+    if (handle_out) *handle_out = handle;
+    stats_.io_completions_created++;
+
+    LOGD("Created IoCompletion: handle=0x%X, max_threads=%u", handle, max_concurrent_threads);
+    return nt::STATUS_SUCCESS;
+}
+
+u32 KernelThreadManager::set_io_completion(u32 handle, GuestAddr key_context, GuestAddr apc_context,
+                                            u32 status, u32 bytes_transferred) {
+    std::lock_guard<std::mutex> lock(objects_mutex_);
+
+    auto it = objects_.find(handle);
+    if (it == objects_.end() || it->second->type != KernelWaitableType::IoCompletion) {
+        return nt::STATUS_INVALID_HANDLE;
+    }
+
+    auto* iocp = static_cast<KernelIoCompletion*>(it->second.get());
+
+    IoCompletionPacket packet;
+    packet.key_context = key_context;
+    packet.apc_context = apc_context;
+    packet.status = status;
+    packet.bytes_transferred = bytes_transferred;
+
+    {
+        std::lock_guard<std::mutex> qlock(iocp->queue_mutex);
+        iocp->packet_queue.push_back(packet);
+    }
+
+    wake_waiters(iocp);
+
+    return nt::STATUS_SUCCESS;
+}
+
+u32 KernelThreadManager::remove_io_completion(u32 handle, IoCompletionPacket* packet_out,
+                                               s64* timeout_100ns) {
+    KernelIoCompletion* iocp = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(objects_mutex_);
+        auto it = objects_.find(handle);
+        if (it == objects_.end() || it->second->type != KernelWaitableType::IoCompletion) {
+            return nt::STATUS_INVALID_HANDLE;
+        }
+        iocp = static_cast<KernelIoCompletion*>(it->second.get());
+    }
+
+    // Try to dequeue immediately
+    {
+        std::lock_guard<std::mutex> qlock(iocp->queue_mutex);
+        if (!iocp->packet_queue.empty()) {
+            if (packet_out) *packet_out = iocp->packet_queue.front();
+            iocp->packet_queue.pop_front();
+            return nt::STATUS_SUCCESS;
+        }
+    }
+
+    // Check for zero timeout
+    if (timeout_100ns && *timeout_100ns == 0) {
+        return nt::STATUS_TIMEOUT;
+    }
+
+    // Wait for a packet
+    // Use the object's condition variable
+    bool infinite_wait = (timeout_100ns == nullptr);
+    u64 deadline = 0;
+    if (!infinite_wait) {
+        s64 timeout = *timeout_100ns;
+        if (timeout < 0) {
+            deadline = get_current_time_100ns() + static_cast<u64>(-timeout);
+        } else {
+            deadline = static_cast<u64>(timeout);
+        }
+    }
+
+    while (true) {
+        {
+            std::lock_guard<std::mutex> qlock(iocp->queue_mutex);
+            if (!iocp->packet_queue.empty()) {
+                if (packet_out) *packet_out = iocp->packet_queue.front();
+                iocp->packet_queue.pop_front();
+                return nt::STATUS_SUCCESS;
+            }
+        }
+
+        if (!infinite_wait && get_current_time_100ns() >= deadline) {
+            return nt::STATUS_TIMEOUT;
+        }
+
+        std::unique_lock<std::mutex> lock(iocp->wait_mutex);
+        iocp->wait_cv.wait_for(lock, std::chrono::milliseconds(5));
+    }
 }
 
 } // namespace x360mu

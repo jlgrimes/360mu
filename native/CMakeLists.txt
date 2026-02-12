@@ -7,11 +7,15 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Generate compile_commands.json for IDE support
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # Build options
 option(X360MU_BUILD_TESTS "Build unit tests" ON)
 option(X360MU_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(X360MU_ENABLE_JIT "Enable JIT compiler (ARM64 only)" ON)
 option(X360MU_USE_FFMPEG "Use FFmpeg for XMA decoding" ON)
+option(X360MU_USE_VULKAN "Enable Vulkan rendering" ON)
 
 # Detect Android NDK build
 if(ANDROID)
@@ -32,10 +36,13 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -flto")
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG")
+set(CMAKE_CXX_FLAGS_PROFILE "-O2 -g -DNDEBUG -DX360MU_PROFILE")
 
 if(X360MU_ENABLE_ASAN)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
-    set(CMAKE_LINKER_FLAGS "${CMAKE_LINKER_FLAGS} -fsanitize=address")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=address")
 endif()
 
 # ARM64 NEON optimization
@@ -51,6 +58,9 @@ set(MSPACK_SOURCES
 # Source files organized by module
 set(CORE_SOURCES
     src/core/emulator.cpp
+    src/core/save_state.cpp
+    src/core/crash_handler.cpp
+    src/core/log_buffer.cpp
 )
 
 set(CPU_SOURCES
@@ -96,12 +106,16 @@ else()
     )
 endif()
 
-# APU sources - full implementation with XMA decoder, mixer, and Android audio output
+# APU sources
 set(APU_SOURCES
     src/apu/apu.cpp
     src/apu/xma_decoder.cpp
-    src/apu/android_audio.cpp
 )
+if(ANDROID)
+    list(APPEND APU_SOURCES src/apu/android_audio.cpp)
+else()
+    list(APPEND APU_SOURCES src/apu/stub/apu_stub.cpp)
+endif()
 
 set(KERNEL_SOURCES
     src/kernel/kernel.cpp
@@ -118,6 +132,7 @@ set(KERNEL_SOURCES
     src/kernel/hle/xam.cpp
     src/kernel/xex_loader.cpp
     src/kernel/xex_crypto.cpp
+    src/kernel/game_info.cpp
     src/kernel/filesystem/vfs.cpp
     src/kernel/filesystem/iso_device.cpp
     src/kernel/filesystem/stfs_device.cpp
@@ -125,6 +140,10 @@ set(KERNEL_SOURCES
 
 set(MEMORY_SOURCES
     src/memory/memory.cpp
+)
+
+set(INPUT_SOURCES
+    src/input/input_manager.cpp
 )
 
 set(JNI_SOURCES
@@ -139,6 +158,7 @@ set(ALL_SOURCES
     ${APU_SOURCES}
     ${KERNEL_SOURCES}
     ${MEMORY_SOURCES}
+    ${INPUT_SOURCES}
     ${MSPACK_SOURCES}
 )
 
@@ -153,13 +173,12 @@ include_directories(
 # VMA (Vulkan Memory Allocator) - header only
 add_definitions(-DVMA_IMPLEMENTATION)
 
-# Find Vulkan (optional for testing)
-option(X360MU_USE_VULKAN "Enable Vulkan rendering" ON)
-
+# Find Vulkan
 if(X360MU_USE_VULKAN)
     if(ANDROID)
         # Android has Vulkan in NDK
         find_library(VULKAN_LIB vulkan)
+        add_definitions(-DX360MU_HAS_VULKAN)
     else()
         find_package(Vulkan QUIET)
         if(Vulkan_FOUND)
@@ -278,11 +297,13 @@ if(ANDROID)
     find_library(LOG_LIB log)
     find_library(ANDROID_LIB android)
     find_library(AAUDIO_LIB aaudio)
-    
+    find_library(ZLIB_LIB z)
+
     target_link_libraries(x360mu_core
         ${LOG_LIB}
         ${ANDROID_LIB}
         ${AAUDIO_LIB}
+        ${ZLIB_LIB}
     )
     
     # JNI bridge - sources already defined above
@@ -317,9 +338,12 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
     set(GPU_TEST_SOURCES "")
     if(X360MU_USE_VULKAN)
         # Shader translator tests (no Vulkan runtime required)
-        set(GPU_TEST_SOURCES 
+        set(GPU_TEST_SOURCES
             tests/gpu/test_shader_translator.cpp
             tests/gpu/test_command_processor.cpp
+            tests/gpu/test_pipeline_cache.cpp
+            tests/gpu/test_buffer_pool.cpp
+            tests/gpu/test_texture_formats.cpp
         )
         if(Vulkan_FOUND)
             # Full Vulkan tests require Vulkan SDK
@@ -329,11 +353,16 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
     
     add_executable(x360mu_tests
         tests/test_main.cpp
+        # CPU tests
         tests/cpu/test_decoder.cpp
         tests/cpu/test_interpreter.cpp
+        tests/cpu/test_interpreter_extended.cpp
         tests/cpu/test_vmx128.cpp
+        # Memory tests
         tests/memory/test_memory.cpp
+        tests/memory/test_memory_extended.cpp
         tests/memory/test_address_mapping.cpp
+        # Kernel tests
         tests/kernel/test_xex_loader.cpp
         tests/kernel/test_filesystem.cpp
         tests/kernel/test_file_io.cpp
@@ -343,6 +372,7 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
         tests/kernel/test_xthread.cpp
         tests/kernel/test_xkernel.cpp
         tests/kernel/test_dpc_execution.cpp
+        # Audio tests
         tests/apu/test_audio.cpp
         # Integration tests
         tests/integration/test_syscall_integration.cpp
@@ -350,6 +380,9 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
         tests/integration/test_xex_integration.cpp
         tests/integration/test_file_hle_integration.cpp
         tests/integration/test_dpc_integration.cpp
+        tests/integration/test_boot_sequence.cpp
+        tests/integration/test_gpu_draw_integration.cpp
+        tests/integration/test_render_pipeline.cpp
         ${JIT_TEST_SOURCES}
         ${GPU_TEST_SOURCES}
     )
@@ -365,9 +398,12 @@ if(X360MU_BUILD_TESTS AND NOT ANDROID)
         target_link_libraries(x360mu_tests ${VULKAN_LIB})
     endif()
     
-    # Disable gtest_discover_tests as it can timeout on some platforms
-    # include(GoogleTest)
-    # gtest_discover_tests(x360mu_tests)
+    # Enable CTest integration with GoogleTest
+    include(GoogleTest)
+    gtest_discover_tests(x360mu_tests
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES TIMEOUT 60
+    )
     
     # XEX Test Tool
     add_executable(xex_test

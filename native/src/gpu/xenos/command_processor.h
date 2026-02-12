@@ -16,6 +16,7 @@
 
 #include "x360mu/types.h"
 #include "gpu.h"
+#include "gpu/vulkan/vulkan_backend.h"
 #include <vulkan/vulkan.h>
 #include <vector>
 #include <functional>
@@ -72,7 +73,8 @@ enum class PM4Opcode : u32 {
     DRAW_INDX_BIN = 0x35,          // Draw indexed with binning
     DRAW_INDX_IMMD = 0x2A,         // Draw with immediate indices
     VIZ_QUERY = 0x23,              // Visibility query
-    
+    SET_PREDICATION = 0x49,        // Set predicated rendering
+
     // === Memory operations ===
     MEM_WRITE = 0x3D,              // Write to memory
     COND_WRITE = 0x45,             // Conditional memory write
@@ -101,10 +103,17 @@ enum class PM4Opcode : u32 {
     SURFACE_SYNC = 0x43,           // Synchronize surface access
     COPY_DW = 0x4B,                // Copy dword
     COPY_DATA = 0x4C,              // Copy data block
-    
+
     // === Scratch/temporary ===
     SCRATCH_RAM_WRITE = 0x4D,      // Write to scratch RAM
     SCRATCH_RAM_READ = 0x4E,       // Read from scratch RAM
+
+    // === Shader microcode loading ===
+    IM_LOAD = 0x27,                // Load shader microcode from memory
+    IM_LOAD_IMMEDIATE = 0x2B,      // Load shader microcode (immediate data in packet)
+
+    // === State invalidation ===
+    INVALIDATE_STATE = 0x3B,       // Invalidate GPU state (alias for CP_INVALIDATE_STATE)
 };
 
 /**
@@ -244,13 +253,54 @@ public:
      */
     u64 packets_processed() const { return packets_processed_; }
     u64 draws_this_frame() const { return draws_this_frame_; }
-    
+    u64 draws_merged() const { return draws_merged_; }
+    u64 redundant_binds_skipped() const { return redundant_binds_skipped_; }
+
     /**
      * For testing: set a mock GPU backend
      */
     void set_vulkan_backend(VulkanBackend* vulkan) { vulkan_ = vulkan; }
-    
+
 private:
+    // === Bound state tracking for deduplication ===
+    struct BoundState {
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+        VkBuffer index_buffer = VK_NULL_HANDLE;
+        VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+        VkDeviceSize index_offset = 0;
+        VkBuffer vertex_buffers[16] = {};
+        VkDeviceSize vertex_offsets[16] = {};
+        u32 vertex_buffer_count = 0;
+        float viewport_x = 0, viewport_y = 0;
+        float viewport_w = 0, viewport_h = 0;
+        float viewport_min_z = 0, viewport_max_z = 0;
+        s32 scissor_x = 0, scissor_y = 0;
+        u32 scissor_w = 0, scissor_h = 0;
+
+        void reset() { *this = BoundState{}; }
+    };
+    BoundState bound_state_;
+
+    // === Draw batching ===
+    struct PendingDraw {
+        u32 vertex_count;
+        u32 index_count;
+        u32 first_vertex;
+        u32 first_index;
+        s32 vertex_offset;
+        u32 instance_count;
+        bool indexed;
+    };
+    static constexpr u32 kMaxBatchedDraws = 32;
+    PendingDraw pending_draws_[kMaxBatchedDraws];
+    u32 pending_draw_count_ = 0;
+    VkPipeline batch_pipeline_ = VK_NULL_HANDLE;
+    VkDescriptorSet batch_descriptor_ = VK_NULL_HANDLE;
+
+    // Batching stats
+    u64 draws_merged_ = 0;
+    u64 redundant_binds_skipped_ = 0;
     Memory* memory_ = nullptr;
     VulkanBackend* vulkan_ = nullptr;
     ShaderTranslator* shader_translator_ = nullptr;
@@ -285,7 +335,13 @@ private:
     std::array<f32, 256 * 4> pixel_constants_;
     std::array<u32, 256> bool_constants_;
     std::array<u32, 32> loop_constants_;
-    
+
+    // Dirty flags for constant upload optimization
+    bool vertex_constants_dirty_ = true;
+    bool pixel_constants_dirty_ = true;
+    bool bool_constants_dirty_ = true;
+    bool loop_constants_dirty_ = true;
+
     // Fetch constants (vertex buffers + textures)
     std::array<FetchConstant, 96> vertex_fetch_;
     std::array<FetchConstant, 32> texture_fetch_;
@@ -302,6 +358,50 @@ private:
     const u32* direct_buffer_ = nullptr;
     size_t direct_buffer_size_ = 0;
     size_t direct_buffer_pos_ = 0;
+
+    // Indirect buffer recursion guard
+    u32 ib_depth_ = 0;
+    static constexpr u32 kMaxIBDepth = 4;
+
+    // Scratch RAM (256 dwords, used by CP microcode)
+    std::array<u32, 256> scratch_ram_{};
+
+    // Binning state
+    u32 bin_mask_lo_ = 0xFFFFFFFF;
+    u32 bin_mask_hi_ = 0xFFFFFFFF;
+    u32 bin_select_lo_ = 0;
+    u32 bin_select_hi_ = 0;
+
+    // Occlusion query state
+    static constexpr u32 MAX_OCCLUSION_QUERIES = 256;
+    struct OcclusionQueryState {
+        bool active = false;
+        u32 active_query_id = 0;
+        u32 next_query_id = 0;
+        bool query_pool_initialized = false;
+        std::array<u32, 256> guest_to_vk_query{};
+        std::array<u64, 256> query_results{};
+        std::array<bool, 256> query_valid{};
+    };
+    OcclusionQueryState occlusion_;
+
+    // Predication state
+    struct PredicationState {
+        bool active = false;
+        u32 query_index = 0;
+        bool inverted = false;
+        bool wait = false;
+        bool use_hw_predication = false;
+    };
+    PredicationState predication_;
+
+    // Shader microcode staging (for IM_LOAD)
+    struct ShaderMicrocodeSlot {
+        std::vector<u32> data;
+        ShaderType type = ShaderType::Vertex;
+        u32 start_offset = 0;
+    };
+    ShaderMicrocodeSlot pending_shader_;
     
     // Packet processing
     u32 execute_packet(GuestAddr addr, u32& packets_consumed);
@@ -327,7 +427,16 @@ private:
     void handle_indirect_buffer(GuestAddr data_addr, u32 count);
     void handle_cond_write(GuestAddr data_addr, u32 count);
     void handle_surface_sync(GuestAddr data_addr, u32 count);
-    
+    void handle_event_write_shd(GuestAddr data_addr, u32 count);
+    void handle_im_load(GuestAddr data_addr, u32 count);
+    void handle_im_load_immediate(GuestAddr data_addr, u32 count);
+    void handle_draw_indx_bin(GuestAddr data_addr, u32 count);
+    void handle_copy_dw(GuestAddr data_addr, u32 count);
+    void handle_viz_query(GuestAddr data_addr, u32 count);
+    void handle_set_predication(GuestAddr data_addr, u32 count);
+    void handle_set_bin_mask(GuestAddr data_addr, u32 count, bool hi);
+    void handle_set_bin_select(GuestAddr data_addr, u32 count, bool hi);
+
     // Type 3 handlers (direct buffer for testing)
     void handle_draw_indx_direct(const u32* data, u32 count);
     void handle_draw_indx_auto_direct(const u32* data, u32 count);
@@ -346,16 +455,39 @@ private:
     // Shader and pipeline management
     bool prepare_shaders();
     bool prepare_pipeline(const DrawCommand& cmd);
+    void set_dynamic_state();
     void bind_vertex_buffers(const DrawCommand& cmd);
     void bind_index_buffer(const DrawCommand& cmd);
+    void build_vertex_input_state(VertexInputConfig& config);
     void update_constants();
     void bind_textures();
+
+    // State deduplication - skip redundant Vulkan binds
+    bool bind_pipeline_dedup(VkPipeline pipeline);
+    bool bind_descriptor_set_dedup(VkDescriptorSet set);
+    void set_viewport_dedup(float x, float y, float w, float h, float minz, float maxz);
+    void set_scissor_dedup(s32 x, s32 y, u32 w, u32 h);
+    void bind_vertex_buffers_dedup(u32 count, const VkBuffer* buffers, const VkDeviceSize* offsets);
+    void bind_index_buffer_dedup(VkBuffer buffer, VkDeviceSize offset, VkIndexType type);
+    void reset_bound_state();
+
+    // Draw batching
+    void queue_draw(const DrawCommand& cmd);
+    void flush_draw_batch();
+    bool can_merge_draw(const DrawCommand& cmd) const;
 
     // Default shader management
     void create_default_shaders();
     void use_default_shaders();
     void cleanup_default_shaders();
     
+    // Tessellation and primitive expansion
+    bool needs_tessellation(const DrawCommand& cmd) const;
+    DrawCommand tessellate_draw(const DrawCommand& cmd);
+    void tessellate_tri_patch(std::vector<f32>& out_vertices, u32 tess_level);
+    void tessellate_quad_patch(std::vector<f32>& out_vertices, u32 tess_level);
+    DrawCommand expand_rect_list(const DrawCommand& cmd);
+
     // Register side effects
     void on_register_write(u32 index, u32 value);
     

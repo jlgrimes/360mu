@@ -16,6 +16,7 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <chrono>
 
 namespace x360mu {
 
@@ -28,6 +29,7 @@ class ShaderCache;
 class DescriptorManager;
 class BufferPool;
 class RenderTargetManager;
+class EdramManager;
 
 /**
  * GPU configuration
@@ -126,7 +128,8 @@ namespace xenos_reg {
     constexpr u32 VGT_VERTEX_REUSE_BLOCK_CNTL = 0x2316;
     constexpr u32 VGT_OUT_DEALLOC_CNTL = 0x2317;
     constexpr u32 VGT_MULTI_PRIM_IB_RESET_INDX = 0x2318;
-    
+    constexpr u32 VGT_TESSELLATION_LEVEL = 0x2319;
+
     // Viewport/clip
     constexpr u32 PA_CL_VTE_CNTL = 0x2006;
     constexpr u32 PA_CL_VPORT_XSCALE = 0x2100;
@@ -151,8 +154,15 @@ namespace xenos_reg {
     constexpr u32 PA_SC_CLIPRECT_0_TL = 0x2086;
     constexpr u32 PA_SC_CLIPRECT_0_BR = 0x2087;
     constexpr u32 PA_SC_VIZ_QUERY = 0x20C0;
-    
-    // Setup unit  
+    constexpr u32 PA_SC_VIZ_QUERY_STATUS = 0x20C1;
+
+    // Predication
+    constexpr u32 CP_SET_PREDICATION = 0x20C2;
+
+    // Event initiator
+    constexpr u32 VGT_EVENT_INITIATOR = 0x20C4;
+
+    // Setup unit
     constexpr u32 PA_SU_SC_MODE_CNTL = 0x2280;
     constexpr u32 PA_SU_POLY_OFFSET_FRONT_SCALE = 0x2281;
     constexpr u32 PA_SU_POLY_OFFSET_FRONT_OFFSET = 0x2282;
@@ -211,39 +221,169 @@ enum class PrimitiveType : u32 {
     TriangleFan = 5,
     TriangleStrip = 6,
     RectList = 8,
+    LineLoop = 12,
     QuadList = 13,
+    QuadStrip = 14,
+    TrianglePatch = 15,    // Tessellation: triangle patches
+    QuadPatch = 16,        // Tessellation: quad patches
 };
+
+/**
+ * Xenos tessellation mode (VGT_OUTPUT_PATH_CNTL bits 1:0)
+ */
+enum class TessellationMode : u32 {
+    Disabled = 0,
+    Discrete = 1,
+    Continuous = 2,
+    Adaptive = 3,
+};
+
+/**
+ * Xbox 360 vertex element data type (from vfetch instruction encoding)
+ */
+enum class VertexFormat : u32 {
+    kFloat1      = 0,   // 1x 32-bit float
+    kFloat2      = 1,   // 2x 32-bit float
+    kFloat3      = 2,   // 3x 32-bit float
+    kFloat4      = 3,   // 4x 32-bit float
+    kHalf2       = 6,   // 2x 16-bit float
+    kHalf4       = 7,   // 4x 16-bit float
+    kUByte4      = 10,  // 4x 8-bit unsigned int
+    kByte4       = 11,  // 4x 8-bit signed int
+    kUByte4N     = 14,  // 4x 8-bit unsigned normalized (COLOR)
+    kShort2      = 15,  // 2x 16-bit signed int
+    kShort4      = 16,  // 4x 16-bit signed int
+    kShort2N     = 17,  // 2x 16-bit signed normalized
+    kShort4N     = 18,  // 4x 16-bit signed normalized
+    kUShort2N    = 19,  // 2x 16-bit unsigned normalized
+    kUShort4N    = 20,  // 4x 16-bit unsigned normalized
+    kDec3N       = 22,  // 10_10_10_2 signed normalized
+    kFloat16_2   = 24,  // 2x 16-bit float (alt encoding)
+    kFloat16_4   = 25,  // 4x 16-bit float (alt encoding)
+    k8_8_8_8     = 26,  // 4x 8-bit unorm
+    k2_10_10_10  = 27,  // 2_10_10_10 unsigned normalized
+    k10_11_11    = 28,  // R11G11B10 float
+    kUnknown     = 0xFF,
+};
+
+/**
+ * Get the size in bytes of a vertex format element
+ */
+inline u32 vertex_format_size(VertexFormat fmt) {
+    switch (fmt) {
+        case VertexFormat::kFloat1:     return 4;
+        case VertexFormat::kFloat2:     return 8;
+        case VertexFormat::kFloat3:     return 12;
+        case VertexFormat::kFloat4:     return 16;
+        case VertexFormat::kHalf2:      return 4;
+        case VertexFormat::kHalf4:      return 8;
+        case VertexFormat::kUByte4:     return 4;
+        case VertexFormat::kByte4:      return 4;
+        case VertexFormat::kUByte4N:    return 4;
+        case VertexFormat::kShort2:     return 4;
+        case VertexFormat::kShort4:     return 8;
+        case VertexFormat::kShort2N:    return 4;
+        case VertexFormat::kShort4N:    return 8;
+        case VertexFormat::kUShort2N:   return 4;
+        case VertexFormat::kUShort4N:   return 8;
+        case VertexFormat::kDec3N:      return 4;
+        case VertexFormat::kFloat16_2:  return 4;
+        case VertexFormat::kFloat16_4:  return 8;
+        case VertexFormat::k8_8_8_8:    return 4;
+        case VertexFormat::k2_10_10_10: return 4;
+        case VertexFormat::k10_11_11:   return 4;
+        default:                        return 16;
+    }
+}
 
 /**
  * Fetch constant (for vertex buffers and textures)
  */
 struct FetchConstant {
     u32 data[6];
-    
+
     // Vertex buffer interpretation
     GuestAddr vertex_buffer_address() const {
         return (data[0] & 0xFFFFFFFC);
     }
-    
+
     u32 vertex_buffer_size() const {
         return ((data[1] >> 2) & 0x3FFFFF) + 1;
     }
-    
+
+    u32 vertex_buffer_stride() const {
+        return data[2] & 0xFF;
+    }
+
+    u32 endian_swap() const {
+        return data[1] & 0x3;
+    }
+
     // Texture interpretation
     GuestAddr texture_address() const {
         return (data[0] & 0xFFFFFFFC);
     }
-    
+
     u32 texture_width() const {
         return ((data[2] >> 22) & 0x1FFF) + 1;
     }
-    
+
     u32 texture_height() const {
         return ((data[3] >> 6) & 0x1FFF) + 1;
     }
-    
+
     TextureFormat texture_format() const {
         return static_cast<TextureFormat>((data[1] >> 7) & 0x3F);
+    }
+
+    u32 texture_depth() const {
+        return ((data[3] >> 19) & 0x3FF) + 1;
+    }
+
+    u32 texture_mip_levels() const {
+        u32 mips = (data[2] >> 16) & 0xF;
+        return mips > 0 ? mips : 1;
+    }
+
+    bool texture_is_tiled() const {
+        return (data[1] >> 1) & 1;
+    }
+
+    TextureDimension texture_dimension() const {
+        return static_cast<TextureDimension>((data[1] >> 4) & 0x3);
+    }
+
+    // Sampler state from fetch constant words 4-5
+    TextureAddressMode address_mode_u() const {
+        return static_cast<TextureAddressMode>(data[4] & 0x7);
+    }
+
+    TextureAddressMode address_mode_v() const {
+        return static_cast<TextureAddressMode>((data[4] >> 3) & 0x7);
+    }
+
+    TextureAddressMode address_mode_w() const {
+        return static_cast<TextureAddressMode>((data[4] >> 6) & 0x7);
+    }
+
+    TextureFilter min_filter() const {
+        return static_cast<TextureFilter>((data[4] >> 9) & 0x3);
+    }
+
+    TextureFilter mag_filter() const {
+        return static_cast<TextureFilter>((data[4] >> 11) & 0x3);
+    }
+
+    TextureFilter mip_filter() const {
+        return static_cast<TextureFilter>((data[4] >> 13) & 0x3);
+    }
+
+    u32 max_anisotropy() const {
+        return 1u << ((data[4] >> 15) & 0x7);
+    }
+
+    u8 border_color_type() const {
+        return (data[4] >> 18) & 0x3;
     }
 };
 
@@ -290,6 +430,19 @@ struct RenderState {
     u32 cull_mode;
     bool front_ccw;
     f32 polygon_offset;
+
+    // Tessellation state (from VGT registers)
+    TessellationMode tessellation_mode = TessellationMode::Disabled;
+    f32 tessellation_level = 1.0f;
+    f32 tess_min_level = 1.0f;
+    f32 tess_max_level = 1.0f;
+    u32 vgt_hos_cntl = 0;
+
+    // Point sprite expansion
+    bool point_sprite_enable = false;
+    f32 point_size = 1.0f;
+    f32 point_size_min = 0.0f;
+    f32 point_size_max = 64.0f;
 };
 
 /**
@@ -351,6 +504,36 @@ public:
      * Call this to verify the rendering pipeline works without loading a game
      */
     void test_render();
+
+    /**
+     * Set VSync mode (changes Vulkan present mode)
+     */
+    void set_vsync(bool enabled);
+
+    /**
+     * Set frame skip count (0 = no skip, N = skip N frames between presents)
+     */
+    void set_frame_skip(u32 skip_count);
+
+    /**
+     * Set target FPS (0 = unlimited, 30, 60 are common values)
+     */
+    void set_target_fps(u32 fps);
+
+    bool vsync_enabled() const { return config_.enable_vsync; }
+    u32 frame_skip() const { return frame_skip_; }
+    u32 target_fps() const { return target_fps_; }
+
+    /**
+     * Set current game's title ID for per-game shader cache directories
+     */
+    void set_title_id(u32 title_id);
+
+    /**
+     * Signal VSync interrupt — called by the main loop at ~60Hz.
+     * Writes VSync status to GPU registers and signals kernel interrupt.
+     */
+    void signal_vsync();
 
     /**
      * Register read/write (for MMIO)
@@ -434,8 +617,18 @@ private:
     std::unique_ptr<BufferPool> buffer_pool_;
     std::unique_ptr<TextureCache> texture_cache_;
     std::unique_ptr<RenderTargetManager> render_target_manager_;
+    std::unique_ptr<EdramManager> edram_manager_;
     std::unique_ptr<CommandProcessor> command_processor_;
-    
+
+    // Surface state
+    bool surface_active_ = false;
+
+    // Frame pacing
+    u32 frame_skip_ = 0;
+    u32 target_fps_ = 30;
+    u64 frame_count_ = 0;
+    std::chrono::steady_clock::time_point last_present_time_{};
+
     // Statistics
     Stats stats_{};
     
@@ -461,6 +654,7 @@ private:
     
     // State updates
     void update_render_state();
+    void update_render_targets();
     void update_shaders();
     void update_textures();
 };

@@ -158,15 +158,28 @@ private:
     u64 compute_texture_hash(const FetchConstant& fetch);
     CachedTexture create_texture(const FetchConstant& fetch);
     void destroy_texture(CachedTexture& texture);
-    
+
     VkFormat translate_format(TextureFormat format);
     u32 get_bytes_per_block(TextureFormat format);
     u32 get_block_size(TextureFormat format);
-    
-    void detile_texture(const void* src, void* dst, u32 width, u32 height, 
+    u64 compute_texture_data_size(u32 width, u32 height, TextureFormat format, u32 mip_levels);
+
+    void detile_texture(const void* src, void* dst, u32 width, u32 height,
                        TextureFormat format, bool is_tiled);
+    void detile_texture_3d(const void* src, void* dst, u32 width, u32 height,
+                           u32 depth, TextureFormat format, bool is_tiled);
+    void detile_texture_cube(const void* src, void* dst, u32 face_size, u32 height,
+                             TextureFormat format, bool is_tiled);
+    void detile_packed_mip_tail(const void* src, void* dst, u32 base_width, u32 base_height,
+                                u32 start_mip, u32 mip_count, TextureFormat format);
+    void byte_swap_texture_data(void* data, u64 size, TextureFormat format);
     void upload_texture(CachedTexture& texture, const void* data, u64 size);
-    
+    void upload_texture_mips(CachedTexture& texture, const void* data, u64 total_size);
+
+    VkSamplerConfig translate_sampler(const FetchConstant& fetch);
+    static VkSamplerAddressMode translate_address_mode(TextureAddressMode mode);
+    static VkFilter translate_filter(TextureFilter filter);
+
     Status create_staging_buffer();
     void destroy_staging_buffer();
 };

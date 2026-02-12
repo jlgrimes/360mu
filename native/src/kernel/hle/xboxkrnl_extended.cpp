@@ -739,46 +739,134 @@ static void HLE_InterlockedAnd(Cpu* cpu, Memory* memory, u64* args, u64* result)
 //=============================================================================
 
 static void HLE_ObReferenceObjectByHandle(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // NTSTATUS ObReferenceObjectByHandle(
+    //   HANDLE Handle,           // r3
+    //   ULONG ObjectType,        // r4
+    //   KPROCESSOR_MODE Mode,    // r5 (unused)
+    //   PVOID* Object,           // r6
+    //   POBJECT_HANDLE_INFO HandleInfo  // r7 (unused)
+    // )
     u32 handle = static_cast<u32>(args[0]);
     u32 object_type = static_cast<u32>(args[1]);
-    GuestAddr object_ptr = static_cast<GuestAddr>(args[4]);
-    
-    // Write a pseudo-object pointer based on handle
-    memory->write_u32(object_ptr, 0x80000000 + (handle & 0xFFFF) * 0x100);
-    
-    *result = STATUS_SUCCESS;
+    GuestAddr object_ptr = static_cast<GuestAddr>(args[3]);
+
+    // Map Xbox 360 object type constants to our XObjectType
+    // type 0 = any type (ExEventObjectType, ExSemaphoreObjectType, etc.)
+    XObjectType expected = XObjectType::None;
+
+    auto& obj_table = KernelState::instance().object_table();
+    std::shared_ptr<XObject> obj;
+    u32 status = obj_table.reference_object_by_handle(handle, expected, &obj);
+
+    if (status == nt_obj::STATUS_SUCCESS && obj) {
+        // Write the guest object address (or a synthetic one based on handle)
+        GuestAddr guest_addr = obj->guest_object();
+        if (guest_addr == 0) {
+            // No guest representation - create synthetic pointer
+            guest_addr = 0x80000000 + (handle & 0xFFFF) * 0x100;
+            obj->set_guest_object(guest_addr);
+        }
+        if (object_ptr) {
+            memory->write_u32(object_ptr, guest_addr);
+        }
+    }
+
+    *result = status;
 }
 
 static void HLE_ObDereferenceObject(Cpu* cpu, Memory* memory, u64* args, u64* result) {
-    // Decrement reference count - no-op for now
+    // void ObDereferenceObject(PVOID Object)
+    // r3 = pointer to object body in guest memory
+    GuestAddr object_addr = static_cast<GuestAddr>(args[0]);
+
+    // Look up the XObject by guest address from the object table
+    // We iterate to find the matching object
+    auto& obj_table = KernelState::instance().object_table();
+
+    // Try to find object with this guest address in the table
+    // For now, we do a lookup through the table
+    // Since we can't efficiently reverse-lookup by guest addr, just do the
+    // refcount decrement on the XObject that has this guest_object
+    // This is O(n) but the object table is typically small
+    bool found = false;
+
+    // Use a simple scan approach - most games don't have huge object tables
+    for (u32 h = 4; h < 4 + 65536 * 4; h += 4) {
+        auto obj = obj_table.lookup(h);
+        if (obj && obj->guest_object() == object_addr) {
+            obj->release();
+            found = true;
+            LOGD("ObDereferenceObject: addr=0x%08X, refcount=%u",
+                 object_addr, obj->ref_count());
+            break;
+        }
+        if (!obj && h > 4 + 1024 * 4) break;  // Early exit if past likely range
+    }
+
+    if (!found) {
+        LOGD("ObDereferenceObject: addr=0x%08X not found in object table", object_addr);
+    }
+
     *result = 0;
 }
 
 static void HLE_ObCreateObject(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // NTSTATUS ObCreateObject(
+    //   POBJECT_TYPE ObjectType,     // r3
+    //   POBJECT_ATTRIBUTES ObjAttr,  // r4
+    //   ULONG ObjectBodySize,        // r5
+    //   PVOID* Object                // r6
+    // )
     u32 object_type = static_cast<u32>(args[0]);
     GuestAddr object_attr = static_cast<GuestAddr>(args[1]);
-    u32 attr_count = static_cast<u32>(args[2]);
-    u32 body_size = static_cast<u32>(args[3]);
-    GuestAddr object_ptr = static_cast<GuestAddr>(args[4]);
-    
-    // Allocate object
+    u32 body_size = static_cast<u32>(args[2]);
+    GuestAddr object_ptr = static_cast<GuestAddr>(args[3]);
+
+    // Allocate guest memory for the object body
     static GuestAddr next_object = 0x90000000;
-    GuestAddr obj = next_object;
+    GuestAddr obj_addr = next_object;
     next_object += align_up(body_size + 0x20, 16u);
-    
-    memory->write_u32(object_ptr, obj);
+
+    // Create a host-side XObject to track it
+    auto xobj = std::make_shared<XObject>(XObjectType::None);
+    xobj->set_guest_object(obj_addr);
+
+    // Add to object table
+    auto& obj_table = KernelState::instance().object_table();
+    obj_table.add_object(xobj);
+
+    if (object_ptr) {
+        memory->write_u32(object_ptr, obj_addr);
+    }
+
+    LOGD("ObCreateObject: type=%u, size=%u -> addr=0x%08X, handle=0x%08X",
+         object_type, body_size, obj_addr, xobj->handle());
+
     *result = STATUS_SUCCESS;
 }
 
 static void HLE_NtDuplicateObject(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // NTSTATUS NtDuplicateObject(
+    //   HANDLE SourceProcessHandle,  // r3 (ignored - always current process)
+    //   HANDLE SourceHandle,         // r4
+    //   HANDLE TargetProcessHandle,  // r5 (ignored - always current process)
+    //   PHANDLE TargetHandle,        // r6
+    //   ACCESS_MASK DesiredAccess,   // r7 (ignored)
+    //   ULONG Attributes,            // r8 (ignored)
+    //   ULONG Options                // r9 (ignored)
+    // )
     u32 source_handle = static_cast<u32>(args[1]);
     GuestAddr target_handle_ptr = static_cast<GuestAddr>(args[3]);
-    
-    // Create a duplicate handle (just use a new handle number)
-    u32 new_handle = g_ext_hle.next_handle++;
-    memory->write_u32(target_handle_ptr, new_handle);
-    
-    *result = STATUS_SUCCESS;
+
+    auto& obj_table = KernelState::instance().object_table();
+    u32 new_handle = 0;
+    u32 status = obj_table.duplicate_handle(source_handle, &new_handle);
+
+    if (status == nt_obj::STATUS_SUCCESS && target_handle_ptr) {
+        memory->write_u32(target_handle_ptr, new_handle);
+    }
+
+    *result = status;
 }
 
 //=============================================================================
@@ -946,6 +1034,356 @@ static void HLE_RtlFreeAnsiString(Cpu* cpu, Memory* memory, u64* args, u64* resu
 
 static void HLE_RtlFreeUnicodeString(Cpu* cpu, Memory* memory, u64* args, u64* result) {
     *result = 0;
+}
+
+static void HLE_RtlCompareUnicodeString(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr str1 = static_cast<GuestAddr>(args[0]);
+    GuestAddr str2 = static_cast<GuestAddr>(args[1]);
+    u32 case_insensitive = static_cast<u32>(args[2]);
+
+    u16 len1 = memory->read_u16(str1);
+    u16 len2 = memory->read_u16(str2);
+    GuestAddr buf1 = memory->read_u32(str1 + 4);
+    GuestAddr buf2 = memory->read_u32(str2 + 4);
+
+    u16 min_len = std::min(len1, len2);
+    for (u16 i = 0; i < min_len; i += 2) {
+        u16 c1 = memory->read_u16(buf1 + i);
+        u16 c2 = memory->read_u16(buf2 + i);
+
+        if (case_insensitive) {
+            if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+            if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+        }
+
+        if (c1 != c2) {
+            *result = (c1 < c2) ? static_cast<u64>(-1) : 1;
+            return;
+        }
+    }
+
+    *result = (len1 == len2) ? 0 : ((len1 < len2) ? static_cast<u64>(-1) : 1);
+}
+
+static void HLE_RtlEqualString(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr str1 = static_cast<GuestAddr>(args[0]);
+    GuestAddr str2 = static_cast<GuestAddr>(args[1]);
+    u32 case_insensitive = static_cast<u32>(args[2]);
+
+    u16 len1 = memory->read_u16(str1);
+    u16 len2 = memory->read_u16(str2);
+
+    if (len1 != len2) { *result = 0; return; }
+
+    GuestAddr buf1 = memory->read_u32(str1 + 4);
+    GuestAddr buf2 = memory->read_u32(str2 + 4);
+
+    for (u16 i = 0; i < len1; i++) {
+        char c1 = static_cast<char>(memory->read_u8(buf1 + i));
+        char c2 = static_cast<char>(memory->read_u8(buf2 + i));
+        if (case_insensitive) {
+            if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+            if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+        }
+        if (c1 != c2) { *result = 0; return; }
+    }
+
+    *result = 1;  // TRUE - equal
+}
+
+static void HLE_RtlEqualUnicodeString(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr str1 = static_cast<GuestAddr>(args[0]);
+    GuestAddr str2 = static_cast<GuestAddr>(args[1]);
+    u32 case_insensitive = static_cast<u32>(args[2]);
+
+    u16 len1 = memory->read_u16(str1);
+    u16 len2 = memory->read_u16(str2);
+
+    if (len1 != len2) { *result = 0; return; }
+
+    GuestAddr buf1 = memory->read_u32(str1 + 4);
+    GuestAddr buf2 = memory->read_u32(str2 + 4);
+
+    for (u16 i = 0; i < len1; i += 2) {
+        u16 c1 = memory->read_u16(buf1 + i);
+        u16 c2 = memory->read_u16(buf2 + i);
+        if (case_insensitive) {
+            if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+            if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+        }
+        if (c1 != c2) { *result = 0; return; }
+    }
+
+    *result = 1;
+}
+
+static void HLE_RtlMultiByteToUnicodeN(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // NTSTATUS RtlMultiByteToUnicodeN(
+    //   PWCH UnicodeString, ULONG MaxBytesInUnicodeString, PULONG BytesInUnicodeString,
+    //   const CHAR* MultiByteString, ULONG BytesInMultiByteString
+    // );
+    GuestAddr uni_buf = static_cast<GuestAddr>(args[0]);
+    u32 max_bytes = static_cast<u32>(args[1]);
+    GuestAddr bytes_written_ptr = static_cast<GuestAddr>(args[2]);
+    GuestAddr mb_buf = static_cast<GuestAddr>(args[3]);
+    u32 mb_bytes = static_cast<u32>(args[4]);
+
+    u32 chars_to_convert = std::min(mb_bytes, max_bytes / 2);
+    for (u32 i = 0; i < chars_to_convert; i++) {
+        u8 c = memory->read_u8(mb_buf + i);
+        memory->write_u16(uni_buf + i * 2, c);
+    }
+
+    if (bytes_written_ptr) {
+        memory->write_u32(bytes_written_ptr, chars_to_convert * 2);
+    }
+
+    *result = STATUS_SUCCESS;
+}
+
+static void HLE_RtlUnicodeToMultiByteN(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // NTSTATUS RtlUnicodeToMultiByteN(
+    //   PCHAR MultiByteString, ULONG MaxBytesInMultiByteString, PULONG BytesInMultiByteString,
+    //   PCWCH UnicodeString, ULONG BytesInUnicodeString
+    // );
+    GuestAddr mb_buf = static_cast<GuestAddr>(args[0]);
+    u32 max_bytes = static_cast<u32>(args[1]);
+    GuestAddr bytes_written_ptr = static_cast<GuestAddr>(args[2]);
+    GuestAddr uni_buf = static_cast<GuestAddr>(args[3]);
+    u32 uni_bytes = static_cast<u32>(args[4]);
+
+    u32 chars_to_convert = std::min(uni_bytes / 2, max_bytes);
+    for (u32 i = 0; i < chars_to_convert; i++) {
+        u16 wc = memory->read_u16(uni_buf + i * 2);
+        memory->write_u8(mb_buf + i, static_cast<u8>(wc & 0xFF));
+    }
+
+    if (bytes_written_ptr) {
+        memory->write_u32(bytes_written_ptr, chars_to_convert);
+    }
+
+    *result = STATUS_SUCCESS;
+}
+
+static void HLE_RtlUnicodeToMultiByteSize(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // NTSTATUS RtlUnicodeToMultiByteSize(PULONG BytesInMultiByteString,
+    //   PCWCH UnicodeString, ULONG BytesInUnicodeString);
+    GuestAddr size_ptr = static_cast<GuestAddr>(args[0]);
+    u32 uni_bytes = static_cast<u32>(args[2]);
+
+    if (size_ptr) {
+        memory->write_u32(size_ptr, uni_bytes / 2);
+    }
+
+    *result = STATUS_SUCCESS;
+}
+
+static void HLE_RtlImageXexHeaderField(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // PVOID RtlImageXexHeaderField(PVOID XexHeader, DWORD ImageField);
+    GuestAddr xex_header = static_cast<GuestAddr>(args[0]);
+    u32 field = static_cast<u32>(args[1]);
+
+    // Return values for common fields
+    switch (field) {
+        case 0x00010100:  // EntryPoint
+            *result = 0x82000000;
+            break;
+        case 0x00010201:  // ImageBaseAddress
+            *result = 0x82000000;
+            break;
+        case 0x00020200:  // DefaultStackSize
+            *result = 64 * 1024;  // 64KB
+            break;
+        case 0x00020401:  // DefaultHeapSize
+            *result = 256 * 1024;  // 256KB
+            break;
+        case 0x00040006:  // ExecutionId
+            *result = 0;  // No execution ID pointer
+            break;
+        default:
+            LOGD("RtlImageXexHeaderField: field=0x%08X (unknown)", field);
+            *result = 0;
+            break;
+    }
+}
+
+static void HLE_RtlCompareMemory(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // SIZE_T RtlCompareMemory(const VOID* Source1, const VOID* Source2, SIZE_T Length);
+    GuestAddr src1 = static_cast<GuestAddr>(args[0]);
+    GuestAddr src2 = static_cast<GuestAddr>(args[1]);
+    u32 length = static_cast<u32>(args[2]);
+
+    u32 matching = 0;
+    for (u32 i = 0; i < length; i++) {
+        if (memory->read_u8(src1 + i) != memory->read_u8(src2 + i)) break;
+        matching++;
+    }
+
+    *result = matching;
+}
+
+static void HLE_RtlCompareMemoryUlong(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // SIZE_T RtlCompareMemoryUlong(PVOID Source, SIZE_T Length, ULONG Pattern);
+    GuestAddr src = static_cast<GuestAddr>(args[0]);
+    u32 length = static_cast<u32>(args[1]);
+    u32 pattern = static_cast<u32>(args[2]);
+
+    u32 matching = 0;
+    for (u32 i = 0; i + 3 < length; i += 4) {
+        if (memory->read_u32(src + i) != pattern) break;
+        matching += 4;
+    }
+
+    *result = matching;
+}
+
+static void HLE_RtlFillMemoryUlong(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // VOID RtlFillMemoryUlong(PVOID Destination, SIZE_T Length, ULONG Pattern);
+    GuestAddr dest = static_cast<GuestAddr>(args[0]);
+    u32 length = static_cast<u32>(args[1]);
+    u32 pattern = static_cast<u32>(args[2]);
+
+    for (u32 i = 0; i + 3 < length; i += 4) {
+        memory->write_u32(dest + i, pattern);
+    }
+}
+
+static void HLE_ExGetXConfigSetting(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // NTSTATUS ExGetXConfigSetting(WORD Category, WORD Setting, PVOID Buffer, WORD BufferSize, PWORD RequiredSize);
+    u32 category = static_cast<u32>(args[0]);
+    u32 setting = static_cast<u32>(args[1]);
+    GuestAddr buffer = static_cast<GuestAddr>(args[2]);
+    u32 buffer_size = static_cast<u32>(args[3]);
+    GuestAddr required_size_ptr = static_cast<GuestAddr>(args[4]);
+
+    LOGD("ExGetXConfigSetting: cat=%u, setting=%u", category, setting);
+
+    // Return reasonable defaults
+    if (buffer && buffer_size >= 4) {
+        memory->write_u32(buffer, 0);
+    }
+    if (required_size_ptr) {
+        memory->write_u16(required_size_ptr, 4);
+    }
+
+    *result = STATUS_SUCCESS;
+}
+
+static void HLE_KeStallExecutionProcessor(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // VOID KeStallExecutionProcessor(ULONG Microseconds);
+    u32 microseconds = static_cast<u32>(args[0]);
+    if (microseconds > 0 && microseconds < 100000) {
+        std::this_thread::sleep_for(std::chrono::microseconds(microseconds));
+    }
+    *result = 0;
+}
+
+static void HLE_KeRaiseIrqlToDpcLevel(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // KIRQL KeRaiseIrqlToDpcLevel(VOID);
+    *result = 0;  // Return old IRQL (PASSIVE_LEVEL)
+}
+
+static void HLE_KfLowerIrql(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // VOID KfLowerIrql(KIRQL NewIrql);
+    *result = 0;
+}
+
+static void HLE_KfRaiseIrql(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // KIRQL KfRaiseIrql(KIRQL NewIrql);
+    *result = 0;  // Return old IRQL
+}
+
+static void HLE_NtSignalAndWaitForSingleObject(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // NTSTATUS NtSignalAndWaitForSingleObject(
+    //   HANDLE SignalHandle, HANDLE WaitHandle, BOOLEAN Alertable, PLARGE_INTEGER Timeout
+    // );
+    u32 signal_handle = static_cast<u32>(args[0]);
+    u32 wait_handle = static_cast<u32>(args[1]);
+
+    // Signal the first object
+    if (g_scheduler) {
+        g_scheduler->signal_object(signal_handle);
+    }
+
+    // For now, return success (wait immediately satisfied)
+    *result = STATUS_SUCCESS;
+}
+
+static void HLE_RtlUpcaseUnicodeChar(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // WCHAR RtlUpcaseUnicodeChar(WCHAR SourceCharacter);
+    u16 ch = static_cast<u16>(args[0]);
+    if (ch >= 'a' && ch <= 'z') ch -= 32;
+    *result = ch;
+}
+
+static void HLE_RtlDowncaseUnicodeChar(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    u16 ch = static_cast<u16>(args[0]);
+    if (ch >= 'A' && ch <= 'Z') ch += 32;
+    *result = ch;
+}
+
+static void HLE_RtlUpcaseUnicodeString(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // NTSTATUS RtlUpcaseUnicodeString(PUNICODE_STRING Dest, PCUNICODE_STRING Src, BOOLEAN Alloc);
+    GuestAddr dest = static_cast<GuestAddr>(args[0]);
+    GuestAddr src = static_cast<GuestAddr>(args[1]);
+    u32 alloc = static_cast<u32>(args[2]);
+
+    u16 src_len = memory->read_u16(src);
+    GuestAddr src_buf = memory->read_u32(src + 4);
+
+    GuestAddr dest_buf;
+    if (alloc) {
+        static GuestAddr next_buf = 0x52000000;
+        dest_buf = next_buf;
+        next_buf += align_up(static_cast<u32>(src_len + 2), 16u);
+    } else {
+        dest_buf = memory->read_u32(dest + 4);
+    }
+
+    for (u16 i = 0; i < src_len; i += 2) {
+        u16 ch = memory->read_u16(src_buf + i);
+        if (ch >= 'a' && ch <= 'z') ch -= 32;
+        memory->write_u16(dest_buf + i, ch);
+    }
+
+    memory->write_u16(dest, src_len);
+    memory->write_u16(dest + 2, src_len + 2);
+    memory->write_u32(dest + 4, dest_buf);
+
+    *result = STATUS_SUCCESS;
+}
+
+static void HLE_NtCreateEvent(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // NTSTATUS NtCreateEvent(
+    //   PHANDLE EventHandle, ACCESS_MASK DesiredAccess,
+    //   POBJECT_ATTRIBUTES ObjectAttributes, EVENT_TYPE EventType, BOOLEAN InitialState
+    // );
+    GuestAddr handle_ptr = static_cast<GuestAddr>(args[0]);
+    u32 event_type = static_cast<u32>(args[3]);
+    u32 initial_state = static_cast<u32>(args[4]);
+
+    // Allocate event object in guest memory
+    static GuestAddr next_event = 0x92000000;
+    GuestAddr event = next_event;
+    next_event += 0x20;
+
+    // Initialize dispatcher header
+    memory->write_u8(event + 0, static_cast<u8>(event_type));
+    memory->write_u8(event + 1, 0);
+    memory->write_u8(event + 2, sizeof(u32) * 4);
+    memory->write_u8(event + 3, 0);
+    memory->write_u32(event + 4, initial_state);
+
+    // Create handle
+    static u32 next_event_handle = 0xE0000100;
+    u32 handle = next_event_handle++;
+
+    if (handle_ptr) {
+        memory->write_u32(handle_ptr, handle);
+    }
+
+    *result = STATUS_SUCCESS;
+    LOGD("NtCreateEvent: handle=0x%X, type=%u, state=%u", handle, event_type, initial_state);
 }
 
 //=============================================================================
@@ -1707,6 +2145,23 @@ void Kernel::register_xboxkrnl_extended() {
     hle_functions_[make_import_key(0, 264)] = HLE_RtlAnsiStringToUnicodeString;
     hle_functions_[make_import_key(0, 273)] = HLE_RtlFreeAnsiString;
     hle_functions_[make_import_key(0, 274)] = HLE_RtlFreeUnicodeString;
+    hle_functions_[make_import_key(0, 269)] = HLE_RtlCompareUnicodeString;
+    hle_functions_[make_import_key(0, 275)] = HLE_RtlEqualString;
+    hle_functions_[make_import_key(0, 276)] = HLE_RtlEqualUnicodeString;
+    hle_functions_[make_import_key(0, 286)] = HLE_RtlMultiByteToUnicodeN;
+    hle_functions_[make_import_key(0, 293)] = HLE_RtlUnicodeToMultiByteN;
+    hle_functions_[make_import_key(0, 294)] = HLE_RtlUnicodeToMultiByteSize;
+    hle_functions_[make_import_key(0, 295)] = HLE_RtlUpcaseUnicodeChar;
+    hle_functions_[make_import_key(0, 296)] = HLE_RtlDowncaseUnicodeChar;
+    hle_functions_[make_import_key(0, 297)] = HLE_RtlUpcaseUnicodeString;
+
+    // Memory utilities
+    hle_functions_[make_import_key(0, 265)] = HLE_RtlCompareMemory;
+    hle_functions_[make_import_key(0, 266)] = HLE_RtlCompareMemoryUlong;
+    hle_functions_[make_import_key(0, 271)] = HLE_RtlFillMemoryUlong;
+
+    // XEX/Module
+    hle_functions_[make_import_key(0, 361)] = HLE_RtlImageXexHeaderField;
     
     // Random
     hle_functions_[make_import_key(0, 283)] = HLE_RtlRandom;
@@ -1720,6 +2175,15 @@ void Kernel::register_xboxkrnl_extended() {
     hle_functions_[make_import_key(0, 27)] = HLE_HalReturnToFirmware;
     hle_functions_[make_import_key(0, 336)] = HLE_KeBugCheck;
     hle_functions_[make_import_key(0, 337)] = HLE_KeBugCheckEx;
+    hle_functions_[make_import_key(0, 16)] = HLE_ExGetXConfigSetting;
+    hle_functions_[make_import_key(0, 83)] = HLE_KeStallExecutionProcessor;
+    hle_functions_[make_import_key(0, 213)] = HLE_NtSignalAndWaitForSingleObject;
+    hle_functions_[make_import_key(0, 189)] = HLE_NtCreateEvent;
+
+    // IRQL management
+    hle_functions_[make_import_key(0, 76)] = HLE_KeRaiseIrqlToDpcLevel;
+    hle_functions_[make_import_key(0, 161)] = HLE_KfLowerIrql;
+    hle_functions_[make_import_key(0, 160)] = HLE_KfRaiseIrql;
     
     // DPC
     hle_functions_[make_import_key(0, 57)] = HLE_KeInitializeDpc;

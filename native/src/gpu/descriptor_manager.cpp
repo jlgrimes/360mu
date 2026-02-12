@@ -171,11 +171,27 @@ Status DescriptorManager::create_descriptor_layout() {
     layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layout_info.bindingCount = static_cast<u32>(bindings.size());
     layout_info.pBindings = bindings.data();
-    
+
     if (vkCreateDescriptorSetLayout(vulkan_->device(), &layout_info, nullptr, &layout_) != VK_SUCCESS) {
         return Status::ErrorInit;
     }
-    
+
+    // Set 2: SSBO for memexport (storage buffer at binding 0)
+    VkDescriptorSetLayoutBinding ssbo_binding{};
+    ssbo_binding.binding = 0;
+    ssbo_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    ssbo_binding.descriptorCount = 1;
+    ssbo_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+    VkDescriptorSetLayoutCreateInfo ssbo_layout_info{};
+    ssbo_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    ssbo_layout_info.bindingCount = 1;
+    ssbo_layout_info.pBindings = &ssbo_binding;
+
+    if (vkCreateDescriptorSetLayout(vulkan_->device(), &ssbo_layout_info, nullptr, &ssbo_layout_) != VK_SUCCESS) {
+        return Status::ErrorInit;
+    }
+
     return Status::Ok;
 }
 
@@ -185,18 +201,37 @@ Status DescriptorManager::create_pipeline_layout() {
     push_constant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     push_constant.offset = 0;
     push_constant.size = 64;  // 16 floats for misc per-draw data
-    
-    VkPipelineLayoutCreateInfo layout_info{};
-    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layout_info.setLayoutCount = 1;
-    layout_info.pSetLayouts = &layout_;
-    layout_info.pushConstantRangeCount = 1;
-    layout_info.pPushConstantRanges = &push_constant;
-    
-    if (vkCreatePipelineLayout(vulkan_->device(), &layout_info, nullptr, &pipeline_layout_) != VK_SUCCESS) {
+
+    // Set layouts: [0] = UBOs + samplers, [1] = empty placeholder, [2] = SSBO (memexport)
+    // Create empty layout for set 1 (unused gap between set 0 and set 2)
+    VkDescriptorSetLayoutCreateInfo empty_layout_info{};
+    empty_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    empty_layout_info.bindingCount = 0;
+    empty_layout_info.pBindings = nullptr;
+
+    VkDescriptorSetLayout empty_layout;
+    if (vkCreateDescriptorSetLayout(vulkan_->device(), &empty_layout_info, nullptr, &empty_layout) != VK_SUCCESS) {
         return Status::ErrorInit;
     }
-    
+
+    VkDescriptorSetLayout set_layouts[3] = { layout_, empty_layout, ssbo_layout_ };
+
+    VkPipelineLayoutCreateInfo layout_info{};
+    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.setLayoutCount = 3;
+    layout_info.pSetLayouts = set_layouts;
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push_constant;
+
+    VkResult result = vkCreatePipelineLayout(vulkan_->device(), &layout_info, nullptr, &pipeline_layout_);
+
+    // Destroy the temporary empty layout (it's baked into the pipeline layout now)
+    vkDestroyDescriptorSetLayout(vulkan_->device(), empty_layout, nullptr);
+
+    if (result != VK_SUCCESS) {
+        return Status::ErrorInit;
+    }
+
     return Status::Ok;
 }
 

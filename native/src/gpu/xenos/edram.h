@@ -268,7 +268,10 @@ enum class TextureTileMode : u8 {
 
 /**
  * Texture untiling functions
- * Xbox 360 uses a complex tiling pattern for textures
+ * Xbox 360 uses a complex tiling pattern for textures:
+ * - 32x32-block macro tiles (row-major across surface)
+ * - 8x8-block micro tiles within each macro tile (Morton ordered)
+ * - Individual blocks within micro tiles (Morton ordered)
  */
 class TextureUntiler {
 public:
@@ -278,26 +281,46 @@ public:
     static void untile_2d(const u8* src, u8* dst,
                           u32 width, u32 height, u32 bpp,
                           u32 block_width, u32 block_height);
-    
+
     /**
-     * Untile a 3D texture
+     * Untile a 3D texture (per-slice 2D tiling)
      */
     static void untile_3d(const u8* src, u8* dst,
                           u32 width, u32 height, u32 depth, u32 bpp);
-    
+
     /**
-     * Calculate tiled offset for a pixel
+     * Untile a cubemap (per-face 2D tiling)
+     */
+    static void untile_cube(const u8* src, u8* dst,
+                            u32 face_size, u32 bpp,
+                            u32 block_width, u32 block_height);
+
+    /**
+     * Calculate tiled byte offset for a 2D block coordinate.
+     * Two-level tiling: macro tile (32x32) row-major, micro tile (8x8) Morton,
+     * element within micro tile Morton.
      */
     static u32 get_tiled_offset_2d(u32 x, u32 y, u32 width, u32 bpp);
-    
+
     /**
-     * Calculate tiled offset for a 3D coordinate
+     * Calculate tiled byte offset for a 3D coordinate
      */
     static u32 get_tiled_offset_3d(u32 x, u32 y, u32 z, u32 width, u32 height, u32 bpp);
-    
-    // Xbox 360 texture tiling uses a modified Morton curve (Z-order curve)
+
+    // Morton curve encoding/decoding
     static u32 morton_encode(u32 x, u32 y);
     static void morton_decode(u32 code, u32& x, u32& y);
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+    /**
+     * NEON-optimized 2D untiling for ARM64.
+     * Processes 4 blocks at a time using vector loads when bpp=4 or bpp=8.
+     * Falls back to scalar for other block sizes.
+     */
+    static void untile_2d_neon(const u8* src, u8* dst,
+                                u32 width, u32 height, u32 bpp,
+                                u32 block_width, u32 block_height);
+#endif
 };
 
 } // namespace x360mu

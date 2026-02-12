@@ -21,10 +21,14 @@
 #include "gpu/descriptor_manager.h"
 #include "gpu/buffer_pool.h"
 #include "gpu/default_shaders.h"
+#include "gpu/gpu_debug.h"
+#include "x360mu/byte_swap.h"
 #include "memory/memory.h"
 #include "kernel/xobject.h"  // For GPU interrupt signaling
 #include <cstring>
 #include <cstdio>
+#include <thread>
+#include <unordered_set>
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -118,6 +122,37 @@ VkPrimitiveTopology translate_primitive_type(PrimitiveType type) {
 }
 
 //=============================================================================
+// Xbox 360 Vertex Format → VkFormat Translation
+//=============================================================================
+
+static VkFormat translate_vertex_format(VertexFormat fmt) {
+    switch (fmt) {
+        case VertexFormat::kFloat1:     return VK_FORMAT_R32_SFLOAT;
+        case VertexFormat::kFloat2:     return VK_FORMAT_R32G32_SFLOAT;
+        case VertexFormat::kFloat3:     return VK_FORMAT_R32G32B32_SFLOAT;
+        case VertexFormat::kFloat4:     return VK_FORMAT_R32G32B32A32_SFLOAT;
+        case VertexFormat::kHalf2:      return VK_FORMAT_R16G16_SFLOAT;
+        case VertexFormat::kHalf4:      return VK_FORMAT_R16G16B16A16_SFLOAT;
+        case VertexFormat::kUByte4:     return VK_FORMAT_R8G8B8A8_UINT;
+        case VertexFormat::kByte4:      return VK_FORMAT_R8G8B8A8_SINT;
+        case VertexFormat::kUByte4N:    return VK_FORMAT_R8G8B8A8_UNORM;
+        case VertexFormat::kShort2:     return VK_FORMAT_R16G16_SINT;
+        case VertexFormat::kShort4:     return VK_FORMAT_R16G16B16A16_SINT;
+        case VertexFormat::kShort2N:    return VK_FORMAT_R16G16_SNORM;
+        case VertexFormat::kShort4N:    return VK_FORMAT_R16G16B16A16_SNORM;
+        case VertexFormat::kUShort2N:   return VK_FORMAT_R16G16_UNORM;
+        case VertexFormat::kUShort4N:   return VK_FORMAT_R16G16B16A16_UNORM;
+        case VertexFormat::kDec3N:      return VK_FORMAT_A2B10G10R10_SNORM_PACK32;
+        case VertexFormat::kFloat16_2:  return VK_FORMAT_R16G16_SFLOAT;
+        case VertexFormat::kFloat16_4:  return VK_FORMAT_R16G16B16A16_SFLOAT;
+        case VertexFormat::k8_8_8_8:    return VK_FORMAT_R8G8B8A8_UNORM;
+        case VertexFormat::k2_10_10_10: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+        case VertexFormat::k10_11_11:   return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+        default:                        return VK_FORMAT_R32G32B32A32_SFLOAT;
+    }
+}
+
+//=============================================================================
 // CommandProcessor Implementation
 //=============================================================================
 
@@ -148,6 +183,18 @@ Status CommandProcessor::initialize(Memory* memory, VulkanBackend* vulkan,
     descriptor_manager_ = descriptor_manager;
     buffer_pool_ = buffer_pool;
 
+    // When descriptor_manager provides its own pipeline layout, override the
+    // backend's layout so that pipeline creation and descriptor binding are
+    // consistent with the descriptor set layout used for constant/texture
+    // resources.
+    if (descriptor_manager_ && vulkan_) {
+        VkPipelineLayout dm_layout = descriptor_manager_->get_pipeline_layout();
+        if (dm_layout != VK_NULL_HANDLE) {
+            vulkan_->set_pipeline_layout_override(dm_layout);
+            LOGI("Pipeline layout override set from descriptor manager");
+        }
+    }
+
     reset();
 
     LOGI("Command processor initialized (shader_cache=%s, descriptors=%s, buffer_pool=%s)",
@@ -159,6 +206,11 @@ Status CommandProcessor::initialize(Memory* memory, VulkanBackend* vulkan,
 void CommandProcessor::shutdown() {
     // Clean up default shaders before clearing pointers
     cleanup_default_shaders();
+
+    // Clear pipeline layout override before descriptor_manager is released
+    if (vulkan_) {
+        vulkan_->set_pipeline_layout_override(VK_NULL_HANDLE);
+    }
 
     memory_ = nullptr;
     vulkan_ = nullptr;
@@ -185,7 +237,13 @@ void CommandProcessor::reset() {
     pixel_constants_.fill(0.0f);
     bool_constants_.fill(0);
     loop_constants_.fill(0);
-    
+
+    // Mark all constants dirty so they get uploaded on first draw
+    vertex_constants_dirty_ = true;
+    pixel_constants_dirty_ = true;
+    bool_constants_dirty_ = true;
+    loop_constants_dirty_ = true;
+
     gpu_state_ = {};
     render_state_ = {};
     frame_complete_ = false;
@@ -196,6 +254,14 @@ void CommandProcessor::reset() {
     direct_buffer_ = nullptr;
     direct_buffer_size_ = 0;
     direct_buffer_pos_ = 0;
+
+    ib_depth_ = 0;
+    scratch_ram_.fill(0);
+    bin_mask_lo_ = 0xFFFFFFFF;
+    bin_mask_hi_ = 0xFFFFFFFF;
+    bin_select_lo_ = 0;
+    bin_select_hi_ = 0;
+    pending_shader_ = {};
 }
 
 void CommandProcessor::set_register(u32 index, u32 value) {
@@ -316,29 +382,36 @@ void CommandProcessor::execute_type0_direct(u32 header, const u32* data) {
 void CommandProcessor::execute_type3_direct(u32 header, const u32* data) {
     PM4Opcode opcode = type3_opcode(header);
     u32 count = type3_count(header);
-    
+
+    GPU_TRACE_PM4(3, static_cast<u32>(opcode), count);
+
     // Check predication
     if (type3_predicate(header)) {
-        // TODO: Check predicate register
+        // Check predicate: skip packet if predication active and result is false
+        if (predication_.active) {
+            u32 qid = predication_.query_index;
+            if (occlusion_.query_valid[qid]) {
+                u64 result = occlusion_.query_results[qid];
+                bool pass = (result > 0);
+                if (predication_.inverted) pass = !pass;
+                if (!pass) return;
+            }
+        }
     }
-    
+
     switch (opcode) {
         case PM4Opcode::NOP:
-            // Nothing to do
             break;
-            
+
         case PM4Opcode::INTERRUPT:
-            // Signal interrupt to CPU - queue a kernel interrupt callback
             LOGI("GPU interrupt - signaling kernel");
             KernelState::instance().queue_gpu_interrupt();
             break;
-            
+
         case PM4Opcode::WAIT_FOR_IDLE:
-            // Wait for GPU to finish - nothing to do in emulation
             break;
-            
+
         case PM4Opcode::REG_RMW:
-            // Read-modify-write register
             if (count >= 3) {
                 u32 reg = data[0];
                 u32 and_mask = data[1];
@@ -347,24 +420,147 @@ void CommandProcessor::execute_type3_direct(u32 header, const u32* data) {
                 write_register(reg, value);
             }
             break;
-            
+
         case PM4Opcode::SET_CONSTANT:
         case PM4Opcode::SET_CONSTANT2:
         case PM4Opcode::SET_SHADER_CONSTANTS:
             handle_set_constant_direct(data, count);
             break;
-            
+
         case PM4Opcode::DRAW_INDX:
             handle_draw_indx_direct(data, count);
             break;
-            
+
         case PM4Opcode::DRAW_INDX_2:
         case PM4Opcode::DRAW_INDX_AUTO:
+        case PM4Opcode::DRAW_INDX_BIN:
             handle_draw_indx_auto_direct(data, count);
             break;
-            
+
+        case PM4Opcode::WAIT_REG_MEM:
+            // In direct mode (testing), conditions are assumed met
+            break;
+
+        case PM4Opcode::MEM_WRITE:
+            if (count >= 2 && memory_) {
+                GuestAddr dest = data[0] & 0xFFFFFFFC;
+                for (u32 i = 1; i < count; i++) {
+                    memory_->write_u32(dest + (i - 1) * 4, data[i]);
+                }
+            }
+            break;
+
+        case PM4Opcode::EVENT_WRITE:
+        case PM4Opcode::EVENT_WRITE_EXT:
+            if (count >= 1) {
+                u32 event_type = data[0] & 0x3F;
+                if (event_type == 0x14) {  // SWAP
+                    flush_draw_batch();
+                    frame_complete_ = true;
+                    in_frame_ = false;
+                    draws_this_frame_ = 0;
+                }
+            }
+            break;
+
+        case PM4Opcode::EVENT_WRITE_SHD:
+            if (count >= 3 && memory_) {
+                GuestAddr dest = data[1] & 0xFFFFFFFC;
+                memory_->write_u32(dest, data[2]);
+                if (count >= 4) memory_->write_u32(dest + 4, data[3]);
+                u32 event_type = data[0] & 0x3F;
+                if (event_type == 0x14) {
+                    flush_draw_batch();
+                    frame_complete_ = true;
+                    in_frame_ = false;
+                    draws_this_frame_ = 0;
+                }
+            }
+            break;
+
+        case PM4Opcode::SURFACE_SYNC:
+        case PM4Opcode::ME_INIT:
+        case PM4Opcode::CP_INVALIDATE_STATE:
+        case PM4Opcode::INVALIDATE_STATE:
+        case PM4Opcode::CONTEXT_UPDATE:
+            break;
+
+        case PM4Opcode::VIZ_QUERY:
+            // In direct mode: handle query begin/end via register state
+            if (count >= 1) {
+                u32 viz_info = data[0];
+                u32 query_id = viz_info & 0xFF;
+                bool end_query = (viz_info >> 23) & 1;
+                if (end_query && occlusion_.active) {
+                    if (vulkan_) vulkan_->end_occlusion_query(occlusion_.active_query_id);
+                    occlusion_.active = false;
+                }
+                if (!end_query) {
+                    occlusion_.active_query_id = query_id;
+                    occlusion_.active = true;
+                    if (vulkan_) vulkan_->begin_occlusion_query(query_id);
+                }
+            }
+            break;
+
+        case PM4Opcode::SET_PREDICATION:
+            if (count >= 1) {
+                u32 pred_info = data[0];
+                bool enable = (pred_info >> 31) & 1;
+                if (enable) {
+                    predication_.active = true;
+                    predication_.query_index = pred_info & 0xFF;
+                    predication_.inverted = (pred_info >> 8) & 1;
+                    predication_.wait = (pred_info >> 9) & 1;
+                } else {
+                    predication_.active = false;
+                }
+            }
+            break;
+
+        case PM4Opcode::LOAD_ALU_CONSTANT:
+        case PM4Opcode::LOAD_BOOL_CONSTANT:
+        case PM4Opcode::LOAD_LOOP_CONSTANT:
+            // These load from guest memory - require memory_ in direct mode
+            break;
+
+        case PM4Opcode::SET_BIN_MASK_LO:
+            if (count >= 1) bin_mask_lo_ = data[0];
+            break;
+
+        case PM4Opcode::SET_BIN_MASK_HI:
+            if (count >= 1) bin_mask_hi_ = data[0];
+            break;
+
+        case PM4Opcode::SET_BIN_SELECT_LO:
+            if (count >= 1) bin_select_lo_ = data[0];
+            break;
+
+        case PM4Opcode::SET_BIN_SELECT_HI:
+            if (count >= 1) bin_select_hi_ = data[0];
+            break;
+
+        case PM4Opcode::SCRATCH_RAM_WRITE:
+            if (count >= 2) {
+                u32 offset = data[0] & 0xFF;
+                if (offset < scratch_ram_.size()) {
+                    scratch_ram_[offset] = data[1];
+                }
+            }
+            break;
+
+        case PM4Opcode::SCRATCH_RAM_READ:
+            if (count >= 2) {
+                u32 offset = data[0] & 0xFF;
+                u32 dest_reg = data[1];
+                if (offset < scratch_ram_.size()) {
+                    write_register(dest_reg, scratch_ram_[offset]);
+                }
+            }
+            break;
+
         default:
-            LOGD("Unhandled PM4 opcode: 0x%02X, count: %u", 
+            LOGD("Unhandled PM4 opcode: 0x%02X, count: %u",
                  static_cast<u32>(opcode), count);
             break;
     }
@@ -431,12 +627,23 @@ void CommandProcessor::execute_type2(u32 /*header*/) {
 void CommandProcessor::execute_type3(u32 header, GuestAddr data_addr) {
     PM4Opcode opcode = type3_opcode(header);
     u32 count = type3_count(header);
-    
+
+    GPU_TRACE_PM4(3, static_cast<u32>(opcode), count);
+
     // Check predication
     if (type3_predicate(header)) {
-        // TODO: Check predicate register
+        // Check predicate: skip packet if predication active and result is false
+        if (predication_.active) {
+            u32 qid = predication_.query_index;
+            if (occlusion_.query_valid[qid]) {
+                u64 result = occlusion_.query_results[qid];
+                bool pass = (result > 0);
+                if (predication_.inverted) pass = !pass;
+                if (!pass) return;
+            }
+        }
     }
-    
+
     switch (opcode) {
         case PM4Opcode::NOP:
             // Nothing to do
@@ -515,39 +722,98 @@ void CommandProcessor::execute_type3(u32 header, GuestAddr data_addr) {
             break;
             
         case PM4Opcode::EVENT_WRITE:
-        case PM4Opcode::EVENT_WRITE_SHD:
         case PM4Opcode::EVENT_WRITE_EXT:
             handle_event_write(data_addr, count);
             break;
-            
+
+        case PM4Opcode::EVENT_WRITE_SHD:
+            handle_event_write_shd(data_addr, count);
+            break;
+
         case PM4Opcode::INDIRECT_BUFFER:
         case PM4Opcode::INDIRECT_BUFFER_PFD:
             handle_indirect_buffer(data_addr, count);
             break;
-            
+
         case PM4Opcode::SURFACE_SYNC:
             handle_surface_sync(data_addr, count);
             break;
-            
+
         case PM4Opcode::ME_INIT:
             // Microengine init - reset state
             LOGD("ME_INIT");
             break;
-            
+
         case PM4Opcode::CP_INVALIDATE_STATE:
-            // Invalidate CP state cache
+        case PM4Opcode::INVALIDATE_STATE:
+            LOGD("INVALIDATE_STATE");
             break;
-            
+
         case PM4Opcode::VIZ_QUERY:
-            // Visibility query
+            handle_viz_query(data_addr, count);
             break;
-            
+
+        case PM4Opcode::SET_PREDICATION:
+            handle_set_predication(data_addr, count);
+            break;
+
         case PM4Opcode::CONTEXT_UPDATE:
-            // Context update
             break;
-            
+
+        case PM4Opcode::IM_LOAD:
+            handle_im_load(data_addr, count);
+            break;
+
+        case PM4Opcode::IM_LOAD_IMMEDIATE:
+            handle_im_load_immediate(data_addr, count);
+            break;
+
+        case PM4Opcode::DRAW_INDX_BIN:
+            handle_draw_indx_bin(data_addr, count);
+            break;
+
+        case PM4Opcode::SET_BIN_MASK_LO:
+            handle_set_bin_mask(data_addr, count, false);
+            break;
+
+        case PM4Opcode::SET_BIN_MASK_HI:
+            handle_set_bin_mask(data_addr, count, true);
+            break;
+
+        case PM4Opcode::SET_BIN_SELECT_LO:
+            handle_set_bin_select(data_addr, count, false);
+            break;
+
+        case PM4Opcode::SET_BIN_SELECT_HI:
+            handle_set_bin_select(data_addr, count, true);
+            break;
+
+        case PM4Opcode::COPY_DW:
+            handle_copy_dw(data_addr, count);
+            break;
+
+        case PM4Opcode::SCRATCH_RAM_WRITE:
+            if (count >= 2) {
+                u32 offset = read_cmd(data_addr) & 0xFF;
+                u32 value = read_cmd(data_addr + 4);
+                if (offset < scratch_ram_.size()) {
+                    scratch_ram_[offset] = value;
+                }
+            }
+            break;
+
+        case PM4Opcode::SCRATCH_RAM_READ:
+            if (count >= 2) {
+                u32 offset = read_cmd(data_addr) & 0xFF;
+                u32 dest_reg = read_cmd(data_addr + 4);
+                if (offset < scratch_ram_.size()) {
+                    write_register(dest_reg, scratch_ram_[offset]);
+                }
+            }
+            break;
+
         default:
-            LOGD("Unhandled PM4 opcode: 0x%02X, count: %u", 
+            LOGW("Unhandled PM4 opcode: 0x%02X, count: %u",
                  static_cast<u32>(opcode), count);
             break;
     }
@@ -701,25 +967,30 @@ void CommandProcessor::handle_draw_indx_auto_direct(const u32* data, u32 count) 
 
 void CommandProcessor::handle_set_constant_direct(const u32* data, u32 count) {
     if (count < 1) return;
-    
+
     u32 info = data[0];
     u32 type = (info >> 16) & 0x3;  // 0=ALU, 1=Fetch, 2=Bool, 3=Loop
-    u32 index = info & 0x1FF;
-    
+    u32 index = info & 0x7FF;       // 11-bit index (0-2047 for ALU vertex+pixel)
+
     // Read constant values
     for (u32 i = 1; i < count; i++) {
         u32 value = data[i];
         u32 const_index = index + i - 1;
-        
+
         switch (type) {
             case 0:  // ALU (float) constants
+                // Xenos ALU constant space: 0-1023 = vertex, 1024-2047 = pixel
                 if (const_index < 256 * 4) {
                     memcpy(&vertex_constants_[const_index], &value, sizeof(f32));
-                    // Also update gpu_state_
                     memcpy(&gpu_state_.alu_constants[const_index], &value, sizeof(f32));
+                    vertex_constants_dirty_ = true;
+                } else if (const_index < 512 * 4) {
+                    u32 pixel_idx = const_index - 256 * 4;
+                    memcpy(&pixel_constants_[pixel_idx], &value, sizeof(f32));
+                    pixel_constants_dirty_ = true;
                 }
                 break;
-                
+
             case 1:  // Fetch constants
                 if (const_index < 96 * 6) {
                     u32 fetch_idx = const_index / 6;
@@ -727,20 +998,27 @@ void CommandProcessor::handle_set_constant_direct(const u32* data, u32 count) {
                     vertex_fetch_[fetch_idx].data[word_idx] = value;
                     gpu_state_.vertex_fetch_constants[const_index] = value;
                 }
+                if (const_index < 32 * 6) {
+                    u32 tex_idx = const_index / 6;
+                    u32 word_idx = const_index % 6;
+                    texture_fetch_[tex_idx].data[word_idx] = value;
+                }
                 break;
-                
+
             case 2:  // Bool constants
                 if (const_index < bool_constants_.size()) {
                     bool_constants_[const_index] = value;
+                    bool_constants_dirty_ = true;
                     if (const_index < 8) {
                         gpu_state_.bool_constants[const_index] = value;
                     }
                 }
                 break;
-                
+
             case 3:  // Loop constants
                 if (const_index < loop_constants_.size()) {
                     loop_constants_[const_index] = value;
+                    loop_constants_dirty_ = true;
                     gpu_state_.loop_constants[const_index] = value;
                 }
                 break;
@@ -759,7 +1037,7 @@ void CommandProcessor::handle_load_alu_constant(GuestAddr data_addr, u32 count) 
     // Determine if this is vertex or pixel constants
     bool is_pixel = (info >> 31) & 1;
     f32* dest = is_pixel ? pixel_constants_.data() : vertex_constants_.data();
-    
+
     // Load constants from memory
     for (u32 i = 0; i < size_vec4 && (start_offset + i) < 256; i++) {
         u32 offset = (start_offset + i) * 4;
@@ -767,6 +1045,12 @@ void CommandProcessor::handle_load_alu_constant(GuestAddr data_addr, u32 count) 
             u32 raw = memory_->read_u32(src_addr + (i * 16) + (j * 4));
             memcpy(&dest[offset + j], &raw, sizeof(f32));
         }
+    }
+
+    if (is_pixel) {
+        pixel_constants_dirty_ = true;
+    } else {
+        vertex_constants_dirty_ = true;
     }
 }
 
@@ -782,6 +1066,7 @@ void CommandProcessor::handle_load_bool_constant(GuestAddr data_addr, u32 count)
     for (u32 i = 0; i < words_to_load && (start_bit / 32 + i) < bool_constants_.size(); i++) {
         bool_constants_[start_bit / 32 + i] = memory_->read_u32(src_addr + i * 4);
     }
+    bool_constants_dirty_ = true;
 }
 
 void CommandProcessor::handle_load_loop_constant(GuestAddr data_addr, u32 count) {
@@ -795,45 +1080,60 @@ void CommandProcessor::handle_load_loop_constant(GuestAddr data_addr, u32 count)
     for (u32 i = 0; i < (count - 1) && (start_index + i) < loop_constants_.size(); i++) {
         loop_constants_[start_index + i] = memory_->read_u32(src_addr + i * 4);
     }
+    loop_constants_dirty_ = true;
 }
 
 void CommandProcessor::handle_set_constant(GuestAddr data_addr, u32 count) {
     if (count < 1) return;
-    
+
     u32 info = read_cmd(data_addr);
     u32 type = (info >> 16) & 0x3;  // 0=ALU, 1=Fetch, 2=Bool, 3=Loop
-    u32 index = info & 0x1FF;
-    
+    u32 index = info & 0x7FF;       // 11-bit index (0-2047 for ALU vertex+pixel)
+
     // Read constant values
     for (u32 i = 1; i < count; i++) {
         u32 value = read_cmd(data_addr + i * 4);
         u32 const_index = index + i - 1;
-        
+
         switch (type) {
             case 0:  // ALU (float) constants
+                // Xenos ALU constant space: 0-1023 = vertex (256 vec4),
+                // 1024-2047 = pixel (256 vec4)
                 if (const_index < 256 * 4) {
                     memcpy(&vertex_constants_[const_index], &value, sizeof(f32));
+                    vertex_constants_dirty_ = true;
+                } else if (const_index < 512 * 4) {
+                    memcpy(&pixel_constants_[const_index - 256 * 4], &value, sizeof(f32));
+                    pixel_constants_dirty_ = true;
                 }
                 break;
-                
+
             case 1:  // Fetch constants
-                // Store in appropriate fetch constant array
+                // Store in vertex fetch constant array
                 if (const_index < 96 * 6) {
                     u32 fetch_idx = const_index / 6;
                     u32 word_idx = const_index % 6;
                     vertex_fetch_[fetch_idx].data[word_idx] = value;
                 }
+                // Texture fetch constants (first 32 fetch slots are also texture slots)
+                if (const_index < 32 * 6) {
+                    u32 tex_idx = const_index / 6;
+                    u32 word_idx = const_index % 6;
+                    texture_fetch_[tex_idx].data[word_idx] = value;
+                }
                 break;
-                
+
             case 2:  // Bool constants
                 if (const_index < bool_constants_.size()) {
                     bool_constants_[const_index] = value;
+                    bool_constants_dirty_ = true;
                 }
                 break;
-                
+
             case 3:  // Loop constants
                 if (const_index < loop_constants_.size()) {
                     loop_constants_[const_index] = value;
+                    loop_constants_dirty_ = true;
                 }
                 break;
         }
@@ -846,82 +1146,164 @@ void CommandProcessor::handle_event_write(GuestAddr data_addr, u32 count) {
     u32 event_info = read_cmd(data_addr);
     u32 event_type = event_info & 0x3F;
     
-    // Event types we care about
-    constexpr u32 EVENT_SWAP = 0x14;      // Swap buffers
+    // Xenos GPU event types (from ATI R600/Xenos documentation)
+    constexpr u32 EVENT_CACHE_FLUSH_TS = 0x04;
+    constexpr u32 EVENT_CACHE_FLUSH_AND_INV = 0x06;
+    constexpr u32 EVENT_SWAP = 0x14;
+    constexpr u32 EVENT_ZPASS_DONE = 0x15;
     constexpr u32 EVENT_CACHE_FLUSH = 0x16;
     constexpr u32 EVENT_VS_DONE = 0x28;
     constexpr u32 EVENT_PS_DONE = 0x29;
-    
+
     switch (event_type) {
         case EVENT_SWAP:
-            // Frame complete
+            GPU_END_FRAME();
+            flush_draw_batch();
+            if (vulkan_ && vulkan_->has_debug_utils()) {
+                vulkan_->cmd_end_label();  // End "Frame N" label
+            }
             frame_complete_ = true;
             in_frame_ = false;
-            LOGD("Frame complete: %llu draws", draws_this_frame_);
+            LOGD("Frame complete: %llu draws", (unsigned long long)draws_this_frame_);
             draws_this_frame_ = 0;
+            KernelState::instance().queue_gpu_interrupt();
             break;
-            
+
         case EVENT_CACHE_FLUSH:
-            // Flush caches
+        case EVENT_CACHE_FLUSH_TS:
+        case EVENT_CACHE_FLUSH_AND_INV:
+            if (texture_cache_) {
+                texture_cache_->invalidate_all();
+            }
+            LOGD("Cache flush event (type=%u)", event_type);
             break;
-            
+
+        case EVENT_ZPASS_DONE:
+            if (occlusion_.active && vulkan_) {
+                u32 vk_idx = occlusion_.guest_to_vk_query[occlusion_.active_query_id];
+                vulkan_->end_occlusion_query(vk_idx);
+                occlusion_.active = false;
+                u64 samples = 0;
+                if (vulkan_->get_query_result(vk_idx, samples)) {
+                    occlusion_.query_results[occlusion_.active_query_id] = samples;
+                    occlusion_.query_valid[occlusion_.active_query_id] = true;
+                }
+                LOGD("ZPASS_DONE: query=%u samples=%llu",
+                     occlusion_.active_query_id, (unsigned long long)samples);
+            }
+            write_register(0x2000, 1);  // SCRATCH_REG0 = query done
+            break;
+
         case EVENT_VS_DONE:
-        case EVENT_PS_DONE:
-            // Shader done events
+            write_register(0x2001, 1);  // SCRATCH_REG1 = VS done
+            LOGD("VS_DONE event");
             break;
-            
+
+        case EVENT_PS_DONE:
+            write_register(0x2002, 1);  // SCRATCH_REG2 = PS done
+            KernelState::instance().queue_gpu_interrupt();
+            LOGD("PS_DONE event");
+            break;
+
         default:
+            LOGD("Unhandled event type: %u", event_type);
             break;
     }
 }
 
 void CommandProcessor::handle_mem_write(GuestAddr data_addr, u32 count) {
-    if (count < 2) return;
-    
-    GuestAddr dest_addr = read_cmd(data_addr);
-    u32 value = read_cmd(data_addr + 4);
-    
-    // Write value to memory
-    memory_->write_u32(dest_addr, value);
+    if (count < 2 || !memory_) return;
+
+    // MEM_WRITE format:
+    // data[0] = address (bits 31:2) | endianness (bits 1:0)
+    // data[1..N] = values to write
+    u32 addr_info = read_cmd(data_addr);
+    GuestAddr dest_addr = addr_info & 0xFFFFFFFC;
+
+    // Write all payload dwords to consecutive addresses
+    for (u32 i = 1; i < count; i++) {
+        u32 value = read_cmd(data_addr + i * 4);
+        memory_->write_u32(dest_addr + (i - 1) * 4, value);
+    }
 }
 
 void CommandProcessor::handle_wait_reg_mem(GuestAddr data_addr, u32 count) {
     if (count < 5) return;
-    
+
     u32 wait_info = read_cmd(data_addr);
-    u32 poll_addr_lo = read_cmd(data_addr + 4);
+    u32 poll_addr = read_cmd(data_addr + 4);
     u32 poll_addr_hi = read_cmd(data_addr + 8);
     u32 reference = read_cmd(data_addr + 12);
     u32 mask = read_cmd(data_addr + 16);
-    
+
     bool mem_space = (wait_info >> 4) & 1;  // 0=register, 1=memory
     u32 function = wait_info & 0x7;
-    
-    // In emulation, we assume the condition is already met
-    // Real hardware would spin until condition is satisfied
-    (void)poll_addr_lo;
     (void)poll_addr_hi;
-    (void)reference;
-    (void)mask;
-    (void)mem_space;
-    (void)function;
+
+    // Poll with limited retry — games depend on this for GPU/CPU sync.
+    // Memory values may be updated asynchronously by other threads.
+    constexpr u32 kMaxRetries = 100;
+    bool condition_met = false;
+
+    for (u32 retry = 0; retry <= kMaxRetries; retry++) {
+        u32 current_value;
+        if (mem_space && memory_) {
+            current_value = memory_->read_u32(poll_addr);
+        } else {
+            current_value = get_register(poll_addr);
+        }
+
+        u32 masked_value = current_value & mask;
+
+        switch (function) {
+            case 0: condition_met = true; break;
+            case 1: condition_met = (masked_value < reference); break;
+            case 2: condition_met = (masked_value <= reference); break;
+            case 3: condition_met = (masked_value == reference); break;
+            case 4: condition_met = (masked_value != reference); break;
+            case 5: condition_met = (masked_value >= reference); break;
+            case 6: condition_met = (masked_value > reference); break;
+            default: condition_met = true; break;
+        }
+
+        if (condition_met) break;
+
+        if (retry < kMaxRetries) {
+            std::this_thread::yield();
+        }
+    }
+
+    if (!condition_met) {
+        LOGW("WAIT_REG_MEM: condition not met after %u retries (%s addr=%08x mask=%08x ref=%08x fn=%u), proceeding",
+             kMaxRetries, mem_space ? "mem" : "reg", poll_addr, mask, reference, function);
+    }
 }
 
 void CommandProcessor::handle_indirect_buffer(GuestAddr data_addr, u32 count) {
     if (count < 2) return;
-    
+
+    // Recursion depth guard
+    if (ib_depth_ >= kMaxIBDepth) {
+        LOGW("INDIRECT_BUFFER: max recursion depth %u reached, skipping", kMaxIBDepth);
+        return;
+    }
+
     GuestAddr ib_addr = read_cmd(data_addr);
     u32 ib_size = read_cmd(data_addr + 4) & 0xFFFFF;  // Size in dwords
-    
+
+    if (ib_addr == 0 || ib_size == 0) return;
+
     // Execute commands from indirect buffer
+    ib_depth_++;
     u32 ib_read = 0;
     while (ib_read < ib_size) {
         u32 consumed = 0;
         execute_packet(ib_addr + ib_read * 4, consumed);
         ib_read += consumed;
-        
+
         if (consumed == 0) break;  // Prevent infinite loop
     }
+    ib_depth_--;
 }
 
 void CommandProcessor::handle_cond_write(GuestAddr data_addr, u32 count) {
@@ -992,6 +1374,198 @@ void CommandProcessor::handle_surface_sync(GuestAddr data_addr, u32 count) {
     LOGD("Surface sync");
 }
 
+void CommandProcessor::handle_event_write_shd(GuestAddr data_addr, u32 count) {
+    if (count < 1) return;
+
+    u32 event_info = read_cmd(data_addr);
+    u32 event_type = event_info & 0x3F;
+
+    // EVENT_WRITE_SHD writes data to a memory address after an event
+    // Used for GPU->CPU synchronization (e.g., writing fence values)
+    // Format: data[0] = event_info, data[1] = address, data[2] = value
+    if (count >= 3 && memory_) {
+        GuestAddr dest_addr = read_cmd(data_addr + 4) & 0xFFFFFFFC;
+        u32 value = read_cmd(data_addr + 8);
+
+        // For ZPASS_DONE with active query, write actual sample count
+        constexpr u32 ZPASS_DONE_TYPE = 0x15;
+        if (event_type == ZPASS_DONE_TYPE && occlusion_.active && vulkan_) {
+            u32 vk_idx = occlusion_.guest_to_vk_query[occlusion_.active_query_id];
+            vulkan_->end_occlusion_query(vk_idx);
+            occlusion_.active = false;
+            u64 samples = 0;
+            vulkan_->get_query_result(vk_idx, samples);
+            occlusion_.query_results[occlusion_.active_query_id] = samples;
+            occlusion_.query_valid[occlusion_.active_query_id] = true;
+            memory_->write_u32(dest_addr, static_cast<u32>(samples));
+            if (count >= 4) {
+                memory_->write_u32(dest_addr + 4, static_cast<u32>(samples >> 32));
+            }
+            LOGD("EVENT_WRITE_SHD ZPASS: query=%u samples=%llu addr=%08x",
+                 occlusion_.active_query_id, (unsigned long long)samples, dest_addr);
+        } else {
+            memory_->write_u32(dest_addr, value);
+            LOGD("EVENT_WRITE_SHD: event=%u addr=%08x val=%08x", event_type, dest_addr, value);
+            if (count >= 4) {
+                u32 value_hi = read_cmd(data_addr + 12);
+                memory_->write_u32(dest_addr + 4, value_hi);
+            }
+        }
+
+        // Signal GPU interrupt — CPU threads may be waiting on this fence value
+        KernelState::instance().queue_gpu_interrupt();
+    }
+
+    // Check for swap event
+    constexpr u32 EVENT_SWAP = 0x14;
+    if (event_type == EVENT_SWAP) {
+        GPU_END_FRAME();
+        flush_draw_batch();
+        if (vulkan_ && vulkan_->has_debug_utils()) {
+            vulkan_->cmd_end_label();  // End "Frame N" label
+        }
+        frame_complete_ = true;
+        in_frame_ = false;
+        LOGD("Frame complete (EVENT_WRITE_SHD): %llu draws", (unsigned long long)draws_this_frame_);
+        draws_this_frame_ = 0;
+    }
+}
+
+void CommandProcessor::handle_im_load(GuestAddr data_addr, u32 count) {
+    if (count < 2 || !memory_) return;
+
+    // IM_LOAD format:
+    // data[0] = shader type (bit 0: 0=vertex, 1=pixel) | start offset (bits 16-31)
+    // data[1] = source address in guest memory
+    // data[2] = size in dwords (optional, may be derived from count)
+    u32 info = read_cmd(data_addr);
+    GuestAddr src_addr = read_cmd(data_addr + 4);
+
+    bool is_pixel = info & 1;
+    u32 start_offset = (info >> 16) & 0x3FF;
+    u32 size_dwords = (count >= 3) ? read_cmd(data_addr + 8) : 0;
+
+    // If size not specified, estimate from shader program register
+    if (size_dwords == 0) {
+        size_dwords = 512;  // Default max shader size
+    }
+
+    // Store shader microcode in staging area
+    pending_shader_.type = is_pixel ? ShaderType::Pixel : ShaderType::Vertex;
+    pending_shader_.start_offset = start_offset;
+    pending_shader_.data.resize(size_dwords);
+
+    for (u32 i = 0; i < size_dwords; i++) {
+        pending_shader_.data[i] = memory_->read_u32(src_addr + i * 4);
+    }
+
+    // Update shader address register so prepare_shaders() can find it
+    u32 shader_reg = is_pixel ? xenos_reg::SQ_PS_PROGRAM : xenos_reg::SQ_VS_PROGRAM;
+    write_register(shader_reg, (src_addr >> 8) & 0xFFFFF);
+
+    LOGD("IM_LOAD: %s shader, %u dwords from %08x",
+         is_pixel ? "pixel" : "vertex", size_dwords, src_addr);
+}
+
+void CommandProcessor::handle_im_load_immediate(GuestAddr data_addr, u32 count) {
+    if (count < 2) return;
+
+    // IM_LOAD_IMMEDIATE format:
+    // data[0] = shader type (bit 0: 0=vertex, 1=pixel) | start offset (bits 16-31)
+    // data[1] = size in dwords
+    // data[2..N] = shader microcode (inline in packet)
+    u32 info = read_cmd(data_addr);
+    u32 size_dwords = read_cmd(data_addr + 4);
+
+    bool is_pixel = info & 1;
+    u32 start_offset = (info >> 16) & 0x3FF;
+
+    // Clamp to available data
+    u32 available = (count > 2) ? (count - 2) : 0;
+    if (size_dwords > available) {
+        size_dwords = available;
+    }
+
+    // Read immediate shader data from packet
+    pending_shader_.type = is_pixel ? ShaderType::Pixel : ShaderType::Vertex;
+    pending_shader_.start_offset = start_offset;
+    pending_shader_.data.resize(size_dwords);
+
+    for (u32 i = 0; i < size_dwords; i++) {
+        pending_shader_.data[i] = read_cmd(data_addr + (2 + i) * 4);
+    }
+
+    LOGD("IM_LOAD_IMMEDIATE: %s shader, %u dwords inline",
+         is_pixel ? "pixel" : "vertex", size_dwords);
+}
+
+void CommandProcessor::handle_draw_indx_bin(GuestAddr data_addr, u32 count) {
+    // DRAW_INDX_BIN is identical to DRAW_INDX but used during binning pass
+    // The bin mask determines which bins this draw affects
+    // For emulation without tiled rendering, treat as normal DRAW_INDX
+    handle_draw_indx(data_addr, count);
+}
+
+void CommandProcessor::handle_copy_dw(GuestAddr data_addr, u32 count) {
+    if (count < 3 || !memory_) return;
+
+    // COPY_DW format:
+    // data[0] = src info (bit 0: 0=register, 1=memory)
+    // data[1] = source address
+    // data[2] = dest info (bit 0: 0=register, 1=memory)
+    // data[3] = dest address
+    u32 src_info = read_cmd(data_addr);
+    u32 src_addr = read_cmd(data_addr + 4);
+    u32 dst_info = (count >= 4) ? read_cmd(data_addr + 8) : 0;
+    u32 dst_addr = (count >= 4) ? read_cmd(data_addr + 12) : read_cmd(data_addr + 8);
+
+    bool src_mem = src_info & 1;
+    bool dst_mem = dst_info & 1;
+
+    // Read source value
+    u32 value;
+    if (src_mem) {
+        value = memory_->read_u32(src_addr);
+    } else {
+        value = get_register(src_addr);
+    }
+
+    // Write to destination
+    if (dst_mem) {
+        memory_->write_u32(dst_addr, value);
+    } else {
+        write_register(dst_addr, value);
+    }
+
+    LOGD("COPY_DW: %s[%08x] -> %s[%08x] = %08x",
+         src_mem ? "mem" : "reg", src_addr,
+         dst_mem ? "mem" : "reg", dst_addr, value);
+}
+
+void CommandProcessor::handle_set_bin_mask(GuestAddr data_addr, u32 count, bool hi) {
+    if (count < 1) return;
+
+    u32 mask = read_cmd(data_addr);
+    if (hi) {
+        bin_mask_hi_ = mask;
+    } else {
+        bin_mask_lo_ = mask;
+    }
+    LOGD("SET_BIN_MASK_%s: %08x", hi ? "HI" : "LO", mask);
+}
+
+void CommandProcessor::handle_set_bin_select(GuestAddr data_addr, u32 count, bool hi) {
+    if (count < 1) return;
+
+    u32 select = read_cmd(data_addr);
+    if (hi) {
+        bin_select_hi_ = select;
+    } else {
+        bin_select_lo_ = select;
+    }
+    LOGD("SET_BIN_SELECT_%s: %08x", hi ? "HI" : "LO", select);
+}
+
 //=============================================================================
 // State Management
 //=============================================================================
@@ -1050,6 +1624,28 @@ void CommandProcessor::update_render_state() {
     
     u32 rb_surface_info = registers_[xenos_reg::RB_SURFACE_INFO];
     render_state_.color_pitch = rb_surface_info & 0x3FFF;
+
+    // Update tessellation state from VGT registers
+    u32 vgt_output_path = registers_[xenos_reg::VGT_OUTPUT_PATH_CNTL];
+    render_state_.tessellation_mode = static_cast<TessellationMode>(vgt_output_path & 0x3);
+    render_state_.vgt_hos_cntl = registers_[xenos_reg::VGT_HOS_CNTL];
+
+    u32 tess_level_raw = registers_[xenos_reg::VGT_TESSELLATION_LEVEL];
+    memcpy(&render_state_.tessellation_level, &tess_level_raw, sizeof(f32));
+    if (render_state_.tessellation_level < 1.0f) render_state_.tessellation_level = 1.0f;
+
+    u32 tess_min_raw = registers_[xenos_reg::VGT_HOS_MIN_TESS_LEVEL];
+    u32 tess_max_raw = registers_[xenos_reg::VGT_HOS_MAX_TESS_LEVEL];
+    memcpy(&render_state_.tess_min_level, &tess_min_raw, sizeof(f32));
+    memcpy(&render_state_.tess_max_level, &tess_max_raw, sizeof(f32));
+
+    // Point sprite state
+    u32 pa_su_point_size = registers_[xenos_reg::PA_SU_POINT_SIZE];
+    u32 pa_su_point_minmax = registers_[xenos_reg::PA_SU_POINT_MINMAX];
+    render_state_.point_size = static_cast<f32>((pa_su_point_size >> 16) & 0xFFFF) / 8.0f;
+    render_state_.point_size_min = static_cast<f32>(pa_su_point_minmax & 0xFFFF) / 8.0f;
+    render_state_.point_size_max = static_cast<f32>((pa_su_point_minmax >> 16) & 0xFFFF) / 8.0f;
+    render_state_.point_sprite_enable = (pa_su_sc_mode_cntl >> 18) & 1;
 }
 
 void CommandProcessor::update_shaders() {
@@ -1139,6 +1735,64 @@ void CommandProcessor::update_gpu_state() {
 void CommandProcessor::execute_draw(const DrawCommand& cmd) {
     if (!vulkan_) {
         LOGE("Draw skipped: no Vulkan backend");
+        GPU_TRACE_DRAW_SKIP("no Vulkan backend");
+        return;
+    }
+
+    // CPU fallback predication: skip draw if query result says invisible
+    if (predication_.active && !predication_.use_hw_predication) {
+        u32 qid = predication_.query_index;
+        if (occlusion_.query_valid[qid]) {
+            u64 result = occlusion_.query_results[qid];
+            bool visible = (result > 0);
+            if (predication_.inverted) visible = !visible;
+            if (!visible) {
+                LOGD("Draw skipped by CPU predication (query=%u samples=%llu)",
+                     qid, (unsigned long long)result);
+                return;
+            }
+        }
+    }
+
+    // Handle tessellation: expand patches to triangles on CPU
+    if (needs_tessellation(cmd)) {
+        DrawCommand tess_cmd = tessellate_draw(cmd);
+        execute_draw(tess_cmd);
+        return;
+    }
+
+    // Handle RectList: expand to triangle list
+    if (cmd.primitive_type == PrimitiveType::RectList) {
+        DrawCommand rect_cmd = expand_rect_list(cmd);
+        execute_draw(rect_cmd);
+        return;
+    }
+
+    // Handle QuadList: convert to triangle list (2 tris per quad)
+    if (cmd.primitive_type == PrimitiveType::QuadList) {
+        DrawCommand quad_cmd = cmd;
+        u32 quad_count = cmd.vertex_count / 4;
+        quad_cmd.primitive_type = PrimitiveType::TriangleList;
+        quad_cmd.vertex_count = quad_count * 6;
+        quad_cmd.indexed = false;
+        LOGD("QUAD_LIST: %u quads → %u triangle verts", quad_count, quad_cmd.vertex_count);
+        execute_draw(quad_cmd);
+        return;
+    }
+
+    // Handle LineLoop: approximate as LineStrip (Vulkan has no line loop)
+    if (cmd.primitive_type == PrimitiveType::LineLoop) {
+        DrawCommand line_cmd = cmd;
+        line_cmd.primitive_type = PrimitiveType::LineStrip;
+        execute_draw(line_cmd);
+        return;
+    }
+
+    // Handle QuadStrip: convert to triangle strip
+    if (cmd.primitive_type == PrimitiveType::QuadStrip) {
+        DrawCommand qs_cmd = cmd;
+        qs_cmd.primitive_type = PrimitiveType::TriangleStrip;
+        execute_draw(qs_cmd);
         return;
     }
 
@@ -1157,16 +1811,27 @@ void CommandProcessor::execute_draw(const DrawCommand& cmd) {
         LOGD("  Starting new frame %u", current_frame_index_ + 1);
         if (vulkan_->begin_frame() != Status::Ok) {
             LOGE("  Failed to begin frame - aborting draw");
+            GPU_TRACE_DRAW_SKIP("begin_frame failed");
             return;
         }
         in_frame_ = true;
         current_frame_index_ = (current_frame_index_ + 1) % 3;
+        reset_bound_state();
+        GPU_BEGIN_FRAME(current_frame_index_);
+
+        // Insert frame debug label for GPU captures
+        if (vulkan_->has_debug_utils()) {
+            char label[48];
+            snprintf(label, sizeof(label), "Frame %u", current_frame_index_);
+            vulkan_->cmd_begin_label(label, 1.0f, 0.5f, 0.0f);
+        }
     }
 
     // Prepare shaders from current GPU state
     LOGD("  Preparing shaders...");
     if (!prepare_shaders()) {
         LOGW("  Draw skipped: shader preparation failed");
+        GPU_TRACE_DRAW_SKIP("shader preparation failed");
         return;
     }
     LOGD("  Shaders ready (vs=%p, ps=%p)",
@@ -1176,6 +1841,7 @@ void CommandProcessor::execute_draw(const DrawCommand& cmd) {
     LOGD("  Preparing pipeline...");
     if (!prepare_pipeline(cmd)) {
         LOGW("  Draw skipped: pipeline preparation failed");
+        GPU_TRACE_DRAW_SKIP("pipeline preparation failed");
         return;
     }
     LOGD("  Pipeline ready (%p)", (void*)current_pipeline_);
@@ -1189,11 +1855,13 @@ void CommandProcessor::execute_draw(const DrawCommand& cmd) {
     bind_textures();
 
     // Bind descriptor set
+    bool desc_set_bound = false;
     if (descriptor_manager_) {
         LOGD("  Binding descriptor set...");
         VkDescriptorSet desc_set = descriptor_manager_->begin_frame(current_frame_index_);
         if (desc_set != VK_NULL_HANDLE) {
-            vulkan_->bind_descriptor_set(desc_set);
+            bind_descriptor_set_dedup(desc_set);
+            desc_set_bound = true;
             LOGD("  Descriptor set bound");
         } else {
             LOGW("  No descriptor set available");
@@ -1207,17 +1875,83 @@ void CommandProcessor::execute_draw(const DrawCommand& cmd) {
     }
     bind_vertex_buffers(cmd);
 
-    // Execute draw
-    LOGD("  Issuing Vulkan draw call...");
-    if (cmd.indexed) {
-        vulkan_->draw_indexed(cmd.index_count, cmd.instance_count, cmd.start_index,
-                             cmd.base_vertex, 0);
-    } else {
-        u32 vertex_count = cmd.vertex_count > 0 ? cmd.vertex_count : cmd.index_count;
-        vulkan_->draw(vertex_count, cmd.instance_count, 0, 0);
+    // Build draw trace for debug validation
+    DrawTrace trace{};
+    trace.draw_index = draws_this_frame_ + 1;
+    trace.vertex_count = cmd.vertex_count;
+    trace.index_count = cmd.index_count;
+    trace.instance_count = cmd.instance_count;
+    trace.primitive_type = static_cast<u32>(cmd.primitive_type);
+    trace.indexed = cmd.indexed;
+    trace.index_base = cmd.index_base;
+    trace.index_size = cmd.index_size;
+    trace.vs_addr = render_state_.vertex_shader_address;
+    trace.ps_addr = render_state_.pixel_shader_address;
+    trace.vs_hash = current_vertex_shader_ ? current_vertex_shader_->hash : 0;
+    trace.ps_hash = current_pixel_shader_ ? current_pixel_shader_->hash : 0;
+    trace.using_default_shaders = (current_vertex_shader_ == default_vertex_shader_);
+    trace.pipeline = current_pipeline_;
+    trace.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    trace.cull_mode = static_cast<VkCullModeFlags>(render_state_.cull_mode);
+    trace.depth_test = render_state_.depth_test ? VK_TRUE : VK_FALSE;
+    trace.depth_write = render_state_.depth_write ? VK_TRUE : VK_FALSE;
+    trace.blend_enable = render_state_.blend_enable ? VK_TRUE : VK_FALSE;
+    trace.texture_count = 0;
+    trace.valid_shaders = (current_vertex_shader_ != nullptr && current_pixel_shader_ != nullptr);
+    trace.valid_pipeline = (current_pipeline_ != VK_NULL_HANDLE);
+    trace.valid_render_pass = in_frame_;
+    trace.valid_descriptors = desc_set_bound;
+
+    GPU_VALIDATE_DRAW(trace);
+    GPU_TRACE_DRAW(trace);
+
+    // Insert debug label for GPU captures (RenderDoc/AGI)
+    if (vulkan_->has_debug_utils()) {
+        char label[64];
+        snprintf(label, sizeof(label), "Draw #%llu %s %u",
+                 (unsigned long long)(draws_this_frame_ + 1),
+                 cmd.indexed ? "idx" : "vtx",
+                 cmd.indexed ? cmd.index_count : cmd.vertex_count);
+        vulkan_->cmd_begin_label(label, 0.2f, 0.8f, 0.2f);
+    }
+
+    // Bind memexport SSBO at set=2 if the vertex shader uses memory export
+    if (current_vertex_shader_ && current_vertex_shader_->info.uses_memexport) {
+        VkDescriptorSet memexport_set = vulkan_->get_memexport_descriptor_set();
+        if (memexport_set != VK_NULL_HANDLE) {
+            vkCmdBindDescriptorSets(vulkan_->current_command_buffer(),
+                                     VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                     vulkan_->pipeline_layout(),
+                                     2, 1, &memexport_set, 0, nullptr);
+            LOGD("Bound memexport SSBO descriptor set");
+        }
+    }
+
+    // Queue draw (batching with state deduplication)
+    LOGD("  Queuing Vulkan draw call...");
+    queue_draw(cmd);
+
+    if (vulkan_->has_debug_utils()) {
+        vulkan_->cmd_end_label();
     }
 
     draws_this_frame_++;
+
+    // Insert memory barrier after draws that use memexport (SSBO writes)
+    if (current_vertex_shader_ && current_vertex_shader_->info.uses_memexport) {
+        VkMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                                VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(vulkan_->current_command_buffer(),
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &barrier, 0, nullptr, 0, nullptr);
+        LOGD("Inserted memexport memory barrier");
+    }
 
     LOGI("Draw #%llu complete: %s, %u %s",
          (unsigned long long)draws_this_frame_,
@@ -1231,7 +1965,7 @@ bool CommandProcessor::prepare_shaders() {
     if (!shader_cache_ || !memory_) {
         LOGD("No shader cache/memory, using default shaders");
         use_default_shaders();
-        return true;
+        return current_vertex_shader_ != nullptr && current_pixel_shader_ != nullptr;
     }
 
     // Get shader addresses from GPU state
@@ -1242,10 +1976,10 @@ bool CommandProcessor::prepare_shaders() {
     if (vs_addr == 0 || ps_addr == 0) {
         LOGD("No shader addresses set (vs=%08x, ps=%08x), using defaults", vs_addr, ps_addr);
         use_default_shaders();
-        return true;
+        return current_vertex_shader_ != nullptr && current_pixel_shader_ != nullptr;
     }
 
-    // Get shader microcode from guest memory
+    // Get shader microcode from guest memory with bounds validation
     const void* vs_microcode = memory_->get_host_ptr(vs_addr);
     const void* ps_microcode = memory_->get_host_ptr(ps_addr);
 
@@ -1254,25 +1988,62 @@ bool CommandProcessor::prepare_shaders() {
         LOGW("Failed to translate shader addresses (vs=%08x, ps=%08x), using defaults",
              vs_addr, ps_addr);
         use_default_shaders();
-        return true;
+        return current_vertex_shader_ != nullptr && current_pixel_shader_ != nullptr;
     }
 
-    // Get shader size from registers (or use default)
-    // The size is typically determined by control flow instructions
-    u32 vs_size = 2048;  // Default size, would be parsed from headers
+    // Determine shader sizes - clamp to available memory region
+    // Default 2048 bytes but validate against mapped region
+    u32 vs_size = 2048;
     u32 ps_size = 2048;
 
-    // Try to compile shaders from game microcode
-    current_vertex_shader_ = shader_cache_->get_shader(vs_microcode, vs_size, ShaderType::Vertex);
-    current_pixel_shader_ = shader_cache_->get_shader(ps_microcode, ps_size, ShaderType::Pixel);
+    // Validate that the full microcode region is accessible
+    if (!memory_->get_host_ptr(vs_addr + vs_size - 1)) {
+        // Region not fully mapped, try smaller size
+        vs_size = 512;
+        if (!memory_->get_host_ptr(vs_addr + vs_size - 1)) {
+            LOGW("VS microcode region not accessible at %08x, using defaults", vs_addr);
+            use_default_shaders();
+            return current_vertex_shader_ != nullptr && current_pixel_shader_ != nullptr;
+        }
+    }
+    if (!memory_->get_host_ptr(ps_addr + ps_size - 1)) {
+        ps_size = 512;
+        if (!memory_->get_host_ptr(ps_addr + ps_size - 1)) {
+            LOGW("PS microcode region not accessible at %08x, using defaults", ps_addr);
+            use_default_shaders();
+            return current_vertex_shader_ != nullptr && current_pixel_shader_ != nullptr;
+        }
+    }
+
+    // Try to compile shaders from game microcode (with exception safety)
+    try {
+        current_vertex_shader_ = shader_cache_->get_shader(vs_microcode, vs_size, ShaderType::Vertex);
+        current_pixel_shader_ = shader_cache_->get_shader(ps_microcode, ps_size, ShaderType::Pixel);
+    } catch (...) {
+        LOGW("Exception during shader compilation (vs=%08x, ps=%08x), using defaults",
+             vs_addr, ps_addr);
+        GPU_TRACE_SHADER(vs_addr, ShaderType::Vertex, 0, false, false, 0);
+        GPU_TRACE_SHADER(ps_addr, ShaderType::Pixel, 0, false, false, 0);
+        current_vertex_shader_ = nullptr;
+        current_pixel_shader_ = nullptr;
+    }
 
     // If shader compilation failed, fall back to defaults
     if (!current_vertex_shader_ || !current_pixel_shader_) {
-        LOGW("Shader compilation failed, using defaults");
+        LOGW("Shader compilation failed (vs=%08x, ps=%08x), using defaults",
+             vs_addr, ps_addr);
         use_default_shaders();
-        return true;
+        if (current_vertex_shader_ && current_pixel_shader_) {
+            GPU_TRACE_SHADER(vs_addr, ShaderType::Vertex, current_vertex_shader_->hash, true, true, 0);
+            GPU_TRACE_SHADER(ps_addr, ShaderType::Pixel, current_pixel_shader_->hash, true, true, 0);
+        }
+        return current_vertex_shader_ != nullptr && current_pixel_shader_ != nullptr;
     }
 
+    GPU_TRACE_SHADER(vs_addr, ShaderType::Vertex, current_vertex_shader_->hash, true, false,
+                     current_vertex_shader_->spirv_size / 4);
+    GPU_TRACE_SHADER(ps_addr, ShaderType::Pixel, current_pixel_shader_->hash, true, false,
+                     current_pixel_shader_->spirv_size / 4);
     LOGD("Using game shaders (vs=%08x, ps=%08x)", vs_addr, ps_addr);
     return true;
 }
@@ -1325,11 +2096,44 @@ bool CommandProcessor::prepare_pipeline(const DrawCommand& cmd) {
     };
     key.depth_compare_op = depth_funcs[render_state_.depth_func & 0x7];
     
-    // Blend state
+    // Blend state - map Xenos blend factors to Vulkan
     key.blend_enable = render_state_.blend_enable ? VK_TRUE : VK_FALSE;
-    key.src_color_blend = VK_BLEND_FACTOR_SRC_ALPHA;
-    key.dst_color_blend = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    key.color_blend_op = VK_BLEND_OP_ADD;
+
+    // Xenos blend factor mapping (from ATI R600/Xenos register spec)
+    static const VkBlendFactor blend_factors[] = {
+        VK_BLEND_FACTOR_ZERO,                     // 0: ZERO
+        VK_BLEND_FACTOR_ONE,                      // 1: ONE
+        VK_BLEND_FACTOR_ZERO,                     // 2: reserved
+        VK_BLEND_FACTOR_ZERO,                     // 3: reserved
+        VK_BLEND_FACTOR_SRC_COLOR,                // 4: SRC_COLOR
+        VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR,      // 5: ONE_MINUS_SRC_COLOR
+        VK_BLEND_FACTOR_SRC_ALPHA,                // 6: SRC_ALPHA
+        VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,      // 7: ONE_MINUS_SRC_ALPHA
+        VK_BLEND_FACTOR_DST_COLOR,                // 8: DST_COLOR
+        VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR,      // 9: ONE_MINUS_DST_COLOR
+        VK_BLEND_FACTOR_DST_ALPHA,                // 10: DST_ALPHA
+        VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA,      // 11: ONE_MINUS_DST_ALPHA
+        VK_BLEND_FACTOR_CONSTANT_COLOR,           // 12: CONSTANT_COLOR
+        VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR, // 13: ONE_MINUS_CONSTANT_COLOR
+        VK_BLEND_FACTOR_CONSTANT_ALPHA,           // 14: CONSTANT_ALPHA
+        VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA, // 15: ONE_MINUS_CONSTANT_ALPHA
+        VK_BLEND_FACTOR_SRC_ALPHA_SATURATE,       // 16: SRC_ALPHA_SATURATE
+    };
+    u32 src_idx = render_state_.blend_src & 0x1F;
+    u32 dst_idx = render_state_.blend_dst & 0x1F;
+    key.src_color_blend = (src_idx < 17) ? blend_factors[src_idx] : VK_BLEND_FACTOR_ONE;
+    key.dst_color_blend = (dst_idx < 17) ? blend_factors[dst_idx] : VK_BLEND_FACTOR_ZERO;
+
+    // Xenos blend op mapping
+    static const VkBlendOp blend_ops[] = {
+        VK_BLEND_OP_ADD,              // 0: ADD
+        VK_BLEND_OP_SUBTRACT,         // 1: SUBTRACT
+        VK_BLEND_OP_MIN,              // 2: MIN
+        VK_BLEND_OP_MAX,              // 3: MAX
+        VK_BLEND_OP_REVERSE_SUBTRACT, // 4: REVERSE_SUBTRACT
+    };
+    u32 op_idx = render_state_.blend_op & 0x7;
+    key.color_blend_op = (op_idx < 5) ? blend_ops[op_idx] : VK_BLEND_OP_ADD;
     
     // Cull mode
     switch (render_state_.cull_mode) {
@@ -1339,43 +2143,230 @@ bool CommandProcessor::prepare_pipeline(const DrawCommand& cmd) {
         default: key.cull_mode = VK_CULL_MODE_NONE; break;
     }
     
-    key.front_face = render_state_.front_ccw ? 
-                     VK_FRONT_FACE_COUNTER_CLOCKWISE : 
+    key.front_face = render_state_.front_ccw ?
+                     VK_FRONT_FACE_COUNTER_CLOCKWISE :
                      VK_FRONT_FACE_CLOCKWISE;
-    
+
+    // Build vertex input state from fetch constants
+    build_vertex_input_state(key.vertex_input);
+
+    // Validate shader SPIR-V bindings (once per unique shader)
+    {
+        static std::unordered_set<u64> validated;
+        auto validate_cached = [&](const CachedShader* shader, ShaderType type) {
+            if (!shader || shader->spirv.empty()) return;
+            if (validated.count(shader->hash)) return;
+            validated.insert(shader->hash);
+
+            auto reflection = reflect_spirv(shader->spirv);
+            ShaderInfo info{};
+            for (u32 i = 0; i < 16; i++) {
+                if (shader->vertex_fetch_bindings & (1u << i))
+                    info.vertex_fetch_slots.push_back(i);
+                if (shader->texture_bindings & (1u << i))
+                    info.texture_bindings.push_back(i);
+            }
+            validate_shader_bindings(reflection, info, type);
+        };
+        validate_cached(current_vertex_shader_, ShaderType::Vertex);
+        validate_cached(current_pixel_shader_, ShaderType::Pixel);
+    }
+
     // Get or create pipeline
     if (shader_cache_ && current_vertex_shader_ && current_pixel_shader_) {
         current_pipeline_ = shader_cache_->get_pipeline(
             current_vertex_shader_, current_pixel_shader_, key);
-        
+
         if (current_pipeline_ != VK_NULL_HANDLE) {
-            vulkan_->bind_pipeline(current_pipeline_);
+            GPU_TRACE_PIPELINE(key.vertex_shader_hash, key.pixel_shader_hash,
+                               key.primitive_topology, current_pipeline_);
+            bind_pipeline_dedup(current_pipeline_);
+            set_dynamic_state();
+            return true;
+        }
+
+        // Pipeline creation failed with current shaders - try default shaders
+        if (current_vertex_shader_ != default_vertex_shader_ ||
+            current_pixel_shader_ != default_pixel_shader_) {
+            LOGW("Pipeline creation failed with game shaders, trying defaults");
+            use_default_shaders();
+            if (current_vertex_shader_ && current_pixel_shader_) {
+                key.vertex_shader_hash = current_vertex_shader_->hash;
+                key.pixel_shader_hash = current_pixel_shader_->hash;
+                current_pipeline_ = shader_cache_->get_pipeline(
+                    current_vertex_shader_, current_pixel_shader_, key);
+                if (current_pipeline_ != VK_NULL_HANDLE) {
+                    GPU_TRACE_PIPELINE(key.vertex_shader_hash, key.pixel_shader_hash,
+                                       key.primitive_topology, current_pipeline_);
+                    bind_pipeline_dedup(current_pipeline_);
+                    set_dynamic_state();
+                    return true;
+                }
+            }
+        }
+    } else if (vulkan_ && current_vertex_shader_ && current_pixel_shader_) {
+        // No shader cache available - create pipeline directly via backend
+        PipelineState state;
+        state.primitive_topology = key.primitive_topology;
+        state.cull_mode = key.cull_mode;
+        state.front_face = key.front_face;
+        state.depth_test_enable = key.depth_test_enable;
+        state.depth_write_enable = key.depth_write_enable;
+        state.depth_compare_op = key.depth_compare_op;
+        state.blend_enable = key.blend_enable;
+        state.src_color_blend = key.src_color_blend;
+        state.dst_color_blend = key.dst_color_blend;
+        state.color_blend_op = key.color_blend_op;
+
+        current_pipeline_ = vulkan_->get_or_create_pipeline(
+            state, current_vertex_shader_->module, current_pixel_shader_->module);
+
+        if (current_pipeline_ != VK_NULL_HANDLE) {
+            GPU_TRACE_PIPELINE(current_vertex_shader_->hash, current_pixel_shader_->hash,
+                               key.primitive_topology, current_pipeline_);
+            bind_pipeline_dedup(current_pipeline_);
+            set_dynamic_state();
             return true;
         }
     }
-    
-    // Fallback: use default pipeline from Vulkan backend if available
-    return true;  // Allow draw even without pipeline for testing
+
+    // No valid pipeline could be created
+    LOGW("No pipeline available for draw call");
+    return false;
+}
+
+void CommandProcessor::set_dynamic_state() {
+    // Viewport with deduplication
+    float vp_x = render_state_.viewport_x;
+    float vp_y = render_state_.viewport_y;
+    float vp_w = render_state_.viewport_width > 0 ? render_state_.viewport_width : 1280.0f;
+    float vp_h = render_state_.viewport_height > 0 ? render_state_.viewport_height : 720.0f;
+    float vp_minz = render_state_.viewport_z_min;
+    float vp_maxz = render_state_.viewport_z_max > 0 ? render_state_.viewport_z_max : 1.0f;
+    set_viewport_dedup(vp_x, vp_y, vp_w, vp_h, vp_minz, vp_maxz);
+
+    // Scissor with deduplication
+    s32 sc_x; s32 sc_y; u32 sc_w; u32 sc_h;
+    if (render_state_.scissor_right > render_state_.scissor_left &&
+        render_state_.scissor_bottom > render_state_.scissor_top) {
+        sc_x = static_cast<s32>(render_state_.scissor_left);
+        sc_y = static_cast<s32>(render_state_.scissor_top);
+        sc_w = render_state_.scissor_right - render_state_.scissor_left;
+        sc_h = render_state_.scissor_bottom - render_state_.scissor_top;
+    } else {
+        sc_x = 0; sc_y = 0;
+        sc_w = static_cast<u32>(vp_w);
+        sc_h = static_cast<u32>(vp_h);
+    }
+    set_scissor_dedup(sc_x, sc_y, sc_w, sc_h);
+}
+
+void CommandProcessor::build_vertex_input_state(VertexInputConfig& config) {
+    config = {};
+
+    // Determine which fetch slots the vertex shader actually uses
+    u32 fetch_mask = 0xFFFF;  // default: all 16 slots
+    if (current_vertex_shader_) {
+        fetch_mask = current_vertex_shader_->vertex_fetch_bindings;
+        if (fetch_mask == 0) return;
+    }
+
+    for (u32 i = 0; i < VertexInputConfig::MAX_BINDINGS; i++) {
+        if (!(fetch_mask & (1u << i))) continue;
+
+        const FetchConstant& fetch = render_state_.vertex_fetch[i];
+        if (fetch.vertex_buffer_address() == 0) continue;
+
+        u32 stride = fetch.vertex_buffer_stride();
+        if (stride == 0) stride = 16;  // default stride for vec4
+
+        // Add binding description
+        u32 bi = config.binding_count;
+        config.bindings[bi].binding = i;
+        config.bindings[bi].stride = stride;
+        config.bindings[bi].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        config.binding_count++;
+
+        // Add attribute description
+        // Shader translator declares all vertex inputs as vec4 at location = slot index
+        u32 ai = config.attribute_count;
+        config.attributes[ai].location = i;
+        config.attributes[ai].binding = i;
+        config.attributes[ai].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        config.attributes[ai].offset = 0;
+        config.attribute_count++;
+
+        LOGD("Vertex input slot %u: stride=%u, format=FLOAT4", i, stride);
+    }
 }
 
 void CommandProcessor::bind_vertex_buffers(const DrawCommand& cmd) {
-    // Xbox 360 vertex data comes through fetch constants
-    // For now, we don't bind explicit vertex buffers - the shader uses
-    // vfetch instructions that read from fetch constants in the uniform buffer
-    //
-    // A full implementation would:
-    // 1. Parse vertex fetch constants to get buffer addresses and formats
-    // 2. Create/upload vertex buffers to GPU using buffer_pool_
-    // 3. Bind them with vkCmdBindVertexBuffers
-    //
-    // This is Phase 2 work (shader translation needs vfetch support first)
-
     if (!buffer_pool_ || !memory_ || !vulkan_) {
         return;
     }
 
-    // TODO: Implement vertex buffer binding once shader translator supports vfetch
-    // For now, vertex data is accessed directly in shaders via storage buffers
+    // Parse vertex fetch constants to find active vertex streams
+    // Xbox 360 uses fetch constant slots 0-15 for vertex buffers typically
+    constexpr u32 MAX_VERTEX_BINDINGS = 16;
+    VkBuffer buffers[MAX_VERTEX_BINDINGS] = {};
+    VkDeviceSize vk_offsets[MAX_VERTEX_BINDINGS] = {};
+    u32 max_binding = 0;
+    bool has_bindings = false;
+
+    for (u32 i = 0; i < MAX_VERTEX_BINDINGS; i++) {
+        const FetchConstant& fetch = render_state_.vertex_fetch[i];
+
+        GuestAddr address = fetch.vertex_buffer_address();
+        if (address == 0) {
+            continue;
+        }
+
+        // Buffer size from fetch constant (in dwords → bytes)
+        u32 buffer_size_dwords = fetch.vertex_buffer_size();
+        size_t buffer_size = static_cast<size_t>(buffer_size_dwords) * 4;
+
+        if (buffer_size == 0 || buffer_size > 64 * 1024 * 1024) {
+            continue;  // Skip invalid or unreasonably large buffers
+        }
+
+        // Get host pointer to guest vertex data
+        const void* src = memory_->get_host_ptr(address);
+        if (!src) {
+            LOGW("Failed to get host pointer for vertex buffer %u at %08x", i, address);
+            continue;
+        }
+
+        // Allocate from buffer pool
+        VkBuffer vk_buffer = buffer_pool_->allocate(buffer_size, current_frame_index_);
+        if (vk_buffer == VK_NULL_HANDLE) {
+            LOGE("Failed to allocate vertex buffer %u (size=%zu)", i, buffer_size);
+            continue;
+        }
+
+        void* mapped = buffer_pool_->get_mapped_ptr(vk_buffer);
+        if (!mapped) {
+            LOGE("Failed to get mapped pointer for vertex buffer %u", i);
+            continue;
+        }
+
+        // Endian swap mode from fetch constant word 1, bits 1:0
+        u32 endian_swap = fetch.data[1] & 0x3;
+
+        // Copy guest data with byte-swapping (Xbox 360 is big-endian)
+        endian_copy(mapped, src, buffer_size, endian_swap);
+
+        buffers[i] = vk_buffer;
+        vk_offsets[i] = 0;
+        max_binding = i + 1;
+        has_bindings = true;
+
+        LOGD("Bound vertex buffer %u: addr=%08x, size=%zu, endian=%u",
+             i, address, buffer_size, endian_swap);
+    }
+
+    if (has_bindings) {
+        vulkan_->bind_vertex_buffers(0, max_binding, buffers, vk_offsets);
+    }
 }
 
 void CommandProcessor::bind_index_buffer(const DrawCommand& cmd) {
@@ -1400,89 +2391,107 @@ void CommandProcessor::bind_index_buffer(const DrawCommand& cmd) {
         return;
     }
 
-    // Get mapped pointer and copy index data
+    // Get mapped pointer and copy index data with byte-swapping
     void* mapped = buffer_pool_->get_mapped_ptr(index_buffer);
     if (!mapped) {
         LOGE("Failed to get mapped pointer for index buffer");
         return;
     }
 
-    memcpy(mapped, index_data, index_size);
+    // Xbox 360 is big-endian — swap indices to little-endian
+    // Use 8-in-16 for 16-bit indices, 8-in-32 for 32-bit indices
+    u32 endian_swap = (cmd.index_size == 4) ? 2 : 1;
+    endian_copy(mapped, index_data, index_size, endian_swap);
 
     // Bind the index buffer
     VkIndexType index_type = (cmd.index_size == 4) ?
                               VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
     vulkan_->bind_index_buffer(index_buffer, 0, index_type);
 
-    LOGD("Bound index buffer: count=%u, size=%u, type=%s",
+    LOGD("Bound index buffer: count=%u, size=%u, type=%s, endian=%u",
          cmd.index_count, cmd.index_size,
-         index_type == VK_INDEX_TYPE_UINT32 ? "uint32" : "uint16");
+         index_type == VK_INDEX_TYPE_UINT32 ? "uint32" : "uint16",
+         endian_swap);
 }
 
 void CommandProcessor::update_constants() {
     if (!descriptor_manager_) return;
-    
-    // Update vertex shader constants
-    descriptor_manager_->update_vertex_constants(
-        current_frame_index_, 
-        vertex_constants_.data(), 
-        static_cast<u32>(vertex_constants_.size())
-    );
-    
-    // Update pixel shader constants
-    descriptor_manager_->update_pixel_constants(
-        current_frame_index_,
-        pixel_constants_.data(),
-        static_cast<u32>(pixel_constants_.size())
-    );
-    
-    // Update bool constants
-    descriptor_manager_->update_bool_constants(
-        current_frame_index_,
-        bool_constants_.data(),
-        static_cast<u32>(bool_constants_.size())
-    );
-    
-    // Update loop constants
-    descriptor_manager_->update_loop_constants(
-        current_frame_index_,
-        loop_constants_.data(),
-        static_cast<u32>(loop_constants_.size())
-    );
+
+    // Only upload constants that have been modified since last draw
+    if (vertex_constants_dirty_) {
+        descriptor_manager_->update_vertex_constants(
+            current_frame_index_,
+            vertex_constants_.data(),
+            static_cast<u32>(vertex_constants_.size())
+        );
+        vertex_constants_dirty_ = false;
+    }
+
+    if (pixel_constants_dirty_) {
+        descriptor_manager_->update_pixel_constants(
+            current_frame_index_,
+            pixel_constants_.data(),
+            static_cast<u32>(pixel_constants_.size())
+        );
+        pixel_constants_dirty_ = false;
+    }
+
+    if (bool_constants_dirty_) {
+        descriptor_manager_->update_bool_constants(
+            current_frame_index_,
+            bool_constants_.data(),
+            static_cast<u32>(bool_constants_.size())
+        );
+        bool_constants_dirty_ = false;
+    }
+
+    if (loop_constants_dirty_) {
+        descriptor_manager_->update_loop_constants(
+            current_frame_index_,
+            loop_constants_.data(),
+            static_cast<u32>(loop_constants_.size())
+        );
+        loop_constants_dirty_ = false;
+    }
 }
 
 void CommandProcessor::bind_textures() {
     if (!texture_cache_ || !descriptor_manager_) return;
-    
+
     std::array<VkImageView, 16> views{};
     std::array<VkSampler, 16> samplers{};
     u32 texture_count = 0;
-    
-    // Bind textures from fetch constants
+
+    // Bind textures from fetch constants using per-texture sampler state
     for (u32 i = 0; i < 16; i++) {
         const FetchConstant& fetch = texture_fetch_[i];
-        
+
         // Check if this texture slot is used
         if (fetch.texture_address() == 0) {
             continue;
         }
-        
-        // Get or create texture
+
+        // Get or create texture from cache
         const CachedTexture* tex = texture_cache_->get_texture(fetch);
         if (tex && tex->is_valid()) {
             views[i] = tex->view;
-            
-            // Get sampler (use default for now)
-            VkSamplerConfig sampler_config{};
-            sampler_config.min_filter = VK_FILTER_LINEAR;
-            sampler_config.mag_filter = VK_FILTER_LINEAR;
-            sampler_config.mipmap_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-            sampler_config.address_u = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-            sampler_config.address_v = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-            sampler_config.address_w = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-            sampler_config.max_anisotropy = 1.0f;
-            
-            samplers[i] = texture_cache_->get_sampler(sampler_config);
+
+            // Use the per-texture sampler from CachedTexture (configured from
+            // fetch constant sampler state during texture cache lookup)
+            if (tex->sampler != VK_NULL_HANDLE) {
+                samplers[i] = tex->sampler;
+            } else {
+                // Fallback: use default linear sampler config
+                VkSamplerConfig sampler_config{};
+                sampler_config.min_filter = VK_FILTER_LINEAR;
+                sampler_config.mag_filter = VK_FILTER_LINEAR;
+                sampler_config.mipmap_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+                sampler_config.address_u = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+                sampler_config.address_v = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+                sampler_config.address_w = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+                sampler_config.max_anisotropy = 1.0f;
+                samplers[i] = texture_cache_->get_sampler(sampler_config);
+            }
             texture_count = i + 1;
         }
     }
@@ -1502,8 +2511,14 @@ void CommandProcessor::bind_textures() {
 //=============================================================================
 
 void CommandProcessor::create_default_shaders() {
-    if (!vulkan_ || default_vertex_shader_ || default_pixel_shader_) {
-        return;  // Already created or no Vulkan backend
+    if (!vulkan_) {
+        LOGW("Cannot create default shaders: no Vulkan backend");
+        return;
+    }
+
+    // Already created
+    if (default_vertex_shader_ && default_pixel_shader_) {
+        return;
     }
 
     LOGI("Creating default fallback shaders");
@@ -1511,6 +2526,11 @@ void CommandProcessor::create_default_shaders() {
     // Get SPIR-V for default shaders
     const std::vector<u32>& vs_spirv = get_default_vertex_shader_spirv();
     const std::vector<u32>& ps_spirv = get_default_pixel_shader_spirv();
+
+    if (vs_spirv.empty() || ps_spirv.empty()) {
+        LOGE("Default shader SPIR-V is empty");
+        return;
+    }
 
     // Create vertex shader module
     VkShaderModule vs_module = VK_NULL_HANDLE;
@@ -1521,7 +2541,7 @@ void CommandProcessor::create_default_shaders() {
 
     VkResult result = vkCreateShaderModule(vulkan_->device(), &vs_create_info, nullptr, &vs_module);
     if (result != VK_SUCCESS) {
-        LOGE("Failed to create default vertex shader module");
+        LOGE("Failed to create default vertex shader module (VkResult=%d)", result);
         return;
     }
 
@@ -1534,14 +2554,14 @@ void CommandProcessor::create_default_shaders() {
 
     result = vkCreateShaderModule(vulkan_->device(), &ps_create_info, nullptr, &ps_module);
     if (result != VK_SUCCESS) {
-        LOGE("Failed to create default pixel shader module");
+        LOGE("Failed to create default pixel shader module (VkResult=%d)", result);
         vkDestroyShaderModule(vulkan_->device(), vs_module, nullptr);
         return;
     }
 
     // Create cached shader entries
     default_vertex_shader_ = new CachedShader();
-    default_vertex_shader_->hash = 0xDEFA017F5; // DEFAULT_VS as valid hex
+    default_vertex_shader_->hash = 0xDEFA0175ULL;
     default_vertex_shader_->type = ShaderType::Vertex;
     default_vertex_shader_->module = vs_module;
     default_vertex_shader_->spirv = vs_spirv;
@@ -1552,7 +2572,7 @@ void CommandProcessor::create_default_shaders() {
     default_vertex_shader_->interpolant_mask = 0;
 
     default_pixel_shader_ = new CachedShader();
-    default_pixel_shader_->hash = 0xDEFA017F6; // DEFAULT_PS as valid hex
+    default_pixel_shader_->hash = 0xDEFA0176ULL;
     default_pixel_shader_->type = ShaderType::Pixel;
     default_pixel_shader_->module = ps_module;
     default_pixel_shader_->spirv = ps_spirv;
@@ -1562,7 +2582,8 @@ void CommandProcessor::create_default_shaders() {
     default_pixel_shader_->vertex_fetch_bindings = 0;
     default_pixel_shader_->interpolant_mask = 0;
 
-    LOGI("Default shaders created successfully");
+    LOGI("Default shaders created successfully (vs=%p, ps=%p)",
+         (void*)vs_module, (void*)ps_module);
 }
 
 void CommandProcessor::use_default_shaders() {
@@ -1599,6 +2620,10 @@ void CommandProcessor::cleanup_default_shaders() {
 //=============================================================================
 
 void CommandProcessor::on_register_write(u32 index, u32 value) {
+    // Trace register writes for GPU debug
+    u32 old_val = (index < registers_.size()) ? registers_[index] : 0;
+    GPU_TRACE_REG(index, old_val, value);
+
     // Handle side effects of register writes
 
     switch (index) {
@@ -1673,6 +2698,388 @@ void CommandProcessor::on_register_write(u32 index, u32 value) {
         default:
             break;
     }
+}
+
+//=============================================================================
+// Tessellation and Primitive Expansion
+//=============================================================================
+
+bool CommandProcessor::needs_tessellation(const DrawCommand& cmd) const {
+    if (render_state_.tessellation_mode == TessellationMode::Disabled) return false;
+    return cmd.primitive_type == PrimitiveType::TrianglePatch ||
+           cmd.primitive_type == PrimitiveType::QuadPatch;
+}
+
+void CommandProcessor::tessellate_tri_patch(std::vector<f32>& out_vertices, u32 tess_level) {
+    // Generate tessellated triangle patch as barycentric coordinates (u, v, w, 0)
+    // For level N, divide each edge into N segments
+    if (tess_level < 1) tess_level = 1;
+    if (tess_level > 64) tess_level = 64;
+
+    f32 inv = 1.0f / static_cast<f32>(tess_level);
+
+    struct TV { f32 u, v, w; };
+    std::vector<TV> verts;
+    for (u32 i = 0; i <= tess_level; i++) {
+        for (u32 j = 0; j <= tess_level - i; j++) {
+            f32 u = static_cast<f32>(j) * inv;
+            f32 v = static_cast<f32>(i) * inv;
+            verts.push_back({u, v, 1.0f - u - v});
+        }
+    }
+
+    auto row_start = [&](u32 i) -> u32 {
+        return i * (tess_level + 1) - i * (i - 1) / 2;
+    };
+
+    for (u32 i = 0; i < tess_level; i++) {
+        u32 r0 = row_start(i);
+        u32 r1 = row_start(i + 1);
+        u32 cols = tess_level - i;
+        for (u32 j = 0; j < cols; j++) {
+            const auto& a = verts[r0 + j];
+            const auto& b = verts[r0 + j + 1];
+            const auto& c = verts[r1 + j];
+            out_vertices.insert(out_vertices.end(), {a.u, a.v, a.w, 0.0f});
+            out_vertices.insert(out_vertices.end(), {b.u, b.v, b.w, 0.0f});
+            out_vertices.insert(out_vertices.end(), {c.u, c.v, c.w, 0.0f});
+            if (j + 1 < cols) {
+                const auto& d = verts[r1 + j];
+                const auto& e = verts[r0 + j + 1];
+                const auto& f = verts[r1 + j + 1];
+                out_vertices.insert(out_vertices.end(), {d.u, d.v, d.w, 0.0f});
+                out_vertices.insert(out_vertices.end(), {e.u, e.v, e.w, 0.0f});
+                out_vertices.insert(out_vertices.end(), {f.u, f.v, f.w, 0.0f});
+            }
+        }
+    }
+}
+
+void CommandProcessor::tessellate_quad_patch(std::vector<f32>& out_vertices, u32 tess_level) {
+    // Generate tessellated quad patch as (u, v, 0, 0) parametric coordinates
+    if (tess_level < 1) tess_level = 1;
+    if (tess_level > 64) tess_level = 64;
+
+    f32 inv = 1.0f / static_cast<f32>(tess_level);
+
+    for (u32 i = 0; i < tess_level; i++) {
+        for (u32 j = 0; j < tess_level; j++) {
+            f32 u0 = static_cast<f32>(j) * inv;
+            f32 v0 = static_cast<f32>(i) * inv;
+            f32 u1 = static_cast<f32>(j + 1) * inv;
+            f32 v1 = static_cast<f32>(i + 1) * inv;
+
+            out_vertices.insert(out_vertices.end(), {u0, v0, 0.0f, 0.0f});
+            out_vertices.insert(out_vertices.end(), {u1, v0, 0.0f, 0.0f});
+            out_vertices.insert(out_vertices.end(), {u0, v1, 0.0f, 0.0f});
+
+            out_vertices.insert(out_vertices.end(), {u1, v0, 0.0f, 0.0f});
+            out_vertices.insert(out_vertices.end(), {u1, v1, 0.0f, 0.0f});
+            out_vertices.insert(out_vertices.end(), {u0, v1, 0.0f, 0.0f});
+        }
+    }
+}
+
+DrawCommand CommandProcessor::tessellate_draw(const DrawCommand& cmd) {
+    DrawCommand tessellated = cmd;
+    u32 tess_level = static_cast<u32>(render_state_.tessellation_level);
+    if (tess_level < 1) tess_level = 1;
+
+    u32 verts_per_patch = (cmd.primitive_type == PrimitiveType::QuadPatch) ? 4 : 3;
+    u32 patch_count = cmd.vertex_count / verts_per_patch;
+    if (patch_count == 0) patch_count = 1;
+
+    std::vector<f32> tess_coords;
+    if (cmd.primitive_type == PrimitiveType::QuadPatch) {
+        tessellate_quad_patch(tess_coords, tess_level);
+    } else {
+        tessellate_tri_patch(tess_coords, tess_level);
+    }
+
+    u32 verts_per_tess_patch = static_cast<u32>(tess_coords.size()) / 4;
+
+    tessellated.primitive_type = PrimitiveType::TriangleList;
+    tessellated.indexed = false;
+    tessellated.vertex_count = verts_per_tess_patch * patch_count;
+    tessellated.instance_count = 1;
+
+    LOGD("TESSELLATION: %u patches * %u verts = %u total (level=%u)",
+         patch_count, verts_per_tess_patch, tessellated.vertex_count, tess_level);
+
+    return tessellated;
+}
+
+DrawCommand CommandProcessor::expand_rect_list(const DrawCommand& cmd) {
+    // RectList: 3 vertices per rect (TL, BR, TR) → expand to 2 triangles (6 verts)
+    DrawCommand expanded = cmd;
+    u32 rect_count = cmd.vertex_count / 3;
+    if (rect_count == 0) return cmd;
+
+    expanded.primitive_type = PrimitiveType::TriangleList;
+    expanded.vertex_count = rect_count * 6;
+    expanded.indexed = false;
+
+    LOGD("RECT_LIST: %u rects → %u triangle verts", rect_count, expanded.vertex_count);
+    return expanded;
+}
+
+//=============================================================================
+// Occlusion Query and Predication Handlers
+//=============================================================================
+
+void CommandProcessor::handle_viz_query(GuestAddr data_addr, u32 count) {
+    if (count < 1) return;
+
+    // Lazily initialize query pool on first use
+    if (!occlusion_.query_pool_initialized && vulkan_) {
+        if (vulkan_->create_query_pool(MAX_OCCLUSION_QUERIES) == Status::Ok) {
+            occlusion_.query_pool_initialized = true;
+        } else {
+            LOGW("Failed to create occlusion query pool");
+            return;
+        }
+    }
+
+    u32 viz_info = read_cmd(data_addr);
+
+    // VIZ_QUERY packet format (Xenos/R500):
+    // Bit 0-7:   Query ID (index)
+    // Bit 23:    End flag (1 = end query, 0 = begin query)
+    u32 guest_query_id = viz_info & 0xFF;
+    bool end_query = (viz_info >> 23) & 1;
+
+    if (end_query) {
+        if (occlusion_.active && vulkan_) {
+            u32 vk_index = occlusion_.guest_to_vk_query[occlusion_.active_query_id];
+            vulkan_->end_occlusion_query(vk_index);
+            LOGD("VIZ_QUERY end: guest_id=%u vk_index=%u", occlusion_.active_query_id, vk_index);
+        }
+        occlusion_.active = false;
+
+        u32 reg_value = registers_[xenos_reg::PA_SC_VIZ_QUERY];
+        reg_value &= ~(1u << 23);
+        write_register(xenos_reg::PA_SC_VIZ_QUERY, reg_value);
+    } else {
+        // End any previously active query
+        if (occlusion_.active && vulkan_) {
+            u32 prev_vk = occlusion_.guest_to_vk_query[occlusion_.active_query_id];
+            vulkan_->end_occlusion_query(prev_vk);
+        }
+
+        // Allocate VK query index
+        u32 vk_index = occlusion_.next_query_id % MAX_OCCLUSION_QUERIES;
+        occlusion_.guest_to_vk_query[guest_query_id] = vk_index;
+        occlusion_.query_valid[guest_query_id] = false;
+        occlusion_.next_query_id++;
+
+        if (vulkan_) {
+            vulkan_->reset_queries(vk_index, 1);
+            vulkan_->begin_occlusion_query(vk_index);
+        }
+
+        occlusion_.active = true;
+        occlusion_.active_query_id = guest_query_id;
+
+        u32 reg_value = (guest_query_id & 0xFF) | (1u << 23);
+        write_register(xenos_reg::PA_SC_VIZ_QUERY, reg_value);
+
+        LOGD("VIZ_QUERY begin: guest_id=%u vk_index=%u", guest_query_id, vk_index);
+    }
+}
+
+void CommandProcessor::handle_set_predication(GuestAddr data_addr, u32 count) {
+    if (count < 1) return;
+
+    u32 pred_info = read_cmd(data_addr);
+
+    // SET_PREDICATION packet format:
+    // Bit 31:    Enable (1) / Disable (0)
+    // Bit 0-7:   Query ID to predicate on
+    // Bit 8:     Invert condition
+    // Bit 9:     Wait for query completion
+    bool enable = (pred_info >> 31) & 1;
+
+    if (!enable) {
+        if (predication_.active && predication_.use_hw_predication && vulkan_) {
+            vulkan_->end_conditional_rendering();
+        }
+        predication_.active = false;
+        LOGD("SET_PREDICATION: disabled");
+        return;
+    }
+
+    u32 query_id = pred_info & 0xFF;
+    bool inverted = (pred_info >> 8) & 1;
+    bool wait = (pred_info >> 9) & 1;
+
+    predication_.active = true;
+    predication_.query_index = query_id;
+    predication_.inverted = inverted;
+    predication_.wait = wait;
+
+    if (vulkan_ && vulkan_->has_conditional_rendering() && occlusion_.query_pool_initialized) {
+        u32 vk_index = occlusion_.guest_to_vk_query[query_id];
+        vulkan_->begin_conditional_rendering(vk_index, inverted);
+        predication_.use_hw_predication = true;
+        LOGD("SET_PREDICATION: HW conditional, query=%u inverted=%d", query_id, inverted);
+    } else {
+        predication_.use_hw_predication = false;
+        LOGD("SET_PREDICATION: CPU fallback, query=%u inverted=%d", query_id, inverted);
+    }
+}
+
+
+// ============================================================
+// State deduplication - skip redundant Vulkan bind calls
+// ============================================================
+
+bool CommandProcessor::bind_pipeline_dedup(VkPipeline pipeline) {
+    if (pipeline == bound_state_.pipeline) {
+        redundant_binds_skipped_++;
+        return false;
+    }
+    flush_draw_batch();
+    bound_state_.pipeline = pipeline;
+    vulkan_->bind_pipeline(pipeline);
+    return true;
+}
+
+bool CommandProcessor::bind_descriptor_set_dedup(VkDescriptorSet set) {
+    if (set == bound_state_.descriptor_set) {
+        redundant_binds_skipped_++;
+        return false;
+    }
+    flush_draw_batch();
+    bound_state_.descriptor_set = set;
+    vulkan_->bind_descriptor_set(set);
+    return true;
+}
+
+void CommandProcessor::set_viewport_dedup(float x, float y, float w, float h,
+                                          float minz, float maxz) {
+    if (x == bound_state_.viewport_x && y == bound_state_.viewport_y &&
+        w == bound_state_.viewport_w && h == bound_state_.viewport_h &&
+        minz == bound_state_.viewport_min_z && maxz == bound_state_.viewport_max_z) {
+        redundant_binds_skipped_++;
+        return;
+    }
+    bound_state_.viewport_x = x;
+    bound_state_.viewport_y = y;
+    bound_state_.viewport_w = w;
+    bound_state_.viewport_h = h;
+    bound_state_.viewport_min_z = minz;
+    bound_state_.viewport_max_z = maxz;
+    vulkan_->set_viewport(x, y, w, h, minz, maxz);
+}
+
+void CommandProcessor::set_scissor_dedup(s32 x, s32 y, u32 w, u32 h) {
+    if (x == bound_state_.scissor_x && y == bound_state_.scissor_y &&
+        w == bound_state_.scissor_w && h == bound_state_.scissor_h) {
+        redundant_binds_skipped_++;
+        return;
+    }
+    bound_state_.scissor_x = x;
+    bound_state_.scissor_y = y;
+    bound_state_.scissor_w = w;
+    bound_state_.scissor_h = h;
+    vulkan_->set_scissor(x, y, w, h);
+}
+
+void CommandProcessor::bind_vertex_buffers_dedup(u32 count, const VkBuffer* buffers,
+                                                  const VkDeviceSize* offsets) {
+    if (count == bound_state_.vertex_buffer_count) {
+        bool same = true;
+        for (u32 i = 0; i < count && same; i++) {
+            if (buffers[i] != bound_state_.vertex_buffers[i] ||
+                offsets[i] != bound_state_.vertex_offsets[i]) {
+                same = false;
+            }
+        }
+        if (same) {
+            redundant_binds_skipped_++;
+            return;
+        }
+    }
+    bound_state_.vertex_buffer_count = count;
+    for (u32 i = 0; i < count; i++) {
+        bound_state_.vertex_buffers[i] = buffers[i];
+        bound_state_.vertex_offsets[i] = offsets[i];
+    }
+    vulkan_->bind_vertex_buffers(0, count, buffers, offsets);
+}
+
+void CommandProcessor::bind_index_buffer_dedup(VkBuffer buffer, VkDeviceSize offset,
+                                                VkIndexType type) {
+    if (buffer == bound_state_.index_buffer &&
+        offset == bound_state_.index_offset &&
+        type == bound_state_.index_type) {
+        redundant_binds_skipped_++;
+        return;
+    }
+    bound_state_.index_buffer = buffer;
+    bound_state_.index_offset = offset;
+    bound_state_.index_type = type;
+    vulkan_->bind_index_buffer(buffer, offset, type);
+}
+
+void CommandProcessor::reset_bound_state() {
+    bound_state_.reset();
+    pending_draw_count_ = 0;
+    batch_pipeline_ = VK_NULL_HANDLE;
+    batch_descriptor_ = VK_NULL_HANDLE;
+}
+
+// ============================================================
+// Draw batching - merge consecutive draws with same state
+// ============================================================
+
+bool CommandProcessor::can_merge_draw(const DrawCommand& cmd) const {
+    if (pending_draw_count_ == 0) return true;
+    if (pending_draw_count_ >= kMaxBatchedDraws) return false;
+    if (bound_state_.pipeline != batch_pipeline_) return false;
+    if (bound_state_.descriptor_set != batch_descriptor_) return false;
+    if (pending_draws_[0].indexed != cmd.indexed) return false;
+    return true;
+}
+
+void CommandProcessor::queue_draw(const DrawCommand& cmd) {
+    if (!can_merge_draw(cmd)) {
+        flush_draw_batch();
+    }
+    if (pending_draw_count_ == 0) {
+        batch_pipeline_ = bound_state_.pipeline;
+        batch_descriptor_ = bound_state_.descriptor_set;
+    }
+    PendingDraw& pd = pending_draws_[pending_draw_count_++];
+    pd.indexed = cmd.indexed;
+    pd.instance_count = cmd.instance_count > 0 ? cmd.instance_count : 1;
+    if (cmd.indexed) {
+        pd.index_count = cmd.index_count;
+        pd.first_index = cmd.start_index;
+        pd.vertex_offset = cmd.base_vertex;
+    } else {
+        pd.vertex_count = cmd.vertex_count > 0 ? cmd.vertex_count : cmd.index_count;
+        pd.first_vertex = 0;
+    }
+}
+
+void CommandProcessor::flush_draw_batch() {
+    if (pending_draw_count_ == 0) return;
+    for (u32 i = 0; i < pending_draw_count_; i++) {
+        const PendingDraw& pd = pending_draws_[i];
+        if (pd.indexed) {
+            vulkan_->draw_indexed(pd.index_count, pd.instance_count,
+                                  pd.first_index, pd.vertex_offset, 0);
+        } else {
+            vulkan_->draw(pd.vertex_count, pd.instance_count, pd.first_vertex, 0);
+        }
+    }
+    if (pending_draw_count_ > 1) {
+        draws_merged_ += pending_draw_count_ - 1;
+    }
+    pending_draw_count_ = 0;
+    batch_pipeline_ = VK_NULL_HANDLE;
+    batch_descriptor_ = VK_NULL_HANDLE;
 }
 
 } // namespace x360mu

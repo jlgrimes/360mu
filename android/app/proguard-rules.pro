@@ -14,6 +14,10 @@
 -keep class com.x360mu.core.NativeEmulator { *; }
 -keep class com.x360mu.core.NativeEmulator$* { *; }
 
+# Keep VibrationManager — JNI reverse callback uses onVibration(III)V by name
+-keep class com.x360mu.core.VibrationManager { *; }
+-keep class com.x360mu.core.VibrationManager$VibrationListener { *; }
+
 # Keep Compose
 -keep class androidx.compose.** { *; }
 

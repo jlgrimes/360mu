@@ -1,183 +1,54 @@
 /**
  * 360μ - Xbox 360 Emulator for Android
- * 
- * Stub APU implementation when audio is disabled
+ *
+ * Stub AndroidAudioOutput for non-Android builds
+ * The real Apu implementation is in apu.cpp (always compiled).
+ * This file only stubs AndroidAudioOutput which requires Android AAudio.
  */
 
-#include "apu/audio.h"
+#include "apu/android_audio.h"
 
 namespace x360mu {
 
-// Apu implementation
-Apu::Apu() = default;
-Apu::~Apu() = default;
+// AndroidAudioOutput stub for non-Android builds
+AndroidAudioOutput::AndroidAudioOutput() = default;
+AndroidAudioOutput::~AndroidAudioOutput() = default;
 
-Status Apu::initialize(Memory* memory, const ApuConfig& config) {
-    memory_ = memory;
-    config_ = config;
-    return Status::Ok;
-}
+Status AndroidAudioOutput::initialize(const AudioConfig& /*config*/) { return Status::Ok; }
+void AndroidAudioOutput::shutdown() {}
+Status AndroidAudioOutput::start() { return Status::Ok; }
+void AndroidAudioOutput::stop() {}
+void AndroidAudioOutput::pause() {}
+void AndroidAudioOutput::resume() {}
+void AndroidAudioOutput::set_callback(AudioCallback /*callback*/) {}
+u32 AndroidAudioOutput::queue_samples(const f32* /*samples*/, u32 /*frame_count*/) { return 0; }
+f32 AndroidAudioOutput::get_latency_ms() const { return 0.0f; }
+void AndroidAudioOutput::set_volume(f32 /*volume*/) {}
 
-void Apu::shutdown() {}
+// AudioRingBuffer stub
+AudioRingBuffer::AudioRingBuffer(u32 /*frame_count*/, u32 channels)
+    : channels_(channels), capacity_(0), read_pos_(0), write_pos_(0) {}
 
-void Apu::reset() {
-    for (auto& ctx : xma_contexts_) {
-        ctx = {};
-    }
-    for (auto& voice : voices_) {
-        voice.active = false;
-        voice.context_index = 0;
-        voice.volume_left = 1.0f;
-        voice.volume_right = 1.0f;
-        voice.pitch = 1.0f;
-        voice.pcm_buffer.clear();
-        voice.read_pos.store(0);
-        voice.write_pos.store(0);
-    }
-    stats_ = {};
-}
+u32 AudioRingBuffer::write(const f32* /*data*/, u32 /*frame_count*/) { return 0; }
+u32 AudioRingBuffer::read(f32* /*data*/, u32 /*frame_count*/) { return 0; }
+u32 AudioRingBuffer::available_read() const { return 0; }
+u32 AudioRingBuffer::available_write() const { return 0; }
+void AudioRingBuffer::clear() { read_pos_ = 0; write_pos_ = 0; }
 
-void Apu::process() {
-    // Stub - no audio processing
-}
+// AudioResampler stub
+AudioResampler::AudioResampler() = default;
+void AudioResampler::configure(u32 /*input_rate*/, u32 /*output_rate*/, u32 /*channels*/) {}
+u32 AudioResampler::process(const f32* /*input*/, u32 /*input_frames*/, f32* /*output*/, u32 /*max_output_frames*/) { return 0; }
+void AudioResampler::reset() {}
+u32 AudioResampler::get_output_frames(u32 input_frames) const { return input_frames; }
 
-Status Apu::create_context(u32 index, const XmaContext& ctx) {
-    if (index >= xma_contexts_.size()) {
-        return Status::InvalidArgument;
-    }
-    xma_contexts_[index] = ctx;
-    return Status::Ok;
-}
-
-void Apu::destroy_context(u32 index) {
-    if (index < xma_contexts_.size()) {
-        xma_contexts_[index] = {};
-    }
-}
-
-XmaContext* Apu::get_context(u32 index) {
-    if (index < xma_contexts_.size()) {
-        return &xma_contexts_[index];
-    }
-    return nullptr;
-}
-
-u32 Apu::create_voice(u32 context_index) {
-    for (u32 i = 0; i < voices_.size(); i++) {
-        if (!voices_[i].active) {
-            voices_[i].active = true;
-            voices_[i].context_index = context_index;
-            voices_[i].volume_left = 1.0f;
-            voices_[i].volume_right = 1.0f;
-            voices_[i].pitch = 1.0f;
-            return i;
-        }
-    }
-    return ~0u;
-}
-
-void Apu::destroy_voice(u32 voice_id) {
-    if (voice_id < voices_.size()) {
-        voices_[voice_id].active = false;
-        voices_[voice_id].context_index = 0;
-        voices_[voice_id].volume_left = 1.0f;
-        voices_[voice_id].volume_right = 1.0f;
-        voices_[voice_id].pitch = 1.0f;
-        voices_[voice_id].pcm_buffer.clear();
-        voices_[voice_id].read_pos.store(0);
-        voices_[voice_id].write_pos.store(0);
-    }
-}
-
-void Apu::set_voice_volume(u32 voice_id, f32 left, f32 right) {
-    if (voice_id < voices_.size()) {
-        voices_[voice_id].volume_left = left;
-        voices_[voice_id].volume_right = right;
-    }
-}
-
-void Apu::set_voice_pitch(u32 voice_id, f32 pitch) {
-    if (voice_id < voices_.size()) {
-        voices_[voice_id].pitch = pitch;
-    }
-}
-
-void Apu::start_voice(u32 /*voice_id*/) {}
-void Apu::stop_voice(u32 /*voice_id*/) {}
-
-u32 Apu::read_register(u32 /*offset*/) {
-    return 0;
-}
-
-void Apu::write_register(u32 /*offset*/, u32 /*value*/) {}
-
-u32 Apu::get_samples(s16* buffer, u32 sample_count) {
-    // Return silence
-    if (buffer && sample_count > 0) {
-        for (u32 i = 0; i < sample_count * 2; i++) {
-            buffer[i] = 0;
-        }
-    }
-    return sample_count;
-}
-
-void Apu::decode_xma_packets() {}
-void Apu::mix_voices() {}
-void Apu::submit_to_output() {}
-
-// XmaDecoder stub
-Apu::XmaDecoder::XmaDecoder() = default;
-Apu::XmaDecoder::~XmaDecoder() = default;
-
-Status Apu::XmaDecoder::initialize() {
-    return Status::Ok;
-}
-
-void Apu::XmaDecoder::shutdown() {}
-
-Status Apu::XmaDecoder::decode(
-    const void* /*input*/, u32 /*input_size*/,
-    s16* output, u32 output_size,
-    u32& samples_decoded
-) {
-    // Return silence
-    if (output && output_size > 0) {
-        for (u32 i = 0; i < output_size * 2; i++) {
-            output[i] = 0;
-        }
-    }
-    samples_decoded = output_size;
-    return Status::Ok;
-}
-
-void Apu::XmaDecoder::reset_state(void* /*context*/) {}
-
-// AudioOutput stub
-Apu::AudioOutput::AudioOutput() = default;
-Apu::AudioOutput::~AudioOutput() = default;
-
-Status Apu::AudioOutput::initialize(const ApuConfig& config) {
-    config_ = config;
-    return Status::Ok;
-}
-
-void Apu::AudioOutput::shutdown() {}
-
-Status Apu::AudioOutput::start() {
-    playing_ = true;
-    return Status::Ok;
-}
-
-void Apu::AudioOutput::stop() {
-    playing_ = false;
-}
-
-Status Apu::AudioOutput::queue_samples(const s16* /*samples*/, u32 /*count*/) {
-    return Status::Ok;
-}
-
-u32 Apu::AudioOutput::get_available_space() const {
-    return 4096;
-}
+// SimpleAudioMixer stub
+SimpleAudioMixer::SimpleAudioMixer() = default;
+void SimpleAudioMixer::configure(u32 /*sample_rate*/, u32 /*channels*/) {}
+int SimpleAudioMixer::add_source(const f32* /*samples*/, u32 /*frame_count*/, f32 /*volume*/, bool /*loop*/) { return -1; }
+void SimpleAudioMixer::remove_source(int /*index*/) {}
+void SimpleAudioMixer::set_source_volume(int /*index*/, f32 /*volume*/) {}
+void SimpleAudioMixer::set_source_pan(int /*index*/, f32 /*pan*/) {}
+void SimpleAudioMixer::mix(f32* /*output*/, u32 /*frame_count*/) {}
 
 } // namespace x360mu

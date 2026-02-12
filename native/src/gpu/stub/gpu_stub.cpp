@@ -12,6 +12,11 @@
 namespace x360mu {
     class VulkanBackend {};
     class CommandProcessor {};
+    class ShaderCache {};
+    class DescriptorManager {};
+    class BufferPool {};
+    class RenderTargetManager {};
+    class EdramManager {};
 }
 
 #include "gpu/xenos/gpu.h"
@@ -77,8 +82,21 @@ void Gpu::cmd_draw_auto(PrimitiveType /*type*/, u32 /*vertex_count*/) {}
 void Gpu::cmd_resolve() {}
 
 void Gpu::update_render_state() {}
+void Gpu::update_render_targets() {}
 void Gpu::update_shaders() {}
 void Gpu::update_textures() {}
+
+void Gpu::test_render() {}
+void Gpu::set_vsync(bool enabled) { config_.enable_vsync = enabled; }
+void Gpu::set_frame_skip(u32 count) { frame_skip_ = count; }
+void Gpu::set_target_fps(u32 fps) { target_fps_ = fps; }
+
+void Gpu::cpu_signal_fence(u64 value) { cpu_fence_.store(value, std::memory_order_release); }
+void Gpu::gpu_signal_fence(u64 value) {
+    gpu_fence_.store(value, std::memory_order_release);
+    fence_cv_.notify_all();
+}
+bool Gpu::wait_for_gpu_fence(u64 /*fence_value*/, u64 /*timeout_ns*/) { return true; }
 
 // ShaderTranslator stub
 ShaderTranslator::ShaderTranslator() = default;

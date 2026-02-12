@@ -5,12 +5,14 @@
  */
 
 #include "kernel.h"
+#include "xobject.h"
 #include "work_queue.h"
 #include "memory/memory.h"
 #include "cpu/xenon/cpu.h"
 #include "cpu/xenon/threading.h"
 #include "xex_loader.h"
 #include "filesystem/vfs.h"
+#include "input/input_manager.h"
 #include <unordered_set>
 #include <chrono>
 
@@ -181,7 +183,12 @@ Status Kernel::load_xex(const std::string& path) {
     
     // Install import thunks for syscall handling
     install_import_thunks(*xex_module);
-    
+
+    // Extract game info and analyze import compatibility
+    game_info_ = std::make_unique<GameInfo>(
+        extract_game_info(*xex_module, hle_functions_,
+                          [this](u32 mod, u32 ord) { return make_import_key(mod, ord); }));
+
     return Status::Ok;
 }
 
@@ -275,17 +282,26 @@ void Kernel::start_system_worker() {
 
 void Kernel::input_button(u32 player, u32 button, bool pressed) {
     if (player >= 4) return;
-    
+
+    // Use InputManager which maps Android button indices to XInput flags
+    get_input_manager().set_button(player, button, pressed);
+    get_input_manager().sync_to_xam();
+
+    // Keep local state in sync
+    u16 xinput_flag = android_button_to_xinput(button);
     if (pressed) {
-        input_state_[player].buttons |= button;
+        input_state_[player].buttons |= xinput_flag;
     } else {
-        input_state_[player].buttons &= ~button;
+        input_state_[player].buttons &= ~xinput_flag;
     }
 }
 
 void Kernel::input_trigger(u32 player, u32 trigger, f32 value) {
     if (player >= 4) return;
-    
+
+    get_input_manager().set_trigger(player, trigger, value);
+    get_input_manager().sync_to_xam();
+
     if (trigger == 0) {
         input_state_[player].left_trigger = value;
     } else {
@@ -295,7 +311,10 @@ void Kernel::input_trigger(u32 player, u32 trigger, f32 value) {
 
 void Kernel::input_stick(u32 player, u32 stick, f32 x, f32 y) {
     if (player >= 4) return;
-    
+
+    get_input_manager().set_stick(player, stick, x, y);
+    get_input_manager().sync_to_xam();
+
     if (stick == 0) {
         input_state_[player].left_stick_x = x;
         input_state_[player].left_stick_y = y;
@@ -381,7 +400,15 @@ void* Kernel::get_object(u32 handle, ObjectType expected_type) {
 }
 
 void Kernel::close_handle(u32 handle) {
-    objects_.erase(handle);
+    // Try local objects first
+    auto it = objects_.find(handle);
+    if (it != objects_.end()) {
+        objects_.erase(it);
+        return;
+    }
+
+    // Fall through to unified ObjectTable
+    KernelState::instance().object_table().close_handle(handle);
 }
 
 void Kernel::set_scheduler(ThreadScheduler* scheduler) {
@@ -434,11 +461,15 @@ void Kernel::register_hle_functions() {
     register_xboxkrnl();
     register_xboxkrnl_extended();
     register_xam();
-    
+
     // Register file I/O HLE functions with proper ordinals
     register_file_io_exports(hle_functions_, [this](u32 module, u32 ordinal) {
         return make_import_key(module, ordinal);
     });
+
+    // Register threading HLE functions LAST so improved implementations
+    // (DPC, Timer, IoCompletion, CV-based waits) override older duplicates
+    register_xboxkrnl_threading(this);
 }
 
 // register_xboxkrnl, register_xboxkrnl_extended, and register_xam

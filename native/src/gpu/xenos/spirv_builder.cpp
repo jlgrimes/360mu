@@ -79,16 +79,63 @@ namespace spv {
     constexpr u32 OpLoopMerge = 246;
     constexpr u32 OpSelectionMerge = 247;
     
+    // Conversion
+    constexpr u32 OpConvertFToU = 109;
+    constexpr u32 OpConvertFToS = 110;
+    constexpr u32 OpConvertSToF = 111;
+    constexpr u32 OpConvertUToF = 112;
+    constexpr u32 OpBitcast = 124;
+
     // Arithmetic
+    constexpr u32 OpSNegate = 126;
+    constexpr u32 OpFNegate = 127;
     constexpr u32 OpIAdd = 128;
     constexpr u32 OpFAdd = 129;
     constexpr u32 OpISub = 130;
     constexpr u32 OpFSub = 131;
     constexpr u32 OpIMul = 132;
     constexpr u32 OpFMul = 133;
+    constexpr u32 OpUDiv = 134;
+    constexpr u32 OpSDiv = 135;
     constexpr u32 OpFDiv = 136;
+    constexpr u32 OpUMod = 137;
+    constexpr u32 OpSRem = 138;
+    constexpr u32 OpSMod = 139;
     constexpr u32 OpFMod = 141;
-    constexpr u32 OpFNegate = 127;
+
+    // Dot product
+    constexpr u32 OpDot = 148;
+
+    // Logical
+    constexpr u32 OpAny = 154;
+    constexpr u32 OpAll = 155;
+    constexpr u32 OpLogicalOr = 166;
+    constexpr u32 OpLogicalAnd = 167;
+    constexpr u32 OpLogicalNot = 168;
+
+    // Integer comparison
+    constexpr u32 OpIEqual = 170;
+    constexpr u32 OpINotEqual = 171;
+    constexpr u32 OpUGreaterThan = 172;
+    constexpr u32 OpSGreaterThan = 173;
+    constexpr u32 OpUGreaterThanEqual = 174;
+    constexpr u32 OpSGreaterThanEqual = 175;
+    constexpr u32 OpULessThan = 176;
+    constexpr u32 OpSLessThan = 177;
+    constexpr u32 OpULessThanEqual = 178;
+    constexpr u32 OpSLessThanEqual = 179;
+
+    // Phi
+    constexpr u32 OpPhi = 245;
+
+    // Bitwise
+    constexpr u32 OpShiftRightLogical = 194;
+    constexpr u32 OpShiftRightArithmetic = 195;
+    constexpr u32 OpShiftLeftLogical = 196;
+    constexpr u32 OpBitwiseOr = 197;
+    constexpr u32 OpBitwiseXor = 198;
+    constexpr u32 OpBitwiseAnd = 199;
+    constexpr u32 OpNot = 200;
     
     // Vector
     constexpr u32 OpVectorShuffle = 79;
@@ -107,10 +154,22 @@ namespace spv {
     // Logical
     constexpr u32 OpSelect = 169;
     
+    // Vector (dynamic)
+    constexpr u32 OpVectorExtractDynamic = 77;
+    constexpr u32 OpVectorInsertDynamic = 78;
+
     // Image
+    constexpr u32 OpSampledImage = 86;
     constexpr u32 OpImageSampleImplicitLod = 87;
     constexpr u32 OpImageSampleExplicitLod = 88;
-    
+    constexpr u32 OpImageSampleDrefImplicitLod = 89;
+    constexpr u32 OpImageSampleDrefExplicitLod = 90;
+    constexpr u32 OpImageFetch = 95;
+    constexpr u32 OpImageQuerySizeLod = 103;
+    constexpr u32 OpImageQuerySize = 104;
+    constexpr u32 OpImageQueryLod = 105;
+    constexpr u32 OpImageQueryLevels = 107;
+
     // Extensions
     constexpr u32 OpExtInstImport = 11;
     constexpr u32 OpExtInst = 12;
@@ -123,6 +182,8 @@ namespace spv {
     
     // Capability values
     constexpr u32 CapabilityShader = 1;
+    constexpr u32 CapabilitySampled1D = 43;
+    constexpr u32 CapabilityImageQuery = 50;
     
     // Execution model
     constexpr u32 ExecutionModelVertex = 0;
@@ -142,7 +203,8 @@ namespace spv {
     constexpr u32 StorageClassUniformConstant = 0;
     constexpr u32 StorageClassFunction = 7;
     constexpr u32 StorageClassPrivate = 6;
-    
+    constexpr u32 StorageClassStorageBuffer = 12;
+
     // Decoration
     constexpr u32 DecorationLocation = 30;
     constexpr u32 DecorationBinding = 33;
@@ -151,7 +213,10 @@ namespace spv {
     constexpr u32 DecorationFlat = 14;
     constexpr u32 DecorationNoPerspective = 13;
     constexpr u32 DecorationBlock = 2;
+    constexpr u32 DecorationBufferBlock = 3;
     constexpr u32 DecorationOffset = 35;
+    constexpr u32 DecorationNonWritable = 24;
+    constexpr u32 DecorationNonReadable = 25;
     
     // BuiltIn values
     constexpr u32 BuiltInPosition = 0;
@@ -544,34 +609,107 @@ u32 SpirvBuilder::i_mul(u32 type, u32 a, u32 b) {
     return id;
 }
 
+u32 SpirvBuilder::s_div(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpSDiv, type, id, {a, b});
+    return id;
+}
+
+u32 SpirvBuilder::u_div(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpUDiv, type, id, {a, b});
+    return id;
+}
+
+u32 SpirvBuilder::s_mod(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpSMod, type, id, {a, b});
+    return id;
+}
+
+u32 SpirvBuilder::u_mod(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpUMod, type, id, {a, b});
+    return id;
+}
+
+u32 SpirvBuilder::s_negate(u32 type, u32 a) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpSNegate, type, id, {a});
+    return id;
+}
+
+// Bitwise operations
+u32 SpirvBuilder::bitwise_and(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpBitwiseAnd, type, id, {a, b});
+    return id;
+}
+
+u32 SpirvBuilder::bitwise_or(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpBitwiseOr, type, id, {a, b});
+    return id;
+}
+
+u32 SpirvBuilder::bitwise_xor(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpBitwiseXor, type, id, {a, b});
+    return id;
+}
+
+u32 SpirvBuilder::bitwise_not(u32 type, u32 a) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpNot, type, id, {a});
+    return id;
+}
+
+u32 SpirvBuilder::shift_left_logical(u32 type, u32 base, u32 shift) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpShiftLeftLogical, type, id, {base, shift});
+    return id;
+}
+
+u32 SpirvBuilder::shift_right_logical(u32 type, u32 base, u32 shift) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpShiftRightLogical, type, id, {base, shift});
+    return id;
+}
+
+u32 SpirvBuilder::shift_right_arithmetic(u32 type, u32 base, u32 shift) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpShiftRightArithmetic, type, id, {base, shift});
+    return id;
+}
+
 // Conversions
 u32 SpirvBuilder::convert_f_to_s(u32 type, u32 value) {
     u32 id = allocate_id();
-    emit_op(current_function_, 110, type, id, {value}); // OpConvertFToS
+    emit_op(current_function_, spv::OpConvertFToS, type, id, {value});
     return id;
 }
 
 u32 SpirvBuilder::convert_s_to_f(u32 type, u32 value) {
     u32 id = allocate_id();
-    emit_op(current_function_, 111, type, id, {value}); // OpConvertSToF
+    emit_op(current_function_, spv::OpConvertSToF, type, id, {value});
     return id;
 }
 
 u32 SpirvBuilder::convert_f_to_u(u32 type, u32 value) {
     u32 id = allocate_id();
-    emit_op(current_function_, 109, type, id, {value}); // OpConvertFToU
+    emit_op(current_function_, spv::OpConvertFToU, type, id, {value});
     return id;
 }
 
 u32 SpirvBuilder::convert_u_to_f(u32 type, u32 value) {
     u32 id = allocate_id();
-    emit_op(current_function_, 112, type, id, {value}); // OpConvertUToF
+    emit_op(current_function_, spv::OpConvertUToF, type, id, {value});
     return id;
 }
 
 u32 SpirvBuilder::bitcast(u32 type, u32 value) {
     u32 id = allocate_id();
-    emit_op(current_function_, 124, type, id, {value}); // OpBitcast
+    emit_op(current_function_, spv::OpBitcast, type, id, {value});
     return id;
 }
 
@@ -617,19 +755,19 @@ u32 SpirvBuilder::composite_construct(u32 type, const std::vector<u32>& constitu
 
 u32 SpirvBuilder::vector_extract_dynamic(u32 type, u32 vector, u32 index) {
     u32 id = allocate_id();
-    emit_op(current_function_, 78, type, id, {vector, index}); // OpVectorExtractDynamic
+    emit_op(current_function_, spv::OpVectorExtractDynamic, type, id, {vector, index});
     return id;
 }
 
 u32 SpirvBuilder::vector_insert_dynamic(u32 type, u32 vector, u32 component, u32 index) {
     u32 id = allocate_id();
-    emit_op(current_function_, 79, type, id, {vector, component, index}); // OpVectorInsertDynamic
+    emit_op(current_function_, spv::OpVectorInsertDynamic, type, id, {vector, component, index});
     return id;
 }
 
 u32 SpirvBuilder::dot(u32 type, u32 a, u32 b) {
     u32 id = allocate_id();
-    emit_op(current_function_, 148, type, id, {a, b}); // OpDot
+    emit_op(current_function_, spv::OpDot, type, id, {a, b});
     return id;
 }
 
@@ -672,56 +810,80 @@ u32 SpirvBuilder::f_ord_greater_than_equal(u32 type, u32 a, u32 b) {
 
 u32 SpirvBuilder::i_equal(u32 type, u32 a, u32 b) {
     u32 id = allocate_id();
-    emit_op(current_function_, 170, type, id, {a, b}); // OpIEqual
+    emit_op(current_function_, spv::OpIEqual, type, id, {a, b});
     return id;
 }
 
 u32 SpirvBuilder::i_not_equal(u32 type, u32 a, u32 b) {
     u32 id = allocate_id();
-    emit_op(current_function_, 171, type, id, {a, b}); // OpINotEqual
+    emit_op(current_function_, spv::OpINotEqual, type, id, {a, b});
     return id;
 }
 
 u32 SpirvBuilder::s_less_than(u32 type, u32 a, u32 b) {
     u32 id = allocate_id();
-    emit_op(current_function_, 177, type, id, {a, b}); // OpSLessThan
+    emit_op(current_function_, spv::OpSLessThan, type, id, {a, b});
     return id;
 }
 
 u32 SpirvBuilder::s_greater_than_equal(u32 type, u32 a, u32 b) {
     u32 id = allocate_id();
-    emit_op(current_function_, 175, type, id, {a, b}); // OpSGreaterThanEqual
+    emit_op(current_function_, spv::OpSGreaterThanEqual, type, id, {a, b});
+    return id;
+}
+
+u32 SpirvBuilder::s_greater_than(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpSGreaterThan, type, id, {a, b});
+    return id;
+}
+
+u32 SpirvBuilder::s_less_than_equal(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpSLessThanEqual, type, id, {a, b});
+    return id;
+}
+
+u32 SpirvBuilder::u_less_than(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpULessThan, type, id, {a, b});
+    return id;
+}
+
+u32 SpirvBuilder::u_greater_than_equal(u32 type, u32 a, u32 b) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpUGreaterThanEqual, type, id, {a, b});
     return id;
 }
 
 // Logical operations
 u32 SpirvBuilder::logical_and(u32 type, u32 a, u32 b) {
     u32 id = allocate_id();
-    emit_op(current_function_, 167, type, id, {a, b}); // OpLogicalAnd
+    emit_op(current_function_, spv::OpLogicalAnd, type, id, {a, b});
     return id;
 }
 
 u32 SpirvBuilder::logical_or(u32 type, u32 a, u32 b) {
     u32 id = allocate_id();
-    emit_op(current_function_, 166, type, id, {a, b}); // OpLogicalOr
+    emit_op(current_function_, spv::OpLogicalOr, type, id, {a, b});
     return id;
 }
 
 u32 SpirvBuilder::logical_not(u32 type, u32 a) {
     u32 id = allocate_id();
-    emit_op(current_function_, 168, type, id, {a}); // OpLogicalNot
+    emit_op(current_function_, spv::OpLogicalNot, type, id, {a});
     return id;
 }
 
 u32 SpirvBuilder::any(u32 type, u32 vector) {
     u32 id = allocate_id();
-    emit_op(current_function_, 154, type, id, {vector}); // OpAny
+    emit_op(current_function_, spv::OpAny, type, id, {vector});
     return id;
 }
 
 u32 SpirvBuilder::all(u32 type, u32 vector) {
     u32 id = allocate_id();
-    emit_op(current_function_, 155, type, id, {vector}); // OpAll
+    emit_op(current_function_, spv::OpAll, type, id, {vector});
     return id;
 }
 
@@ -759,14 +921,14 @@ u32 SpirvBuilder::phi(u32 type, const std::vector<std::pair<u32, u32>>& incoming
         ops.push_back(value);
         ops.push_back(block);
     }
-    emit_op(current_function_, 245, type, id, ops); // OpPhi
+    emit_op(current_function_, spv::OpPhi, type, id, ops);
     return id;
 }
 
 // Texture
 u32 SpirvBuilder::sampled_image(u32 type, u32 image, u32 sampler) {
     u32 id = allocate_id();
-    emit_op(current_function_, 86, type, id, {image, sampler}); // OpSampledImage
+    emit_op(current_function_, spv::OpSampledImage, type, id, {image, sampler});
     return id;
 }
 
@@ -799,16 +961,42 @@ u32 SpirvBuilder::image_sample_grad(u32 type, u32 sampled_image, u32 coord, u32 
 u32 SpirvBuilder::image_fetch(u32 type, u32 image, u32 coord, u32 lod) {
     u32 id = allocate_id();
     if (lod != 0) {
-        emit_op(current_function_, 98, type, id, {image, coord, 0x2, lod}); // OpImageFetch
+        emit_op(current_function_, spv::OpImageFetch, type, id, {image, coord, 0x2, lod});
     } else {
-        emit_op(current_function_, 98, type, id, {image, coord}); // OpImageFetch
+        emit_op(current_function_, spv::OpImageFetch, type, id, {image, coord});
     }
     return id;
 }
 
 u32 SpirvBuilder::image_query_size_lod(u32 type, u32 image, u32 lod) {
     u32 id = allocate_id();
-    emit_op(current_function_, 103, type, id, {image, lod}); // OpImageQuerySizeLod
+    emit_op(current_function_, spv::OpImageQuerySizeLod, type, id, {image, lod});
+    return id;
+}
+
+u32 SpirvBuilder::image_query_size(u32 type, u32 image) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpImageQuerySize, type, id, {image});
+    return id;
+}
+
+u32 SpirvBuilder::image_query_levels(u32 type, u32 image) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpImageQueryLevels, type, id, {image});
+    return id;
+}
+
+u32 SpirvBuilder::image_sample_dref(u32 type, u32 sampled_image, u32 coord, u32 dref) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpImageSampleDrefImplicitLod, type, id,
+            {sampled_image, coord, dref});
+    return id;
+}
+
+u32 SpirvBuilder::image_sample_dref_lod(u32 type, u32 sampled_image, u32 coord, u32 dref, u32 lod) {
+    u32 id = allocate_id();
+    emit_op(current_function_, spv::OpImageSampleDrefExplicitLod, type, id,
+            {sampled_image, coord, dref, 0x2, lod});
     return id;
 }
 
@@ -931,6 +1119,52 @@ void SpirvBuilder::capability(u32 cap) {
 
 void SpirvBuilder::memory_model(u32 addressing, u32 memory) {
     emit_op(memory_model_, spv::OpMemoryModel, 0, 0, {addressing, memory});
+}
+
+bool SpirvBuilder::validate(std::string* error_out) const {
+    // Basic structural validation of the generated SPIR-V
+
+    // 1. Check that we have content in essential sections
+    if (capabilities_.empty()) {
+        if (error_out) *error_out = "No capabilities declared";
+        return false;
+    }
+
+    if (memory_model_.empty()) {
+        if (error_out) *error_out = "No memory model declared";
+        return false;
+    }
+
+    if (entry_points_.empty()) {
+        if (error_out) *error_out = "No entry point declared";
+        return false;
+    }
+
+    if (functions_.empty() && current_function_.empty()) {
+        if (error_out) *error_out = "No functions defined";
+        return false;
+    }
+
+    // 2. Verify ID bound is reasonable
+    if (next_id_ > 100000) {
+        if (error_out) *error_out = "ID bound unreasonably large: " + std::to_string(next_id_);
+        return false;
+    }
+
+    // 3. Verify we have type declarations
+    if (types_constants_.empty()) {
+        if (error_out) *error_out = "No types or constants declared";
+        return false;
+    }
+
+    return true;
+}
+
+std::vector<u32> SpirvBuilder::end_validated(std::string* error_out) {
+    if (!validate(error_out)) {
+        return {};
+    }
+    return end();
 }
 
 } // namespace x360mu

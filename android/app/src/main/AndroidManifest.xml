@@ -35,6 +35,7 @@
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
             android:screenOrientation="userLandscape"
             android:launchMode="singleTop"
+            android:keepScreenOn="true"
             android:theme="@style/Theme.X360mu">
             
             <intent-filter>

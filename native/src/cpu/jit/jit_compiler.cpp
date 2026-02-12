@@ -191,54 +191,110 @@ RegisterAllocator::RegisterAllocator() {
 }
 
 void RegisterAllocator::reset() {
-    ppc_to_arm_.fill(INVALID_REG);
-    arm_to_ppc_.fill(INVALID_REG);
+    for (int i = 0; i < 32; i++) ppc_to_arm_[i] = INVALID_REG;
+    for (int i = 0; i < MAX_CACHED_GPRS; i++) cached_ppcs_[i] = -1;
     dirty_.reset();
-    temp_available_.set();  // All temps available
-    
-    // Reserve certain temp registers
-    temp_available_[arm64::X16] = false;  // IP0 - used for address calculation
-    temp_available_[arm64::X17] = false;  // IP1 - used for address calculation
 }
 
-int RegisterAllocator::get_gpr(int ppc_reg) {
-    // For now, use simple direct mapping
-    // All GPRs are loaded/stored from context on each access
-    return arm64::X0;  // Will be loaded by caller
+void RegisterAllocator::setup_block(GuestAddr addr, u32 inst_count, Memory* memory) {
+    reset();
+
+    // Count GPR usage across the block to find the hottest registers
+    u32 gpr_use_count[32] = {};
+
+    for (u32 i = 0; i < inst_count; i++) {
+        u32 raw = memory->read_u32(addr + i * 4);
+        u32 opcode = raw >> 26;
+
+        // Extract common register fields from PPC instruction encoding
+        u32 rd_rs = (raw >> 21) & 0x1F;
+        u32 ra = (raw >> 16) & 0x1F;
+        u32 rb = (raw >> 11) & 0x1F;
+
+        // Count based on instruction format
+        switch (opcode) {
+            case 14: case 15: // addi/addis (D-form: rD, rA)
+            case 32: case 33: case 34: case 35: // lwz/lwzu/lbz/lbzu
+            case 40: case 41: case 42: case 43: // lhz/lhzu/lha/lhau
+            case 48: case 49: case 50: case 51: // lfs/lfsu/lfd/lfdu
+            case 58: // ld/ldu/lwa
+                if (rd_rs > 0) gpr_use_count[rd_rs] += 2;  // dest written
+                if (ra > 0) gpr_use_count[ra]++;            // base read
+                break;
+            case 36: case 37: case 38: case 39: // stw/stwu/stb/stbu
+            case 44: case 45: case 52: case 53: // sth/sthu/stfs/stfsu
+            case 54: case 55: case 62: // stfd/stfdu/std
+                if (rd_rs > 0) gpr_use_count[rd_rs]++;  // value read
+                if (ra > 0) gpr_use_count[ra]++;         // base read
+                break;
+            case 11: case 10: // cmpi/cmpli
+                if (ra > 0) gpr_use_count[ra]++;
+                break;
+            case 24: case 25: case 26: case 27: // ori/oris/xori/xoris
+            case 28: case 29: // andi./andis.
+                if (rd_rs > 0) gpr_use_count[rd_rs]++;
+                if (ra > 0) gpr_use_count[ra] += 2;
+                break;
+            case 20: case 21: case 23: // rlwimi/rlwinm/rlwnm
+                if (rd_rs > 0) gpr_use_count[rd_rs]++;
+                if (ra > 0) gpr_use_count[ra] += 2;
+                if (opcode == 23 && rb > 0) gpr_use_count[rb]++;
+                break;
+            case 31: // Extended (X/XO-form: rd/rs, ra, rb)
+                if (rd_rs > 0) gpr_use_count[rd_rs] += 2;
+                if (ra > 0) gpr_use_count[ra]++;
+                if (rb > 0) gpr_use_count[rb]++;
+                break;
+            default:
+                break;
+        }
+    }
+
+    // Don't cache r0 (it has special semantics as 0 in address calculations)
+    gpr_use_count[0] = 0;
+
+    // Pick the top MAX_CACHED_GPRS most-used GPRs (minimum 3 uses to be worth caching)
+    for (int slot = 0; slot < MAX_CACHED_GPRS; slot++) {
+        int best_reg = -1;
+        u32 best_count = 2;  // Minimum threshold
+        for (int r = 1; r < 32; r++) {
+            if (gpr_use_count[r] > best_count) {
+                best_count = gpr_use_count[r];
+                best_reg = r;
+            }
+        }
+        if (best_reg < 0) break;
+
+        cached_ppcs_[slot] = best_reg;
+        ppc_to_arm_[best_reg] = CACHE_REGS[slot];
+        gpr_use_count[best_reg] = 0;  // Don't pick again
+    }
+}
+
+int RegisterAllocator::get_cached_arm_reg(int ppc_reg) const {
+    if (ppc_reg < 0 || ppc_reg >= 32) return INVALID_REG;
+    return ppc_to_arm_[ppc_reg];
 }
 
 void RegisterAllocator::mark_dirty(int ppc_reg) {
-    if (ppc_to_arm_[ppc_reg] != INVALID_REG) {
+    if (ppc_reg >= 0 && ppc_reg < 32 && ppc_to_arm_[ppc_reg] != INVALID_REG) {
         dirty_.set(ppc_reg);
     }
 }
 
-void RegisterAllocator::flush_all(ARM64Emitter& emit) {
-    // For simple implementation, nothing to flush as we use immediate load/store
-}
-
-void RegisterAllocator::flush_gpr(ARM64Emitter& emit, int ppc_reg) {
-    // For simple implementation, nothing to flush
-}
-
-int RegisterAllocator::alloc_temp() {
-    for (int i = 0; i < 16; i++) {
-        if (temp_available_[i]) {
-            temp_available_[i] = false;
-            return i;
-        }
-    }
-    return arm64::X0;  // Fallback
-}
-
-void RegisterAllocator::free_temp(int arm_reg) {
-    if (arm_reg >= 0 && arm_reg < 16) {
-        temp_available_[arm_reg] = true;
-    }
+bool RegisterAllocator::is_dirty(int ppc_reg) const {
+    if (ppc_reg < 0 || ppc_reg >= 32) return false;
+    return dirty_.test(ppc_reg);
 }
 
 bool RegisterAllocator::is_cached(int ppc_reg) const {
+    if (ppc_reg < 0 || ppc_reg >= 32) return false;
     return ppc_to_arm_[ppc_reg] != INVALID_REG;
+}
+
+int RegisterAllocator::cached_ppc_reg(int slot) const {
+    if (slot < 0 || slot >= MAX_CACHED_GPRS) return -1;
+    return cached_ppcs_[slot];
 }
 
 //=============================================================================
@@ -368,9 +424,19 @@ u64 JitCompiler::execute(ThreadContext& ctx, u64 cycles) {
                 }
             }
             
+            // Idle loop optimization: if this block is an idle loop that has
+            // been executed many times, advance time base and yield CPU
+            if (block->is_idle_loop && block->execution_count > 10) {
+                ctx.time_base += 4000;  // Skip ~1000 instructions worth of time
+                cycles_executed += 1000;
+                stats_.idle_loops_skipped++;
+                std::this_thread::yield();
+                continue;
+            }
+
             // Execute the block (fastmem_base is now embedded in block code)
             fn(&ctx, nullptr);
-            
+
             cycles_executed += block->size;
             block->execution_count++;
         }
@@ -499,12 +565,22 @@ void JitCompiler::compile_instruction(ARM64Emitter& emit, ThreadContext& ctx_tem
             
         case DecodedInst::Type::Load:
         case DecodedInst::Type::LoadUpdate:
-            compile_load(emit, inst);
+            // Route atomic loads (lwarx/ldarx) to dedicated handler
+            if (inst.opcode == 31 && (inst.xo == 20 || inst.xo == 84)) {
+                compile_atomic_load(emit, inst);
+            } else {
+                compile_load(emit, inst);
+            }
             break;
-            
+
         case DecodedInst::Type::Store:
         case DecodedInst::Type::StoreUpdate:
-            compile_store(emit, inst);
+            // Route atomic stores (stwcx./stdcx.) to dedicated handler
+            if (inst.opcode == 31 && (inst.xo == 150 || inst.xo == 214)) {
+                compile_atomic_store(emit, inst);
+            } else {
+                compile_store(emit, inst);
+            }
             break;
             
         case DecodedInst::Type::LoadMultiple:
@@ -535,12 +611,36 @@ void JitCompiler::compile_instruction(ARM64Emitter& emit, ThreadContext& ctx_tem
         case DecodedInst::Type::FMadd:
             compile_float(emit, inst);
             break;
-            
+
+        case DecodedInst::Type::FNeg:
+        case DecodedInst::Type::FAbs:
+            compile_float_unary(emit, inst);
+            break;
+
+        case DecodedInst::Type::FCompare:
+            compile_float_compare(emit, inst);
+            break;
+
+        case DecodedInst::Type::FConvert:
+            compile_float_convert(emit, inst);
+            break;
+
         case DecodedInst::Type::VAdd:
         case DecodedInst::Type::VSub:
         case DecodedInst::Type::VMul:
+        case DecodedInst::Type::VDiv:
         case DecodedInst::Type::VLogical:
             compile_vector(emit, inst);
+            break;
+
+        case DecodedInst::Type::VPerm:
+        case DecodedInst::Type::VMerge:
+        case DecodedInst::Type::VSplat:
+            compile_vector_permute(emit, inst);
+            break;
+
+        case DecodedInst::Type::VCompare:
+            compile_vector_compare(emit, inst);
             break;
             
         case DecodedInst::Type::SC:
@@ -603,7 +703,18 @@ void JitCompiler::compile_instruction(ARM64Emitter& emit, ThreadContext& ctx_tem
             // Data Cache Block Zero - zeros 32 bytes aligned to 32-byte boundary
             compile_dcbz(emit, inst);
             break;
-            
+
+        case DecodedInst::Type::RFI:
+            compile_rfi(emit, inst);
+            break;
+
+        case DecodedInst::Type::TW:
+        case DecodedInst::Type::TD:
+            // Trap instructions - NOP for game compatibility
+            // Games rarely trigger traps; if they do, just skip
+            emit.NOP();
+            break;
+
         default:
             // Fallback: NOP for unknown instructions
             emit.NOP();
@@ -1118,6 +1229,108 @@ void JitCompiler::compile_rotate(ARM64Emitter& emit, const DecodedInst& inst) {
         store_gpr(emit, inst.ra, arm64::X0);
     }
     
+    else if (inst.opcode == 30) { // 64-bit rotate instructions (rldic, rldicl, rldicr, rldimi, rldcl, rldcr)
+        load_gpr(emit, arm64::X0, inst.rs);
+
+        // Extract sub-opcode from bits 27-30 (2-4 bits depending on form)
+        u32 sub_xo = (inst.raw >> 1) & 0xF;  // bits 27-30
+
+        // 6-bit shift: sh[0:4] from bits 16-20, sh[5] from bit 30
+        u32 sh6 = inst.sh;  // Already extracted by decoder with bit 30
+
+        // 6-bit mask begin (mb6): mb[0:4] from bits 21-25, mb[5] from bit 26
+        u32 mb6 = inst.mb;  // Already extracted by decoder
+
+        switch (sub_xo & 0x7) {  // Lower 3 bits determine the form
+            case 0: // rldicl - Rotate Left Doubleword Immediate then Clear Left
+            {
+                if (sh6 != 0) {
+                    emit.ROR_imm(arm64::X0, arm64::X0, 64 - sh6);
+                }
+                // Clear bits 0 to mb6-1 (i.e., mask = bits mb6..63)
+                if (mb6 > 0) {
+                    u64 mask = ~0ULL >> mb6;
+                    emit.MOV_imm(arm64::X1, mask);
+                    emit.AND(arm64::X0, arm64::X0, arm64::X1);
+                }
+                break;
+            }
+            case 1: // rldicr - Rotate Left Doubleword Immediate then Clear Right
+            {
+                if (sh6 != 0) {
+                    emit.ROR_imm(arm64::X0, arm64::X0, 64 - sh6);
+                }
+                // Clear bits me6+1 to 63 (me6 = mb6 in this encoding)
+                u32 me6 = mb6;
+                if (me6 < 63) {
+                    u64 mask = ~0ULL << (63 - me6);
+                    emit.MOV_imm(arm64::X1, mask);
+                    emit.AND(arm64::X0, arm64::X0, arm64::X1);
+                }
+                break;
+            }
+            case 2: // rldic - Rotate Left Doubleword Immediate then Clear
+            {
+                if (sh6 != 0) {
+                    emit.ROR_imm(arm64::X0, arm64::X0, 64 - sh6);
+                }
+                // Clear bits 0..mb6-1 and bits 63-sh6+1..63
+                u64 mask = (~0ULL >> mb6) & (~0ULL << sh6);
+                emit.MOV_imm(arm64::X1, mask);
+                emit.AND(arm64::X0, arm64::X0, arm64::X1);
+                break;
+            }
+            case 3: // rldimi - Rotate Left Doubleword Immediate then Mask Insert
+            {
+                load_gpr(emit, arm64::X2, inst.ra);
+                if (sh6 != 0) {
+                    emit.ROR_imm(arm64::X0, arm64::X0, 64 - sh6);
+                }
+                u64 mask = (~0ULL >> mb6) & (~0ULL << sh6);
+                emit.MOV_imm(arm64::X1, mask);
+                emit.AND(arm64::X0, arm64::X0, arm64::X1);
+                emit.MOV_imm(arm64::X3, ~mask);
+                emit.AND(arm64::X2, arm64::X2, arm64::X3);
+                emit.ORR(arm64::X0, arm64::X0, arm64::X2);
+                break;
+            }
+            case 4: // rldcl - Rotate Left Doubleword then Clear Left (register shift)
+            {
+                load_gpr(emit, arm64::X1, inst.rb);
+                emit.AND_imm(arm64::X1, arm64::X1, 0x3F);
+                emit.MOV_imm(arm64::X2, 64);
+                emit.SUB(arm64::X2, arm64::X2, arm64::X1);
+                emit.ROR(arm64::X0, arm64::X0, arm64::X2);
+                if (mb6 > 0) {
+                    u64 mask = ~0ULL >> mb6;
+                    emit.MOV_imm(arm64::X1, mask);
+                    emit.AND(arm64::X0, arm64::X0, arm64::X1);
+                }
+                break;
+            }
+            case 5: // rldcr - Rotate Left Doubleword then Clear Right (register shift)
+            {
+                load_gpr(emit, arm64::X1, inst.rb);
+                emit.AND_imm(arm64::X1, arm64::X1, 0x3F);
+                emit.MOV_imm(arm64::X2, 64);
+                emit.SUB(arm64::X2, arm64::X2, arm64::X1);
+                emit.ROR(arm64::X0, arm64::X0, arm64::X2);
+                u32 me6 = mb6;
+                if (me6 < 63) {
+                    u64 mask = ~0ULL << (63 - me6);
+                    emit.MOV_imm(arm64::X1, mask);
+                    emit.AND(arm64::X0, arm64::X0, arm64::X1);
+                }
+                break;
+            }
+            default:
+                // Unknown 64-bit rotate sub-opcode
+                break;
+        }
+
+        store_gpr(emit, inst.ra, arm64::X0);
+    }
+
     if (inst.rc) {
         compile_cr_update(emit, 0, arm64::X0);
     }
@@ -1376,6 +1589,31 @@ void JitCompiler::compile_load(ARM64Emitter& emit, const DecodedInst& inst) {
                     emit.LDR(dest_reg, arm64::X0);
                     byteswap64(emit, dest_reg);
                     break;
+                case 341: // lwax (load word algebraic - sign extend)
+                    emit.LDR(dest_reg, arm64::X0);
+                    byteswap32(emit, dest_reg);
+                    emit.SXTW(dest_reg, dest_reg);
+                    break;
+                case 535: // lfsx (load float single indexed)
+                    emit.LDR(dest_reg, arm64::X0);
+                    byteswap32(emit, dest_reg);
+                    break;
+                case 599: // lfdx (load float double indexed)
+                    emit.LDR(dest_reg, arm64::X0);
+                    byteswap64(emit, dest_reg);
+                    break;
+                // Byte-reversed loads - no byteswap needed since memory is
+                // big-endian and ARM is little-endian, the raw read IS reversed
+                case 534: // lwbrx (load word byte-reverse indexed)
+                    emit.LDR(dest_reg, arm64::X0);
+                    emit.UXTW(dest_reg, dest_reg);
+                    break;
+                case 790: // lhbrx (load halfword byte-reverse indexed)
+                    emit.LDRH(dest_reg, arm64::X0);
+                    break;
+                case 532: // ldbrx (load doubleword byte-reverse indexed)
+                    emit.LDR(dest_reg, arm64::X0);
+                    break;
             }
             break;
     }
@@ -1416,10 +1654,14 @@ void JitCompiler::compile_load(ARM64Emitter& emit, const DecodedInst& inst) {
             break;
         case 31: // Extended loads
             switch (inst.xo) {
-                case 23: mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u32); break; // lwzx
-                case 87: mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u8); break;  // lbzx
-                case 279: case 343: mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u16); break; // lhzx/lhax
-                case 21: mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u64); break; // ldx
+                case 23: case 534: case 341: // lwzx/lwbrx/lwax
+                    mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u32); break;
+                case 87: // lbzx
+                    mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u8); break;
+                case 279: case 343: case 790: // lhzx/lhax/lhbrx
+                    mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u16); break;
+                case 21: case 532: case 535: case 599: // ldx/ldbrx/lfsx/lfdx
+                    mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u64); break;
                 default: mmio_read_helper = reinterpret_cast<u64>(&jit_mmio_read_u32); break;
             }
             break;
@@ -1629,10 +1871,14 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
             break;
         case 31: // Extended stores - check xo
             switch (inst.xo) {
-                case 151: mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u32); break; // stwx
-                case 215: mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u8); break;  // stbx
-                case 407: mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u16); break; // sthx
-                case 149: mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u64); break; // stdx
+                case 151: case 662: // stwx/stwbrx
+                    mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u32); break;
+                case 215: // stbx
+                    mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u8); break;
+                case 407: case 918: // sthx/sthbrx
+                    mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u16); break;
+                case 149: case 660: case 727: // stdx/stdbrx/stfdx
+                    mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u64); break;
                 default:  mmio_helper = reinterpret_cast<u64>(&jit_mmio_write_u32); break;
             }
             break;
@@ -1726,6 +1972,21 @@ void JitCompiler::compile_store(ARM64Emitter& emit, const DecodedInst& inst) {
                     break;
                 case 149: // stdx
                     byteswap64(emit, arm64::X1);
+                    emit.STR(arm64::X1, arm64::X0);
+                    break;
+                case 727: // stfdx (store float double indexed)
+                    byteswap64(emit, arm64::X1);
+                    emit.STR(arm64::X1, arm64::X0);
+                    break;
+                // Byte-reversed stores - no byteswap needed since memory is
+                // big-endian and ARM is little-endian, storing raw IS reversed
+                case 662: // stwbrx (store word byte-reverse indexed)
+                    emit.STR(arm64::X1, arm64::X0);
+                    break;
+                case 918: // sthbrx (store halfword byte-reverse indexed)
+                    emit.STRH(arm64::X1, arm64::X0);
+                    break;
+                case 660: // stdbrx (store doubleword byte-reverse indexed)
                     emit.STR(arm64::X1, arm64::X0);
                     break;
             }
@@ -2245,30 +2506,42 @@ void JitCompiler::compile_cntlzd(ARM64Emitter& emit, const DecodedInst& inst) {
 // Branch Compilation
 //=============================================================================
 
-void JitCompiler::compile_branch(ARM64Emitter& emit, const DecodedInst& inst, 
+void JitCompiler::compile_branch(ARM64Emitter& emit, const DecodedInst& inst,
                                   GuestAddr pc, CompiledBlock* block) {
     GuestAddr target;
     bool absolute = inst.raw & 2;
     bool link = inst.raw & 1;
-    
+
     if (absolute) {
         target = inst.li;
     } else {
         target = pc + inst.li;
     }
-    
+
     // Save link register if LK=1
     if (link) {
         emit.MOV_imm(arm64::X0, pc + 4);
         emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_lr());
     }
-    
+
     // Update PC
     emit.MOV_imm(arm64::X0, target);
     emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_pc());
-    
-    // Return from block (will continue in dispatcher)
-    emit_block_epilogue(emit, current_block_inst_count_);
+
+    // Emit epilogue without RET for block linking
+    emit_block_epilogue_for_link(emit, current_block_inst_count_);
+
+    // Emit linkable B (default: skip to RET fallback)
+    u32 link_offset = static_cast<u32>(emit.size());
+    emit.B(4);  // Default: jump over to RET below
+
+    // Record link so try_link_block can patch the B to jump to target block
+    if (block && !link) {  // Don't link bl (call) targets - they return to different places
+        block->links.push_back({target, link_offset, false, false});
+    }
+
+    // Fallback RET (used when B is not yet linked to a target block)
+    emit.RET();
 }
 
 void JitCompiler::compile_branch_conditional(ARM64Emitter& emit, const DecodedInst& inst,
@@ -2342,13 +2615,13 @@ void JitCompiler::compile_branch_conditional(ARM64Emitter& emit, const DecodedIn
     }
     
     // ---- Branch taken path ----
-    
+
     // Save link register if LK=1
     if (inst.raw & 1) { // LK
         emit.MOV_imm(arm64::X0, pc + 4);
         emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_lr());
     }
-    
+
     // Set target PC
     if (is_lr_target) {
         emit.LDR(arm64::X0, arm64::CTX_REG, ctx_offset_lr());
@@ -2359,13 +2632,23 @@ void JitCompiler::compile_branch_conditional(ARM64Emitter& emit, const DecodedIn
     } else {
         emit.MOV_imm(arm64::X0, target_taken);
     }
-    
+
     emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_pc());
-    emit_block_epilogue(emit, current_block_inst_count_);
-    
+
+    // Linkable exit for taken path (only for known constant targets, non-link branches)
+    if (!is_lr_target && !is_ctr_target && block && !(inst.raw & 1)) {
+        emit_block_epilogue_for_link(emit, current_block_inst_count_);
+        u32 link_offset = static_cast<u32>(emit.size());
+        emit.B(4);  // Default: skip to RET fallback
+        block->links.push_back({target_taken, link_offset, false, true});
+        emit.RET();
+    } else {
+        emit_block_epilogue(emit, current_block_inst_count_);
+    }
+
     // ---- Not-taken path ----
     u8* not_taken_start = emit.current();
-    
+
     // Patch all skip branches to jump here
     for (u8* skip : skip_branches) {
         s64 skip_offset = not_taken_start - skip;
@@ -2373,11 +2656,20 @@ void JitCompiler::compile_branch_conditional(ARM64Emitter& emit, const DecodedIn
         s32 imm19 = skip_offset >> 2;
         *patch_addr = (*patch_addr & 0xFF00001F) | ((imm19 & 0x7FFFF) << 5);
     }
-    
-    // Not-taken: continue to next instruction
+
+    // Not-taken: continue to next instruction (linkable)
     emit.MOV_imm(arm64::X0, target_not_taken);
     emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_pc());
-    emit_block_epilogue(emit, current_block_inst_count_);
+
+    if (block) {
+        emit_block_epilogue_for_link(emit, current_block_inst_count_);
+        u32 link_offset = static_cast<u32>(emit.size());
+        emit.B(4);  // Default: skip to RET fallback
+        block->links.push_back({target_not_taken, link_offset, false, true});
+        emit.RET();
+    } else {
+        emit_block_epilogue(emit, current_block_inst_count_);
+    }
 }
 
 void JitCompiler::compile_branch_to_lr(ARM64Emitter& emit, const DecodedInst& inst, 
@@ -2422,12 +2714,48 @@ void JitCompiler::compile_float(ARM64Emitter& emit, const DecodedInst& inst) {
             load_fpr(emit, 2, (inst.raw >> 6) & 0x1F); // FRC
             emit.FMADD_vec(0, 0, 2, 1, true);
             if (inst.xo == 28 || inst.xo == 30) {
-                // Negate for fmsub/fnmsub
+                emit.FNEG_vec(0, 0, true);
             }
             break;
+        case 22: // fsqrt
+            emit.FSQRT_vec(0, 1, true);
+            break;
+        case 24: // fres (reciprocal estimate)
+            emit.FRECPE_vec(0, 1, true);
+            break;
+        case 26: // frsqrte (reciprocal square root estimate)
+            emit.FRSQRTE_vec(0, 1, true);
+            break;
+        case 23: // fsel (float select)
+        {
+            // fsel frD, frA, frC, frB: if frA >= 0 then frD = frC else frD = frB
+            load_fpr(emit, 2, (inst.raw >> 6) & 0x1F); // FRC
+            // V0=frA, V1=frB, V2=frC
+            // Use scalar FCMP D0, #0.0 then branch
+            // FCMP Dn, #0.0 encoding: 0x1E602008 | (n << 5)
+            emit.emit_raw(0x1E602008 | (0 << 5));
+            // B.LT +8 (skip next MOV, go to frB path)
+            u8* branch_lt = emit.current();
+            emit.B_cond(arm64_cond::LT, 0);
+            // frA >= 0: move frC to result
+            // FMOV D0, D2 = ORR V0.8B, V2.8B, V2.8B
+            emit.ORR_vec(0, 2, 2);
+            u8* branch_done = emit.current();
+            emit.B(0);
+            // frA < 0: move frB to result
+            emit.patch_branch(reinterpret_cast<u32*>(branch_lt), emit.current());
+            emit.ORR_vec(0, 1, 1);
+            emit.patch_branch(reinterpret_cast<u32*>(branch_done), emit.current());
+            break;
+        }
     }
     
     store_fpr(emit, inst.rd, 0);
+
+    // Update FPSCR FPRF for arithmetic ops (not fsel which doesn't set FPRF)
+    if (inst.xo != 23) {
+        emit_update_fprf(emit, 0);
+    }
 }
 
 //=============================================================================
@@ -2435,10 +2763,95 @@ void JitCompiler::compile_float(ARM64Emitter& emit, const DecodedInst& inst) {
 //=============================================================================
 
 void JitCompiler::compile_vector(ARM64Emitter& emit, const DecodedInst& inst) {
-    // Load vector operands
+    // Check for vector load/store ops (decoded as VLogical with opcode 31)
+    if (inst.type == DecodedInst::Type::VLogical && inst.opcode == 31) {
+        switch (inst.xo) {
+            case 103: // lvx - Load Vector Indexed
+            case 359: // lvxl - Load Vector Indexed LRU
+            {
+                calc_ea_indexed(emit, arm64::X0, inst.ra, inst.rb);
+                // Align to 16 bytes (clear low 4 bits)
+                emit.AND_imm(arm64::X0, arm64::X0, ~15ULL);
+                // Mask to physical address
+                emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
+                emit.AND(arm64::X0, arm64::X0, arm64::X16);
+                // Add fastmem base
+                emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(fastmem_base_));
+                emit.ADD(arm64::X0, arm64::X0, arm64::X16);
+                // Load 16 bytes into NEON register
+                emit.LDR_vec(0, arm64::X0);
+                // Byteswap each 32-bit element (big-endian to little-endian)
+                // REV32 on vector: reverses bytes within each 32-bit element
+                // Encoding: REV32 V0.16B, V0.16B = 0x6E200800 | (vn << 5) | vd
+                emit.emit_raw(0x6E200800 | (0 << 5) | 0);
+                store_vr(emit, inst.rd, 0);
+                return;
+            }
+            case 231: // stvx - Store Vector Indexed
+            case 487: // stvxl - Store Vector Indexed LRU
+            {
+                load_vr(emit, 0, inst.rd);  // Source vector
+                // Byteswap each 32-bit element for big-endian storage
+                emit.emit_raw(0x6E200800 | (0 << 5) | 0);  // REV32 V0.16B, V0.16B
+                calc_ea_indexed(emit, arm64::X0, inst.ra, inst.rb);
+                // Align to 16 bytes
+                emit.AND_imm(arm64::X0, arm64::X0, ~15ULL);
+                // Mask to physical address
+                emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
+                emit.AND(arm64::X0, arm64::X0, arm64::X16);
+                // Add fastmem base
+                emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(fastmem_base_));
+                emit.ADD(arm64::X0, arm64::X0, arm64::X16);
+                // Store 16 bytes from NEON register
+                emit.STR_vec(0, arm64::X0);
+                return;
+            }
+            case 6:  // lvsl - Load Vector for Shift Left
+            case 38: // lvsr - Load Vector for Shift Right
+            {
+                // These generate permute control vectors based on byte offset
+                // Used with vperm to implement unaligned loads
+                // For now, generate a sequential byte index vector
+                calc_ea_indexed(emit, arm64::X0, inst.ra, inst.rb);
+                emit.AND_imm(arm64::X0, arm64::X0, 0xF);  // Get byte offset
+                // Simplified: store offset for use by vperm
+                // Generate identity permute shifted by offset
+                emit.MOV_imm(arm64::X1, 0x0706050403020100ULL);
+                emit.MOV_imm(arm64::X2, 0x0F0E0D0C0B0A0908ULL);
+                // Store into context VR
+                emit.STR(arm64::X1, arm64::CTX_REG, ctx_offset_vr(inst.rd));
+                emit.STR(arm64::X2, arm64::CTX_REG, ctx_offset_vr(inst.rd) + 8);
+                return;
+            }
+            case 7:  // lvebx
+            case 39: // lvehx
+            case 71: // lvewx
+            {
+                // Load Vector Element Byte/Halfword/Word - load single element
+                // Simplified: load the full 16 bytes from aligned address
+                calc_ea_indexed(emit, arm64::X0, inst.ra, inst.rb);
+                emit.MOV_imm(arm64::X16, 0x1FFFFFFFULL);
+                emit.AND(arm64::X0, arm64::X0, arm64::X16);
+                emit.MOV_imm(arm64::X16, reinterpret_cast<u64>(fastmem_base_));
+                emit.ADD(arm64::X0, arm64::X0, arm64::X16);
+                // Zero the target VR first, then load the element
+                emit.EOR_vec(0, 0, 0);
+                // Load single element (simplified - loads a word)
+                emit.LDR(arm64::X1, arm64::X0, 0);
+                byteswap32(emit, arm64::X1);
+                emit.INS_general(0, 0, arm64::X1);
+                store_vr(emit, inst.rd, 0);
+                return;
+            }
+            default:
+                break;
+        }
+    }
+
+    // Standard vector arithmetic operations
     load_vr(emit, 0, inst.ra);
     load_vr(emit, 1, inst.rb);
-    
+
     switch (inst.type) {
         case DecodedInst::Type::VAdd:
             emit.FADD_vec(0, 0, 1, false);
@@ -2449,15 +2862,583 @@ void JitCompiler::compile_vector(ARM64Emitter& emit, const DecodedInst& inst) {
         case DecodedInst::Type::VMul:
             emit.FMUL_vec(0, 0, 1, false);
             break;
+        case DecodedInst::Type::VDiv:
+            emit.FDIV_vec(0, 0, 1, false);
+            break;
         case DecodedInst::Type::VLogical:
-            emit.AND_vec(0, 0, 1);
+            // All opcode 4 VMX instructions decoded as VLogical
+            // Dispatch based on sub-opcode fields
+            {
+                u32 xo_11 = inst.raw & 0x7FF;           // bits 21-31 (11-bit)
+                u32 xo_6 = inst.raw & 0x3F;             // bits 26-31 (6-bit, VA-form)
+
+                // Extract vC from VA-form (bits 21-25)
+                u32 vc = (inst.raw >> 6) & 0x1F;
+
+                // Check VA-form (6-bit xo) first for multiply-add ops
+                switch (xo_6) {
+                    case 46: // vmaddfp - vD = vA * vC + vB
+                        load_vr(emit, 2, vc);
+                        emit.FMLA_vec(1, 0, 2, false);  // vB += vA * vC
+                        store_vr(emit, inst.rd, 1);
+                        return;
+                    case 47: // vnmsubfp - vD = -(vA * vC - vB) = vB - vA * vC
+                        load_vr(emit, 2, vc);
+                        emit.FMLS_vec(1, 0, 2, false);  // vB -= vA * vC
+                        store_vr(emit, inst.rd, 1);
+                        return;
+                    default:
+                        break;
+                }
+
+                // 11-bit xo dispatch
+                switch (xo_11) {
+                    // Float arithmetic
+                    case 10: // vaddfp
+                        emit.FADD_vec(0, 0, 1, false);
+                        break;
+                    case 74: // vsubfp
+                        emit.FSUB_vec(0, 0, 1, false);
+                        break;
+                    case 1034: // vmaxfp
+                        emit.FMAX_vec(0, 0, 1, false);
+                        break;
+                    case 1098: // vminfp
+                        emit.FMIN_vec(0, 0, 1, false);
+                        break;
+                    case 266: // vrefp (reciprocal estimate)
+                        emit.FRECPE_vec(0, 1, false);
+                        break;
+                    case 330: // vrsqrtefp (reciprocal square root estimate)
+                        emit.FRSQRTE_vec(0, 1, false);
+                        break;
+
+                    // Integer arithmetic
+                    case 0:    // vaddubm
+                    case 64:   // vadduhm
+                    case 128:  // vadduwm
+                        emit.ADD_vec(0, 0, 1);
+                        break;
+                    case 1024: // vsububm
+                    case 1088: // vsubuhm
+                    case 1152: // vsubuwm
+                        emit.SUB_vec(0, 0, 1);
+                        break;
+
+                    // Float compare
+                    case 198: // vcmpeqfp
+                        emit.FCMEQ_vec(0, 0, 1, false);
+                        break;
+                    case 454: // vcmpgefp
+                        emit.FCMGE_vec(0, 0, 1, false);
+                        break;
+                    case 710: // vcmpgtfp
+                        emit.FCMGT_vec(0, 0, 1, false);
+                        break;
+
+                    // Integer compare
+                    case 134: // vcmpequw
+                        emit.CMEQ_vec(0, 0, 1);
+                        break;
+                    case 646: // vcmpgtuw (unsigned)
+                        emit.CMHI_vec(0, 0, 1);
+                        break;
+                    case 902: // vcmpgtsw (signed)
+                        emit.CMGT_vec(0, 0, 1);
+                        break;
+
+                    // Logical
+                    case 1028: // vand
+                        emit.AND_vec(0, 0, 1);
+                        break;
+                    case 1092: // vandc
+                        emit.BIC_vec(0, 0, 1);
+                        break;
+                    case 1156: // vor
+                        emit.ORR_vec(0, 0, 1);
+                        break;
+                    case 1284: // vxor
+                        emit.EOR_vec(0, 0, 1);
+                        break;
+                    case 1220: // vnor
+                        emit.ORR_vec(0, 0, 1);
+                        emit.NOT_vec(0, 0);
+                        break;
+
+                    // Merge
+                    case 140: // vmrghw
+                        emit.ZIP1(0, 0, 1);
+                        break;
+                    case 396: // vmrglw
+                        emit.ZIP2(0, 0, 1);
+                        break;
+
+                    // Splat
+                    case 588: // vspltw
+                    {
+                        u32 uimm = (inst.raw >> 16) & 0x1F;
+                        emit.DUP_element(0, 1, uimm & 3);
+                        break;
+                    }
+
+                    default:
+                        // Fallback NOP for unhandled VMX sub-ops
+                        emit.NOP();
+                        break;
+                }
+            }
             break;
         default:
             emit.NOP();
             break;
     }
-    
+
     store_vr(emit, inst.rd, 0);
+}
+
+//=============================================================================
+// Vector Permute/Merge/Splat Compilation
+//=============================================================================
+
+void JitCompiler::compile_vector_permute(ARM64Emitter& emit, const DecodedInst& inst) {
+    switch (inst.type) {
+        case DecodedInst::Type::VPerm:
+        {
+            // vperm vD, vA, vB, vC - Permute bytes from vA/vB using vC as control
+            // Load all three source vectors
+            load_vr(emit, 0, inst.ra);  // vA
+            load_vr(emit, 1, inst.rb);  // vB
+            // vC is in the FRC field position
+            int vc = (inst.raw >> 6) & 0x1F;
+            load_vr(emit, 2, vc);       // vC (permute control)
+
+            // ARM64 TBL instruction can permute from a table of 1-4 registers
+            // For vperm, we'd need TBL with 2 source regs (vA, vB as table)
+            // Simplified: use EXT as an approximation for common cases
+            // Full vperm requires TBL2 which uses V0-V1 as table
+            emit.EXT(0, 0, 1, 0);  // Simplified permute
+            store_vr(emit, inst.rd, 0);
+            break;
+        }
+        case DecodedInst::Type::VMerge:
+        {
+            // vmrghw/vmrglw - Merge high/low words from two vectors
+            load_vr(emit, 0, inst.ra);
+            load_vr(emit, 1, inst.rb);
+
+            // Use ZIP for merge operations
+            // vmrghw = interleave high elements, vmrglw = interleave low elements
+            u32 sub_xo = (inst.raw >> 1) & 0x3FF;
+            if (sub_xo == 12 || sub_xo == 268) {
+                // vmrghw / vmrghh - merge high
+                emit.ZIP1(0, 0, 1);
+            } else {
+                // vmrglw / vmrglh - merge low
+                emit.ZIP2(0, 0, 1);
+            }
+            store_vr(emit, inst.rd, 0);
+            break;
+        }
+        case DecodedInst::Type::VSplat:
+        {
+            // vspltw/vsplth/vspltb - Splat element across vector
+            load_vr(emit, 0, inst.rb);
+            // Splat element inst.ra across the vector
+            int element = inst.ra & 0x3;
+            emit.DUP_element(0, 0, element);
+            store_vr(emit, inst.rd, 0);
+            break;
+        }
+        default:
+            emit.NOP();
+            break;
+    }
+}
+
+//=============================================================================
+// Vector Compare Compilation
+//=============================================================================
+
+void JitCompiler::compile_vector_compare(ARM64Emitter& emit, const DecodedInst& inst) {
+    // vcmpgtfp, vcmpeqfp, vcmpgefp, etc.
+    load_vr(emit, 0, inst.ra);
+    load_vr(emit, 1, inst.rb);
+
+    // Determine compare type from xo field
+    u32 xo = (inst.raw >> 1) & 0x3FF;
+    switch (xo) {
+        case 198: // vcmpgtfp (float greater than)
+            emit.FCMGT_vec(0, 0, 1, false);
+            break;
+        case 70: // vcmpeqfp (float equal)
+            emit.FCMEQ_vec(0, 0, 1, false);
+            break;
+        case 454: // vcmpgefp (float greater or equal)
+            emit.FCMGE_vec(0, 0, 1, false);
+            break;
+        case 966: // vcmpgtuw (unsigned int greater than)
+            emit.CMHI_vec(0, 0, 1, 2);
+            break;
+        case 518: // vcmpgtsh (signed half greater than)
+            emit.CMGT_vec(0, 0, 1, 1);
+            break;
+        default:
+            // Default to equality compare
+            emit.CMEQ_vec(0, 0, 1, 2);
+            break;
+    }
+
+    store_vr(emit, inst.rd, 0);
+
+    // If Rc bit set, update CR6 with vector result
+    if (inst.rc) {
+        // Simplified: set CR6 based on whether all/none elements matched
+        // Full implementation would reduce the vector comparison result
+        emit.STRB(arm64::XZR, arm64::CTX_REG, ctx_offset_cr(6) + 0);
+        emit.STRB(arm64::XZR, arm64::CTX_REG, ctx_offset_cr(6) + 1);
+        emit.STRB(arm64::XZR, arm64::CTX_REG, ctx_offset_cr(6) + 2);
+        emit.STRB(arm64::XZR, arm64::CTX_REG, ctx_offset_cr(6) + 3);
+    }
+}
+
+//=============================================================================
+// Float Unary Compilation (fneg, fabs, fnabs, fmr)
+//=============================================================================
+
+void JitCompiler::compile_float_unary(ARM64Emitter& emit, const DecodedInst& inst) {
+    // X-form float operations use 10-bit xo from bits 1-10
+    u32 xo_x = (inst.raw >> 1) & 0x3FF;
+
+    load_fpr(emit, 0, inst.rb);
+
+    switch (xo_x) {
+        case 40: // fneg
+            emit.FNEG_vec(0, 0, true);
+            break;
+        case 264: // fabs
+            emit.FABS_vec(0, 0, true);
+            break;
+        case 136: // fnabs - negate absolute
+            emit.FABS_vec(0, 0, true);
+            emit.FNEG_vec(0, 0, true);
+            break;
+        case 72: // fmr - float move register
+            // Value already in register, just store
+            break;
+        default:
+            // Unknown float unary, preserve value
+            break;
+    }
+
+    store_fpr(emit, inst.rd, 0);
+}
+
+//=============================================================================
+// Float Compare Compilation (fcmpu, fcmpo)
+//=============================================================================
+
+void JitCompiler::compile_float_compare(ARM64Emitter& emit, const DecodedInst& inst) {
+    // fcmpu/fcmpo - Float Compare (Unordered/Ordered)
+    int crfd = inst.crfd;
+    size_t cr_offset = ctx_offset_cr(crfd);
+
+    // Load FPR values into NEON regs then into GPRs for comparison
+    load_fpr(emit, 0, inst.ra);
+    load_fpr(emit, 1, inst.rb);
+
+    // FCMP D0, D1
+    emit.FCMP_vec(0, 0, 1, true);
+
+    // Map ARM64 NZCV flags to PowerPC CR field
+    // ARM64 FCMP: N=less, Z=equal, C=greater-or-equal-or-unordered, V=unordered
+    // PowerPC: LT, GT, EQ, FU(unordered)
+
+    // LT (negative flag - fra < frb)
+    emit.CSET(arm64::X2, arm64_cond::MI);
+    emit.STRB(arm64::X2, arm64::CTX_REG, cr_offset);
+
+    // GT (fra > frb = carry set AND not equal AND not unordered)
+    emit.CSET(arm64::X2, arm64_cond::GT);
+    emit.STRB(arm64::X2, arm64::CTX_REG, cr_offset + 1);
+
+    // EQ (equal)
+    emit.CSET(arm64::X2, arm64_cond::EQ);
+    emit.STRB(arm64::X2, arm64::CTX_REG, cr_offset + 2);
+
+    // SO/FU (unordered - overflow flag set by FCMP for NaN)
+    emit.CSET(arm64::X2, arm64_cond::VS);
+    emit.STRB(arm64::X2, arm64::CTX_REG, cr_offset + 3);
+}
+
+//=============================================================================
+// Float Convert Compilation (frsp, fctiw, fctiwz, fctid, fctidz, fcfid)
+//=============================================================================
+
+void JitCompiler::compile_float_convert(ARM64Emitter& emit, const DecodedInst& inst) {
+    // X-form float operations use 10-bit xo from bits 1-10
+    u32 xo_x = (inst.raw >> 1) & 0x3FF;
+
+    // FPSCR access instructions don't follow normal FPR load/store pattern
+    switch (xo_x) {
+        case 583: // mffs
+        case 711: // mtfsf
+        case 70:  // mtfsb0
+        case 38:  // mtfsb1
+        case 64:  // mcrfs
+            compile_fpscr_access(emit, inst);
+            return;
+        default:
+            break;
+    }
+
+    load_fpr(emit, 0, inst.rb);
+
+    switch (xo_x) {
+        case 12: // frsp - Round to Single Precision
+            // FCVT S0, D0 then FCVT D0, S0 (round through single)
+            // Simplified: just store as-is since NEON handles precision
+            break;
+
+        case 14: // fctiw - Convert to Integer Word (round)
+        case 15: // fctiwz - Convert to Integer Word, Round toward Zero
+            emit.FCVTZS_vec(0, 0, true);
+            break;
+
+        case 814: // fctid - Convert to Integer Doubleword
+        case 815: // fctidz - Convert to Integer Doubleword, Round toward Zero
+            emit.FCVTZS_vec(0, 0, true);
+            break;
+
+        case 846: // fcfid - Convert From Integer Doubleword
+            emit.SCVTF_vec(0, 0, true);
+            break;
+
+        default:
+            break;
+    }
+
+    store_fpr(emit, inst.rd, 0);
+}
+
+//=============================================================================
+// RFI - Return From Interrupt
+//=============================================================================
+
+void JitCompiler::compile_rfi(ARM64Emitter& emit, const DecodedInst& inst) {
+    // RFI: Restore MSR from SRR1, set PC from SRR0
+    // In an emulator, this signals return from exception handler
+
+    // Set interrupted flag to let dispatcher handle MSR restoration
+    emit.MOV_imm(arm64::X0, 1);
+    emit.STRB(arm64::X0, arm64::CTX_REG, offsetof(ThreadContext, interrupted));
+
+    // Load SRR0 (saved PC) and set as new PC
+    // SRR0 is stored in context - use a fixed offset or load from SPR array
+    // For simplicity, just set running=false to return to dispatcher
+    emit.STRB(arm64::XZR, arm64::CTX_REG, offsetof(ThreadContext, running));
+
+    emit_block_epilogue(emit, current_block_inst_count_);
+}
+
+//=============================================================================
+// FPSCR Access (mffs, mtfsf, mtfsb0, mtfsb1, mcrfs)
+//=============================================================================
+
+void JitCompiler::compile_fpscr_access(ARM64Emitter& emit, const DecodedInst& inst) {
+    u32 xo_x = (inst.raw >> 1) & 0x3FF;
+
+    switch (xo_x) {
+        case 583: // mffs - Move From FPSCR
+        {
+            // Load FPSCR into u64 and store to FPR[rd] (as raw bits in f64)
+            emit.LDR_u32(arm64::X0, arm64::CTX_REG, ctx_offset_fpscr());
+            // Store as 64-bit to FPR (FPSCR goes in low 32 bits)
+            emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_fpr(inst.rd));
+            break;
+        }
+        case 711: // mtfsf - Move To FPSCR Fields
+        {
+            // FM field mask is bits 7-14 (8-bit)
+            u32 fm = (inst.raw >> 17) & 0xFF;
+            // Load source FPR as raw u64
+            emit.LDR(arm64::X0, arm64::CTX_REG, ctx_offset_fpr(inst.rb));
+            // Load current FPSCR
+            emit.LDR_u32(arm64::X1, arm64::CTX_REG, ctx_offset_fpscr());
+
+            // For each FM bit set, copy 4-bit nibble from FPR value to FPSCR
+            for (int i = 0; i < 8; i++) {
+                if (fm & (0x80 >> i)) {
+                    u32 mask = 0xF << (28 - i * 4);
+                    // Clear bits in FPSCR
+                    emit.MOV_imm(arm64::X2, ~mask);
+                    emit.AND(arm64::X1, arm64::X1, arm64::X2);
+                    // Extract bits from source
+                    emit.MOV_imm(arm64::X2, mask);
+                    emit.AND(arm64::X3, arm64::X0, arm64::X2);
+                    // Merge
+                    emit.ORR(arm64::X1, arm64::X1, arm64::X3);
+                }
+            }
+
+            // Store updated FPSCR
+            emit.STR_u32(arm64::X1, arm64::CTX_REG, ctx_offset_fpscr());
+
+            // If RN bits (bits 0-1) were modified, sync ARM64 rounding mode
+            if (fm & 0x01) {
+                emit_sync_rounding_mode(emit);
+            }
+            break;
+        }
+        case 70: // mtfsb0 - Set FPSCR bit to 0
+        {
+            int bit = (inst.raw >> 21) & 0x1F;
+            emit.LDR_u32(arm64::X0, arm64::CTX_REG, ctx_offset_fpscr());
+            emit.MOV_imm(arm64::X1, ~(1u << (31 - bit)));
+            emit.AND(arm64::X0, arm64::X0, arm64::X1);
+            emit.STR_u32(arm64::X0, arm64::CTX_REG, ctx_offset_fpscr());
+            // Sync rounding mode if RN bits changed (bits 30-31 in PPC numbering = bits 0-1)
+            if (bit >= 30) emit_sync_rounding_mode(emit);
+            break;
+        }
+        case 38: // mtfsb1 - Set FPSCR bit to 1
+        {
+            int bit = (inst.raw >> 21) & 0x1F;
+            emit.LDR_u32(arm64::X0, arm64::CTX_REG, ctx_offset_fpscr());
+            emit.MOV_imm(arm64::X1, 1u << (31 - bit));
+            emit.ORR(arm64::X0, arm64::X0, arm64::X1);
+            emit.STR_u32(arm64::X0, arm64::CTX_REG, ctx_offset_fpscr());
+            if (bit >= 30) emit_sync_rounding_mode(emit);
+            break;
+        }
+        case 64: // mcrfs - Move to CR from FPSCR
+        {
+            int crfd = (inst.raw >> 23) & 0x7;
+            int crfs = (inst.raw >> 18) & 0x7;
+            // Extract 4-bit field from FPSCR
+            emit.LDR_u32(arm64::X0, arm64::CTX_REG, ctx_offset_fpscr());
+            int shift = 28 - crfs * 4;
+            emit.LSR_imm(arm64::X0, arm64::X0, shift);
+            emit.AND_imm(arm64::X0, arm64::X0, 0xF);
+            // Split into CR sub-fields: LT(3), GT(2), EQ(1), SO(0)
+            emit.LSR_imm(arm64::X1, arm64::X0, 3);
+            emit.AND_imm(arm64::X1, arm64::X1, 1);
+            emit.STRB(arm64::X1, arm64::CTX_REG, ctx_offset_cr(crfd) + 0);
+            emit.LSR_imm(arm64::X1, arm64::X0, 2);
+            emit.AND_imm(arm64::X1, arm64::X1, 1);
+            emit.STRB(arm64::X1, arm64::CTX_REG, ctx_offset_cr(crfd) + 1);
+            emit.LSR_imm(arm64::X1, arm64::X0, 1);
+            emit.AND_imm(arm64::X1, arm64::X1, 1);
+            emit.STRB(arm64::X1, arm64::CTX_REG, ctx_offset_cr(crfd) + 2);
+            emit.AND_imm(arm64::X1, arm64::X0, 1);
+            emit.STRB(arm64::X1, arm64::CTX_REG, ctx_offset_cr(crfd) + 3);
+            break;
+        }
+        default:
+            emit.NOP();
+            break;
+    }
+}
+
+//=============================================================================
+// FPSCR FPRF Update - classify FP result after arithmetic ops
+//=============================================================================
+
+void JitCompiler::emit_update_fprf(ARM64Emitter& emit, int vreg) {
+    // FPRF is FPSCR bits 12-16 (in PPC bit numbering = bits 15-19 in standard)
+    // FPRF = C | FPCC(FL, FG, FE, FU)
+    //   C=class bit, FL=less-than, FG=greater-than, FE=equal, FU=unordered/NaN
+    //
+    // Fast path classification of double in NEON vreg:
+    //   Compare with zero using scalar FCMP, then read NZCV flags
+    //   ARM64 FCMP: N=less, Z=equal, C=greater-or-unordered, V=unordered
+
+    // FCMP Dn, #0.0 encoding: 0x1E602008 | (vn << 5)
+    emit.emit_raw(0x1E602008 | (vreg << 5));
+
+    // Build FPRF from condition flags
+    // Start with 0, set bits based on conditions
+    emit.MOV_imm(arm64::X0, 0);
+
+    // FU (unordered/NaN) = VS condition
+    emit.CSET(arm64::X1, arm64_cond::VS);
+    emit.ORR(arm64::X0, arm64::X0, arm64::X1);  // bit 0 = FU
+
+    // FE (equal) = EQ condition
+    emit.CSET(arm64::X1, arm64_cond::EQ);
+    emit.LSL_imm(arm64::X1, arm64::X1, 1);
+    emit.ORR(arm64::X0, arm64::X0, arm64::X1);  // bit 1 = FE
+
+    // FG (greater than) = GT condition
+    emit.CSET(arm64::X1, arm64_cond::GT);
+    emit.LSL_imm(arm64::X1, arm64::X1, 2);
+    emit.ORR(arm64::X0, arm64::X0, arm64::X1);  // bit 2 = FG
+
+    // FL (less than) = MI condition
+    emit.CSET(arm64::X1, arm64_cond::MI);
+    emit.LSL_imm(arm64::X1, arm64::X1, 3);
+    emit.ORR(arm64::X0, arm64::X0, arm64::X1);  // bit 3 = FL
+
+    // C (class) bit 4 - set for negative zero, denormals, infinity
+    // Simplified: set C=0 for normal results (most common case)
+
+    // Write FPRF to FPSCR bits 12-16
+    // Load current FPSCR
+    emit.LDR_u32(arm64::X2, arm64::CTX_REG, ctx_offset_fpscr());
+    // Clear FPRF field (bits 12-16 = mask 0x1F000)
+    emit.MOV_imm(arm64::X3, ~0x1F000ULL);
+    emit.AND(arm64::X2, arm64::X2, arm64::X3);
+    // Shift FPRF into position and merge
+    emit.LSL_imm(arm64::X0, arm64::X0, 12);
+    emit.ORR(arm64::X2, arm64::X2, arm64::X0);
+    // Store updated FPSCR
+    emit.STR_u32(arm64::X2, arm64::CTX_REG, ctx_offset_fpscr());
+}
+
+//=============================================================================
+// Rounding Mode Sync - map PPC FPSCR.RN to ARM64 FPCR.RMode
+//=============================================================================
+
+void JitCompiler::emit_sync_rounding_mode(ARM64Emitter& emit) {
+    // PPC FPSCR RN (bits 0-1): 0=nearest, 1=toward zero, 2=toward +inf, 3=toward -inf
+    // ARM64 FPCR RMode (bits 22-23): 0=nearest, 1=toward +inf, 2=toward -inf, 3=toward zero
+    // Mapping: PPC 0→ARM 0, PPC 1→ARM 3, PPC 2→ARM 1, PPC 3→ARM 2
+
+    // Load FPSCR RN bits
+    emit.LDR_u32(arm64::X0, arm64::CTX_REG, ctx_offset_fpscr());
+    emit.AND_imm(arm64::X0, arm64::X0, 3);  // RN = bits 0-1
+
+    // Map PPC RN to ARM64 RMode using a small lookup
+    // Build lookup: [0]=0, [1]=3, [2]=1, [3]=2
+    // Use conditional moves for compact code
+    emit.MOV_imm(arm64::X1, 0);  // default: nearest
+
+    // if RN==1, rmode=3 (toward zero)
+    emit.CMP_imm(arm64::X0, 1);
+    emit.MOV_imm(arm64::X2, 3);
+    emit.CSEL(arm64::X1, arm64::X2, arm64::X1, arm64_cond::EQ);
+
+    // if RN==2, rmode=1 (toward +inf)
+    emit.CMP_imm(arm64::X0, 2);
+    emit.MOV_imm(arm64::X2, 1);
+    emit.CSEL(arm64::X1, arm64::X2, arm64::X1, arm64_cond::EQ);
+
+    // if RN==3, rmode=2 (toward -inf)
+    emit.CMP_imm(arm64::X0, 3);
+    emit.MOV_imm(arm64::X2, 2);
+    emit.CSEL(arm64::X1, arm64::X2, arm64::X1, arm64_cond::EQ);
+
+    // Read current FPCR
+    // ARM64 FPCR sysreg encoding: op0=3,op1=3,CRn=4,CRm=4,op2=0 = 0xDA20
+    emit.MRS(arm64::X0, 0xDA20);
+
+    // Clear RMode bits (22-23) and set new value
+    emit.MOV_imm(arm64::X2, ~(3ULL << 22));
+    emit.AND(arm64::X0, arm64::X0, arm64::X2);
+    emit.LSL_imm(arm64::X1, arm64::X1, 22);
+    emit.ORR(arm64::X0, arm64::X0, arm64::X1);
+
+    // Write back FPCR
+    emit.MSR(0xDA20, arm64::X0);
 }
 
 //=============================================================================
@@ -2692,7 +3673,15 @@ void JitCompiler::load_gpr(ARM64Emitter& emit, int arm_reg, int ppc_reg) {
     if (ppc_reg == 0) {
         emit.MOV_imm(arm_reg, 0);
     } else {
-        emit.LDR(arm_reg, arm64::CTX_REG, ctx_offset_gpr(ppc_reg));
+        int cached = reg_alloc_.get_cached_arm_reg(ppc_reg);
+        if (cached != RegisterAllocator::INVALID_REG) {
+            // Use cached register (MOV = 1 cycle vs LDR = 3-4 cycles)
+            if (arm_reg != cached) {
+                emit.ORR(arm_reg, arm64::XZR, cached);
+            }
+        } else {
+            emit.LDR(arm_reg, arm64::CTX_REG, ctx_offset_gpr(ppc_reg));
+        }
     }
 }
 
@@ -2700,7 +3689,16 @@ void JitCompiler::store_gpr(ARM64Emitter& emit, int ppc_reg, int arm_reg) {
     // Note: r0 CAN be written to as a destination register in most instructions.
     // The "r0 = 0" special case only applies when r0 is used as a BASE register
     // for load/store address calculation (rA field), not when it's a destination (rD).
-    emit.STR(arm_reg, arm64::CTX_REG, ctx_offset_gpr(ppc_reg));
+    int cached = reg_alloc_.get_cached_arm_reg(ppc_reg);
+    if (cached != RegisterAllocator::INVALID_REG) {
+        // Update cached register, defer ThreadContext write to block epilogue
+        if (arm_reg != cached) {
+            emit.ORR(cached, arm64::XZR, arm_reg);
+        }
+        reg_alloc_.mark_dirty(ppc_reg);
+    } else {
+        emit.STR(arm_reg, arm64::CTX_REG, ctx_offset_gpr(ppc_reg));
+    }
 }
 
 void JitCompiler::load_fpr(ARM64Emitter& emit, int neon_reg, int ppc_reg) {
@@ -2790,29 +3788,48 @@ void JitCompiler::emit_block_prologue(ARM64Emitter& emit) {
     emit.STP(arm64::X29, arm64::X30, arm64::SP, -16);
     emit.STP(arm64::X19, arm64::X20, arm64::SP, -32);
     emit.STP(arm64::X21, arm64::X22, arm64::SP, -48);
-    emit.SUB_imm(arm64::SP, arm64::SP, 48);
-    
+    emit.STP(arm64::X23, arm64::X24, arm64::SP, -64);
+    emit.SUB_imm(arm64::SP, arm64::SP, 64);
+
     // Set up context register (X19)
     emit.ORR(arm64::CTX_REG, arm64::XZR, arm64::X0);
-    
-    // Note: MEM_BASE (X20) is no longer used - fastmem_base is loaded
-    // directly into X16 in emit_translate_address for each memory access.
-    // This avoids potential register corruption issues and simplifies debugging.
+
+    // Load cached PPC GPRs into X21-X24
+    for (int i = 0; i < RegisterAllocator::MAX_CACHED_GPRS; i++) {
+        int ppc_reg = reg_alloc_.cached_ppc_reg(i);
+        if (ppc_reg > 0) {
+            emit.LDR(RegisterAllocator::CACHE_REGS[i], arm64::CTX_REG, ctx_offset_gpr(ppc_reg));
+        }
+    }
 }
 
-void JitCompiler::emit_block_epilogue(ARM64Emitter& emit, u32 inst_count) {
+void JitCompiler::emit_block_epilogue_for_link(ARM64Emitter& emit, u32 inst_count) {
     // Increment time base register by actual cycles executed
     // ~4 cycles per instruction to approximate Xbox 360's ~50MHz time base
     u32 cycles = inst_count * 4;
     emit.LDR(arm64::X0, arm64::CTX_REG, ctx_offset_time_base());
     emit.ADD_imm(arm64::X0, arm64::X0, cycles);
     emit.STR(arm64::X0, arm64::CTX_REG, ctx_offset_time_base());
-    
-    // Restore callee-saved registers and return
-    emit.ADD_imm(arm64::SP, arm64::SP, 48);
+
+    // Flush dirty cached GPRs back to ThreadContext
+    for (int i = 0; i < RegisterAllocator::MAX_CACHED_GPRS; i++) {
+        int ppc_reg = reg_alloc_.cached_ppc_reg(i);
+        if (ppc_reg > 0 && reg_alloc_.is_dirty(ppc_reg)) {
+            emit.STR(RegisterAllocator::CACHE_REGS[i], arm64::CTX_REG, ctx_offset_gpr(ppc_reg));
+        }
+    }
+
+    // Restore callee-saved registers
+    emit.ADD_imm(arm64::SP, arm64::SP, 64);
+    emit.LDP(arm64::X23, arm64::X24, arm64::SP, -64);
     emit.LDP(arm64::X21, arm64::X22, arm64::SP, -48);
     emit.LDP(arm64::X19, arm64::X20, arm64::SP, -32);
     emit.LDP(arm64::X29, arm64::X30, arm64::SP, -16);
+    // No RET - caller emits B for block linking or RET for non-linkable exits
+}
+
+void JitCompiler::emit_block_epilogue(ARM64Emitter& emit, u32 inst_count) {
+    emit_block_epilogue_for_link(emit, inst_count);
     emit.RET();
 }
 
@@ -2821,25 +3838,26 @@ void JitCompiler::emit_block_epilogue(ARM64Emitter& emit, u32 inst_count) {
 //=============================================================================
 
 void JitCompiler::try_link_block(CompiledBlock* block) {
-    // Link exits to already-compiled blocks
+    // Link this block's exits to already-compiled target blocks
     for (auto& link : block->links) {
         if (link.linked) continue;
-        
+
         auto it = block_map_.find(link.target);
         if (it != block_map_.end()) {
             CompiledBlock* target = it->second;
-            
+
             u32* patch_addr = reinterpret_cast<u32*>(
                 static_cast<u8*>(block->code) + link.patch_offset
             );
-            s64 offset = static_cast<u8*>(target->code) - 
+            s64 offset = static_cast<u8*>(target->code) -
                         reinterpret_cast<u8*>(patch_addr);
-            
+
             if (offset >= -128*1024*1024 && offset < 128*1024*1024) {
                 s32 imm26 = offset >> 2;
                 *patch_addr = 0x14000000 | (imm26 & 0x03FFFFFF);
                 link.linked = true;
-                
+                stats_.blocks_linked++;
+
 #ifdef __aarch64__
                 __builtin___clear_cache(
                     reinterpret_cast<char*>(patch_addr),
@@ -2849,26 +3867,27 @@ void JitCompiler::try_link_block(CompiledBlock* block) {
             }
         }
     }
-    
-    // Link other blocks to this one
+
+    // Link other blocks' exits to this newly-compiled block
     for (auto& [addr, other] : block_map_) {
         if (other == block) continue;
-        
+
         for (auto& link : other->links) {
             if (link.linked) continue;
             if (link.target != block->start_addr) continue;
-            
+
             u32* patch_addr = reinterpret_cast<u32*>(
                 static_cast<u8*>(other->code) + link.patch_offset
             );
-            s64 offset = static_cast<u8*>(block->code) - 
+            s64 offset = static_cast<u8*>(block->code) -
                         reinterpret_cast<u8*>(patch_addr);
-            
+
             if (offset >= -128*1024*1024 && offset < 128*1024*1024) {
                 s32 imm26 = offset >> 2;
                 *patch_addr = 0x14000000 | (imm26 & 0x03FFFFFF);
                 link.linked = true;
-                
+                stats_.blocks_linked++;
+
 #ifdef __aarch64__
                 __builtin___clear_cache(
                     reinterpret_cast<char*>(patch_addr),
@@ -2888,6 +3907,68 @@ void JitCompiler::unlink_block(CompiledBlock* block) {
             }
         }
     }
+}
+
+//=============================================================================
+// Idle Loop Detection
+//=============================================================================
+
+bool JitCompiler::detect_idle_loop(GuestAddr addr, u32 inst_count) {
+    // Idle loops are small blocks (2-8 instructions) that branch back to themselves
+    // and only contain loads, compares, and NOPs (no stores or side effects).
+    // Detecting these allows us to skip ahead and yield CPU time.
+    if (inst_count < 2 || inst_count > 8) return false;
+
+    // Check last instruction - must be a conditional branch back to block start
+    u32 last_raw = memory_->read_u32(addr + (inst_count - 1) * 4);
+    u32 last_opcode = last_raw >> 26;
+
+    if (last_opcode != 16) return false;  // Must be bc (opcode 16)
+
+    // Calculate branch target
+    GuestAddr branch_pc = addr + (inst_count - 1) * 4;
+    s32 bd = static_cast<s16>(last_raw & 0xFFFC);  // Sign-extend BD field
+    GuestAddr target;
+    if (last_raw & 2) {  // AA (absolute)
+        target = bd & ~3;
+    } else {
+        target = branch_pc + bd;
+    }
+
+    if (target != addr) return false;  // Must loop back to start
+
+    // Check that all instructions (except last branch) are side-effect-free:
+    // Allow: loads (lwz, lbz, lhz, lha), compares (cmpi, cmpli, cmp, cmpl), NOPs
+    for (u32 i = 0; i < inst_count - 1; i++) {
+        u32 raw = memory_->read_u32(addr + i * 4);
+        u32 opcode = raw >> 26;
+
+        switch (opcode) {
+            case 32: case 34: case 40: case 42:  // lwz, lbz, lhz, lha
+                break;  // Safe: read-only
+            case 11: case 10:  // cmpi, cmpli
+                break;  // Safe: only sets CR
+            case 24:  // ori - check if NOP (ori 0,0,0)
+                if ((raw & 0x03FFFFFF) != 0) return false;
+                break;
+            case 31: {  // Extended ops
+                u32 xo = (raw >> 1) & 0x3FF;
+                switch (xo) {
+                    case 0: case 32:    // cmp, cmpl
+                    case 23: case 87:   // lwzx, lbzx
+                    case 279: case 343: // lhzx, lhax
+                        break;  // Safe
+                    default:
+                        return false;  // Unknown extended op - not safe
+                }
+                break;
+            }
+            default:
+                return false;  // Unknown opcode - not safe
+        }
+    }
+
+    return true;
 }
 
 //=============================================================================
@@ -2923,25 +4004,53 @@ CompiledBlock* JitCompiler::compile_block_unlocked(GuestAddr addr) {
     block->start_addr = addr;
     block->code = code_write_ptr_;
     block->execution_count = 0;
-    
+    block->linked_entry_offset = 0;
+    block->is_idle_loop = false;
+
     // Create temporary buffer for code generation
     u8 temp_buffer[TEMP_BUFFER_SIZE];
     ARM64Emitter emit(temp_buffer, TEMP_BUFFER_SIZE);
-    
+
     ThreadContext ctx_template = {};
-    
+
+    // Pre-scan block to determine size and set up register allocation
+    {
+        GuestAddr scan_pc = addr;
+        u32 pre_scan_count = 0;
+        bool scan_ended = false;
+        while (!scan_ended && pre_scan_count < MAX_BLOCK_INSTRUCTIONS) {
+            u32 raw = memory_->read_u32(scan_pc);
+            DecodedInst d = Decoder::decode(raw);
+            d.raw = raw;
+            pre_scan_count++;
+            scan_pc += 4;
+            if (is_block_ending(d)) scan_ended = true;
+        }
+
+        // Analyze GPR usage and map hot registers to X21-X24
+        reg_alloc_.setup_block(addr, pre_scan_count, memory_);
+
+        // Detect idle loops (small loops that just spin on a condition)
+        block->is_idle_loop = detect_idle_loop(addr, pre_scan_count);
+        if (block->is_idle_loop) {
+            stats_.idle_loops_detected++;
+            LOGI("Idle loop detected at %08llX (%u instructions)", (unsigned long long)addr, pre_scan_count);
+        }
+    }
+
     GuestAddr pc = addr;
     u32 inst_count = 0;
     bool block_ended = false;
-    
+
     // Reset instruction count for time_base tracking
     current_block_inst_count_ = 0;
-    
+
     // Emit block prologue
-    // The block is called with: X0 = ThreadContext*, X1 = memory_base
-    // We need to set up CTX_REG (X19) and MEM_BASE (X20)
     emit_block_prologue(emit);
-    
+
+    // Record entry point past prologue for linked block entry
+    block->linked_entry_offset = static_cast<u32>(emit.size());
+
     while (!block_ended && inst_count < MAX_BLOCK_INSTRUCTIONS) {
         // Fetch instruction from PPC memory (big-endian)
         u32 ppc_inst = memory_->read_u32(pc);

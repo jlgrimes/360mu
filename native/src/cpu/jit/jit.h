@@ -91,52 +91,46 @@ namespace arm64 {
 
 /**
  * Register allocator for PPC to ARM64 mapping
+ *
+ * Maps frequently-used PPC GPRs to ARM64 callee-saved registers (X21-X24)
+ * for the duration of a compiled block. Avoids repeated LDR/STR to
+ * ThreadContext for hot registers (1 cycle MOV vs 3-4 cycle memory access).
  */
 class RegisterAllocator {
 public:
     RegisterAllocator();
-    
-    // Get ARM64 register for PPC GPR
-    // Returns a register (may need to load from context if not cached)
-    int get_gpr(int ppc_reg);
-    
-    // Mark a PPC GPR as dirty (needs writeback)
+
+    // Analyze a block's PPC instructions and map the most-used GPRs to X21-X24
+    void setup_block(GuestAddr addr, u32 inst_count, class Memory* memory);
+
+    // Get ARM64 register caching this PPC GPR, or INVALID_REG if not cached
+    int get_cached_arm_reg(int ppc_reg) const;
+
+    // Mark a cached PPC GPR as dirty (needs writeback at block exit)
     void mark_dirty(int ppc_reg);
-    
-    // Flush all dirty registers to context
-    void flush_all(class ARM64Emitter& emit);
-    
-    // Flush specific register
-    void flush_gpr(class ARM64Emitter& emit, int ppc_reg);
-    
-    // Allocate a temporary ARM64 register
-    int alloc_temp();
-    
-    // Free a temporary register
-    void free_temp(int arm_reg);
-    
-    // Reset allocator state
-    void reset();
-    
+
+    // Check if a cached PPC register has been modified
+    bool is_dirty(int ppc_reg) const;
+
     // Check if a PPC register is currently cached in an ARM64 register
     bool is_cached(int ppc_reg) const;
-    
-    // Direct register mapping (simple approach for initial implementation)
-    // PPC GPR -> ARM64 register or -1 if not mapped
+
+    // Get PPC reg cached in slot i (0..MAX_CACHED_GPRS-1), or -1 if empty
+    int cached_ppc_reg(int slot) const;
+
+    // Reset allocator state for a new block
+    void reset();
+
     static constexpr int INVALID_REG = -1;
-    
+    static constexpr int MAX_CACHED_GPRS = 4;
+    static constexpr int CACHE_REGS[MAX_CACHED_GPRS] = {
+        arm64::X21, arm64::X22, arm64::X23, arm64::X24
+    };
+
 private:
-    // Which PPC GPRs are cached in ARM64 registers
-    std::array<int, 32> ppc_to_arm_;  // -1 if not cached
-    
-    // Which ARM64 registers hold PPC GPRs
-    std::array<int, 32> arm_to_ppc_;  // -1 if not holding a PPC reg
-    
-    // Which cached registers are dirty
-    std::bitset<32> dirty_;
-    
-    // Available temp registers
-    std::bitset<18> temp_available_;  // X0-X17 availability
+    int ppc_to_arm_[32];                    // PPC GPR -> ARM64 reg, or INVALID_REG
+    int cached_ppcs_[MAX_CACHED_GPRS];      // Which PPC GPR is in each cache slot (-1 if none)
+    std::bitset<32> dirty_;                 // Which cached GPRs have been modified
 };
 
 /**
@@ -150,6 +144,8 @@ struct CompiledBlock {
     u32 code_size;                  // Size of ARM64 code in bytes
     u64 hash;                       // Hash of original PPC code for SMC detection
     u32 execution_count;            // For hot block tracking
+    u32 linked_entry_offset;        // Offset past prologue for linked block entry
+    bool is_idle_loop;              // Block detected as an idle/spin loop
     std::vector<GuestAddr> exits;   // Block exit addresses
     
     // Linking info for direct jumps
@@ -324,6 +320,8 @@ public:
     void FMUL_vec(int vd, int vn, int vm, bool is_double = false);
     void FDIV_vec(int vd, int vn, int vm, bool is_double = false);
     void FMADD_vec(int vd, int vn, int vm, int va, bool is_double = false);
+    void FMLA_vec(int vd, int vn, int vm, bool is_double = false);
+    void FMLS_vec(int vd, int vn, int vm, bool is_double = false);
     void FNEG_vec(int vd, int vn, bool is_double = false);
     void FABS_vec(int vd, int vn, bool is_double = false);
     void FCMP_vec(int vd, int vn, int vm, bool is_double = false);
@@ -356,10 +354,16 @@ public:
     void BIC_vec(int vd, int vn, int vm);
     void NOT_vec(int vd, int vn);
     
-    // NEON - comparison
+    // NEON - comparison (integer)
     void CMEQ_vec(int vd, int vn, int vm, int size = 2);
     void CMGT_vec(int vd, int vn, int vm, int size = 2);
     void CMGE_vec(int vd, int vn, int vm, int size = 2);
+    void CMHI_vec(int vd, int vn, int vm, int size = 2);
+
+    // NEON - comparison (float)
+    void FCMEQ_vec(int vd, int vn, int vm, bool is_double = false);
+    void FCMGE_vec(int vd, int vn, int vm, bool is_double = false);
+    void FCMGT_vec(int vd, int vn, int vm, bool is_double = false);
     
     // NEON - min/max
     void FMAX_vec(int vd, int vn, int vm, bool is_double = false);
@@ -391,6 +395,9 @@ public:
     void ADR(int rd, s32 offset);
     void ADRP(int rd, s64 offset);
     
+    // Raw instruction emit (for custom encodings)
+    void emit_raw(u32 value) { emit32(value); }
+
     // Patching
     void patch_branch(u32* patch_site, void* target);
     void patch_imm(u32* patch_site, u64 imm);
@@ -453,6 +460,9 @@ public:
         u64 cache_misses;
         u64 instructions_executed;
         u64 interpreter_fallbacks;
+        u64 blocks_linked;
+        u64 idle_loops_detected;
+        u64 idle_loops_skipped;
     };
     Stats get_stats() const { return stats_; }
     
@@ -544,13 +554,19 @@ private:
     
     // Float compilation
     void compile_float(ARM64Emitter& emit, const DecodedInst& inst);
-    
+    void compile_float_unary(ARM64Emitter& emit, const DecodedInst& inst);
+    void compile_float_compare(ARM64Emitter& emit, const DecodedInst& inst);
+    void compile_float_convert(ARM64Emitter& emit, const DecodedInst& inst);
+
     // Vector (VMX128) compilation - uses NEON
     void compile_vector(ARM64Emitter& emit, const DecodedInst& inst);
-    
+    void compile_vector_permute(ARM64Emitter& emit, const DecodedInst& inst);
+    void compile_vector_compare(ARM64Emitter& emit, const DecodedInst& inst);
+
     // System instruction compilation
     void compile_system(ARM64Emitter& emit, const DecodedInst& inst);
     void compile_syscall(ARM64Emitter& emit, const DecodedInst& inst);
+    void compile_rfi(ARM64Emitter& emit, const DecodedInst& inst);
     
     // CR operations
     void compile_cr_update(ARM64Emitter& emit, int field, int result_reg);
@@ -558,9 +574,14 @@ private:
     void compile_mtcrf(ARM64Emitter& emit, const DecodedInst& inst);
     void compile_mfcr(ARM64Emitter& emit, const DecodedInst& inst);
     
-    // SPR operations  
+    // SPR operations
     void compile_mfspr(ARM64Emitter& emit, const DecodedInst& inst);
     void compile_mtspr(ARM64Emitter& emit, const DecodedInst& inst);
+
+    // FPSCR operations
+    void compile_fpscr_access(ARM64Emitter& emit, const DecodedInst& inst);
+    void emit_update_fprf(ARM64Emitter& emit, int vreg);
+    void emit_sync_rounding_mode(ARM64Emitter& emit);
     
     // Helper: Load PPC GPR into ARM64 register
     void load_gpr(ARM64Emitter& emit, int arm_reg, int ppc_reg);
@@ -595,10 +616,14 @@ private:
     // Block prologue/epilogue
     void emit_block_prologue(ARM64Emitter& emit);
     void emit_block_epilogue(ARM64Emitter& emit, u32 inst_count);
-    
+    void emit_block_epilogue_for_link(ARM64Emitter& emit, u32 inst_count);  // No RET, for linkable exits
+
     // Block linking
     void try_link_block(CompiledBlock* block);
     void unlink_block(CompiledBlock* block);
+
+    // Idle loop detection
+    bool detect_idle_loop(GuestAddr addr, u32 inst_count);
     
     // Dispatcher
     using DispatcherFunc = void(*)(ThreadContext* ctx, void* jit);
@@ -647,6 +672,9 @@ private:
     }
     static constexpr size_t ctx_offset_time_base() {
         return offsetof(ThreadContext, time_base);
+    }
+    static constexpr size_t ctx_offset_fpscr() {
+        return offsetof(ThreadContext, fpscr);
     }
 };
 

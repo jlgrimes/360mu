@@ -26,6 +26,10 @@ while [[ $# -gt 0 ]]; do
             BUILD_TYPE="Release"
             shift
             ;;
+        --profile)
+            BUILD_TYPE="Profile"
+            shift
+            ;;
         --test)
             RUN_TESTS=true
             shift
@@ -36,7 +40,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--release] [--test] [--clean]"
+            echo "Usage: $0 [--release] [--profile] [--test] [--clean]"
             exit 1
             ;;
     esac
@@ -57,6 +61,7 @@ echo -e "${GREEN}Configuring CMake (${BUILD_TYPE})...${NC}"
 # Configure CMake
 cmake .. \
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     -DX360MU_BUILD_TESTS=ON \
     -DX360MU_ENABLE_JIT=OFF \
     -DX360MU_USE_FFMPEG=OFF \
@@ -73,7 +78,13 @@ BUILD_RESULT=$?
 if [ $BUILD_RESULT -eq 0 ]; then
     echo ""
     echo -e "${GREEN}Build successful!${NC}"
-    
+
+    # Symlink compile_commands.json to project root for IDE support
+    if [ -f "${BUILD_DIR}/compile_commands.json" ]; then
+        ln -sf "${BUILD_DIR}/compile_commands.json" "${PROJECT_ROOT}/compile_commands.json"
+        echo -e "${GREEN}compile_commands.json linked to project root${NC}"
+    fi
+
     # Run tests if requested
     if [ "$RUN_TESTS" = true ]; then
         echo ""

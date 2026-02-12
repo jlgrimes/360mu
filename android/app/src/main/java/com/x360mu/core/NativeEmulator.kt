@@ -192,15 +192,157 @@ class NativeEmulator : AutoCloseable {
     fun setButton(player: Int, button: Int, pressed: Boolean) {
         nativeSetButton(nativeHandle, player, button, pressed)
     }
-    
+
     fun setTrigger(player: Int, trigger: Int, value: Float) {
         nativeSetTrigger(nativeHandle, player, trigger, value)
     }
-    
+
     fun setStick(player: Int, stick: Int, x: Float, y: Float) {
         nativeSetStick(nativeHandle, player, stick, x, y)
     }
+
+    // Touch input (passes raw touch coordinates to native touch-to-controller mapping)
+    fun onTouchDown(player: Int, pointerId: Int, x: Float, y: Float, screenWidth: Float, screenHeight: Float) {
+        nativeOnTouchDown(nativeHandle, player, pointerId, x, y, screenWidth, screenHeight)
+    }
+
+    fun onTouchMove(player: Int, pointerId: Int, x: Float, y: Float, screenWidth: Float, screenHeight: Float) {
+        nativeOnTouchMove(nativeHandle, player, pointerId, x, y, screenWidth, screenHeight)
+    }
+
+    fun onTouchUp(player: Int, pointerId: Int) {
+        nativeOnTouchUp(nativeHandle, player, pointerId)
+    }
+
+    // Physical controller connection
+    fun setControllerConnected(player: Int, connected: Boolean) {
+        nativeSetControllerConnected(nativeHandle, player, connected)
+    }
+
+    // Vibration feedback (read by polling from game thread)
+    fun getVibrationLeft(player: Int): Int = nativeGetVibrationLeft(nativeHandle, player)
+    fun getVibrationRight(player: Int): Int = nativeGetVibrationRight(nativeHandle, player)
+
+    /**
+     * Register a vibration listener that receives callbacks from native XInputSetState.
+     * Pass null to unregister.
+     */
+    fun setVibrationListener(listener: VibrationManager.VibrationListener?) {
+        Log.i(TAG, "setVibrationListener: ${if (listener != null) "registering" else "clearing"}")
+        nativeSetVibrationListener(nativeHandle, listener)
+    }
+
+    // Dead zone configuration
+    fun setStickDeadZone(stickId: Int, inner: Float, outer: Float = 0.95f) {
+        nativeSetStickDeadZone(nativeHandle, stickId, inner, outer)
+    }
+
+    fun setTriggerDeadZone(threshold: Float) {
+        nativeSetTriggerDeadZone(nativeHandle, threshold)
+    }
+
+    /**
+     * Map Android KeyEvent keyCode to Xbox 360 button index.
+     * Returns -1 if unmapped.
+     */
+    fun mapKeyCodeToButton(keyCode: Int): Int {
+        return when (keyCode) {
+            96 /* KEYCODE_BUTTON_A */ -> Button.A
+            97 /* KEYCODE_BUTTON_B */ -> Button.B
+            99 /* KEYCODE_BUTTON_X */ -> Button.X
+            100 /* KEYCODE_BUTTON_Y */ -> Button.Y
+            19 /* KEYCODE_DPAD_UP */ -> Button.DPAD_UP
+            20 /* KEYCODE_DPAD_DOWN */ -> Button.DPAD_DOWN
+            21 /* KEYCODE_DPAD_LEFT */ -> Button.DPAD_LEFT
+            22 /* KEYCODE_DPAD_RIGHT */ -> Button.DPAD_RIGHT
+            108 /* KEYCODE_BUTTON_START */ -> Button.START
+            4 /* KEYCODE_BACK */, 109 /* KEYCODE_BUTTON_SELECT */ -> Button.BACK
+            102 /* KEYCODE_BUTTON_L1 */ -> Button.LEFT_BUMPER
+            103 /* KEYCODE_BUTTON_R1 */ -> Button.RIGHT_BUMPER
+            106 /* KEYCODE_BUTTON_THUMBL */ -> Button.LEFT_STICK
+            107 /* KEYCODE_BUTTON_THUMBR */ -> Button.RIGHT_STICK
+            110 /* KEYCODE_BUTTON_MODE */ -> Button.GUIDE
+            else -> -1
+        }
+    }
     
+    // Game info / compatibility
+    data class GameInfo(
+        val titleId: String,
+        val mediaId: String,
+        val version: String,
+        val baseVersion: String,
+        val discNumber: Int,
+        val discCount: Int,
+        val platform: Int,
+        val executableType: Int,
+        val savegameId: String,
+        val gameRegion: String,
+        val baseAddress: String,
+        val entryPoint: String,
+        val imageSize: Long,
+        val stackSize: Long,
+        val heapSize: Long,
+        val moduleName: String,
+        val sectionCount: Int,
+        val importLibraries: Map<String, Int>,  // lib name -> import count
+        val totalImports: Int,
+        val resolvedImports: Int
+    ) {
+        val compatibilityPercent: Int
+            get() = if (totalImports > 0) (resolvedImports * 100 / totalImports) else 0
+
+        val compatibilityRating: String
+            get() = when {
+                compatibilityPercent >= 90 -> "Playable"
+                compatibilityPercent >= 70 -> "In-Game"
+                compatibilityPercent >= 50 -> "Menu"
+                compatibilityPercent >= 30 -> "Boots"
+                else -> "Untested"
+            }
+    }
+
+    fun getGameInfo(path: String): GameInfo? {
+        val raw = nativeGetGameInfo(nativeHandle, path)
+        if (raw.isNullOrEmpty()) return null
+
+        val parts = raw.split('|')
+        if (parts.size < 20) return null
+
+        val importLibs = mutableMapOf<String, Int>()
+        if (parts[17].isNotEmpty()) {
+            parts[17].split(',').forEach { entry ->
+                val kv = entry.split(':')
+                if (kv.size == 2) {
+                    importLibs[kv[0]] = kv[1].toIntOrNull() ?: 0
+                }
+            }
+        }
+
+        return GameInfo(
+            titleId = parts[0],
+            mediaId = parts[1],
+            version = parts[2],
+            baseVersion = parts[3],
+            discNumber = parts[4].toIntOrNull() ?: 0,
+            discCount = parts[5].toIntOrNull() ?: 0,
+            platform = parts[6].toIntOrNull() ?: 0,
+            executableType = parts[7].toIntOrNull() ?: 0,
+            savegameId = parts[8],
+            gameRegion = parts[9],
+            baseAddress = parts[10],
+            entryPoint = parts[11],
+            imageSize = parts[12].toLongOrNull() ?: 0,
+            stackSize = parts[13].toLongOrNull() ?: 0,
+            heapSize = parts[14].toLongOrNull() ?: 0,
+            moduleName = parts[15],
+            sectionCount = parts[16].toIntOrNull() ?: 0,
+            importLibraries = importLibs,
+            totalImports = parts[18].toIntOrNull() ?: 0,
+            resolvedImports = parts[19].toIntOrNull() ?: 0
+        )
+    }
+
     // Save states
     fun saveState(path: String): Boolean {
         return nativeSaveState(nativeHandle, path)
@@ -221,9 +363,17 @@ class NativeEmulator : AutoCloseable {
     fun setResolutionScale(scale: Int) {
         nativeSetResolutionScale(nativeHandle, scale)
     }
-    
+
     fun setVsync(enabled: Boolean) {
         nativeSetVsync(nativeHandle, enabled)
+    }
+
+    fun setFrameSkip(count: Int) {
+        nativeSetFrameSkip(nativeHandle, count)
+    }
+
+    fun setTargetFps(fps: Int) {
+        nativeSetTargetFps(nativeHandle, fps)
     }
     
     override fun close() {
@@ -288,7 +438,25 @@ class NativeEmulator : AutoCloseable {
     private external fun nativeSetButton(handle: Long, player: Int, button: Int, pressed: Boolean)
     private external fun nativeSetTrigger(handle: Long, player: Int, trigger: Int, value: Float)
     private external fun nativeSetStick(handle: Long, player: Int, stick: Int, x: Float, y: Float)
-    
+
+    // Touch input
+    private external fun nativeOnTouchDown(handle: Long, player: Int, pointerId: Int, x: Float, y: Float, screenWidth: Float, screenHeight: Float)
+    private external fun nativeOnTouchMove(handle: Long, player: Int, pointerId: Int, x: Float, y: Float, screenWidth: Float, screenHeight: Float)
+    private external fun nativeOnTouchUp(handle: Long, player: Int, pointerId: Int)
+
+    // Controller connection
+    private external fun nativeSetControllerConnected(handle: Long, player: Int, connected: Boolean)
+
+    // Vibration
+    private external fun nativeGetVibrationLeft(handle: Long, player: Int): Int
+    private external fun nativeGetVibrationRight(handle: Long, player: Int): Int
+    private external fun nativeSetVibrationListener(handle: Long, listener: VibrationManager.VibrationListener?)
+
+    // Dead zone configuration
+    private external fun nativeSetStickDeadZone(handle: Long, stickId: Int, inner: Float, outer: Float)
+    private external fun nativeSetTriggerDeadZone(handle: Long, threshold: Float)
+
+    private external fun nativeGetGameInfo(handle: Long, path: String): String
     private external fun nativeSaveState(handle: Long, path: String): Boolean
     private external fun nativeLoadState(handle: Long, path: String): Boolean
     
@@ -297,6 +465,8 @@ class NativeEmulator : AutoCloseable {
     
     private external fun nativeSetResolutionScale(handle: Long, scale: Int)
     private external fun nativeSetVsync(handle: Long, enabled: Boolean)
+    private external fun nativeSetFrameSkip(handle: Long, count: Int)
+    private external fun nativeSetTargetFps(handle: Long, fps: Int)
     
     // Feature flags for debugging
     private external fun nativeSetFeatureFlag(flagName: String, enabled: Boolean)
@@ -328,5 +498,76 @@ class NativeEmulator : AutoCloseable {
     fun getFeatureFlag(name: String): Boolean {
         return nativeGetFeatureFlag(name)
     }
+
+    // ========================================================================
+    // Crash handler and log buffer
+    // ========================================================================
+
+    fun installCrashHandler(crashDir: String) {
+        Log.i(TAG, "Installing crash handler, dir: $crashDir")
+        nativeInstallCrashHandler(nativeHandle, crashDir)
+    }
+
+    enum class LogSeverity(val value: Int) {
+        Debug(0), Info(1), Warning(2), Error(3)
+    }
+
+    enum class LogComponent(val value: Int) {
+        Core(0), CPU(1), GPU(2), APU(3), Kernel(4),
+        Memory(5), Input(6), JIT(7), Loader(8);
+
+        val displayName: String get() = name
+    }
+
+    data class LogEntry(
+        val timestampMs: Long,
+        val severity: LogSeverity,
+        val component: LogComponent,
+        val message: String
+    )
+
+    fun getLogCount(): Int = nativeGetLogCount()
+
+    fun getLogs(
+        severityMin: LogSeverity = LogSeverity.Debug,
+        component: Int = -1
+    ): List<LogEntry> {
+        val raw = nativeGetLogs(severityMin.value, component)
+        if (raw.isNullOrEmpty()) return emptyList()
+
+        return raw.trimEnd('\n').split('\n').mapNotNull { line ->
+            val parts = line.split('|', limit = 4)
+            if (parts.size < 4) return@mapNotNull null
+            LogEntry(
+                timestampMs = parts[0].toLongOrNull() ?: 0,
+                severity = LogSeverity.entries.find { it.value == (parts[1].toIntOrNull() ?: 0) } ?: LogSeverity.Debug,
+                component = LogComponent.entries.find { it.value == (parts[2].toIntOrNull() ?: 0) } ?: LogComponent.Core,
+                message = parts[3]
+            )
+        }
+    }
+
+    fun exportLogs(): String = nativeExportLogs() ?: ""
+
+    fun clearLogs() = nativeClearLogs()
+
+    fun listCrashLogs(crashDir: String): List<String> {
+        return nativeListCrashLogs(crashDir)?.toList() ?: emptyList()
+    }
+
+    fun readCrashLog(path: String): String {
+        return nativeReadCrashLog(path) ?: ""
+    }
+
+    // Crash handler and log buffer native methods (instance - need handle)
+    private external fun nativeInstallCrashHandler(handle: Long, crashDir: String)
+
+    // Static log/crash methods (operate on global singleton)
+    private external fun nativeGetLogCount(): Int
+    private external fun nativeGetLogs(severityMin: Int, component: Int): String
+    private external fun nativeExportLogs(): String
+    private external fun nativeClearLogs()
+    private external fun nativeListCrashLogs(crashDir: String): Array<String>?
+    private external fun nativeReadCrashLog(path: String): String
 }
 

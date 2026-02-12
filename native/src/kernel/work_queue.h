@@ -64,9 +64,16 @@ public:
     // Get current queue size
     size_t size() const;
     
+    // Cancel a specific work item by its guest address
+    // Returns true if the item was found and removed
+    bool cancel(GuestAddr item_address);
+
+    // Drain all pending items (returns count removed)
+    size_t drain();
+
     // Reset shutdown flag (for restart)
     void reset();
-    
+
 private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
@@ -92,11 +99,17 @@ public:
     // Reset all queues
     void reset_all();
     
+    // Cancel a work item by guest address in specified queue
+    bool cancel(WorkQueueType type, GuestAddr item_address);
+
+    // Drain all items from a specific queue
+    size_t drain(WorkQueueType type);
+
     // Get queue statistics
     size_t get_queue_size(WorkQueueType type) const;
     size_t get_total_queued() const;
     size_t get_total_processed() const;
-    
+
 private:
     WorkQueueManager() = default;
     ~WorkQueueManager() = default;

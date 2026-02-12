@@ -128,18 +128,47 @@ protected:
 };
 
 /**
+ * NT status codes for object operations
+ */
+namespace nt_obj {
+    constexpr u32 STATUS_SUCCESS = 0x00000000;
+    constexpr u32 STATUS_INVALID_HANDLE = 0xC0000008;
+    constexpr u32 STATUS_OBJECT_TYPE_MISMATCH = 0xC0000024;
+    constexpr u32 STATUS_INVALID_PARAMETER = 0xC000000D;
+}
+
+/**
+ * Special handle constants (same as Windows NT kernel)
+ */
+constexpr u32 HANDLE_CURRENT_PROCESS = 0xFFFFFFFF;  // NtCurrentProcess() = -1
+constexpr u32 HANDLE_CURRENT_THREAD  = 0xFFFFFFFE;  // NtCurrentThread()  = -2
+
+/**
  * Object handle table
+ *
+ * Implements Xbox 360 / Windows NT kernel handle table semantics:
+ * - Handles are 4-byte aligned incrementing values (4, 8, 12, ...)
+ * - add_object: inserts object, sets initial refcount to 1 (for the handle itself)
+ * - close_handle: removes handle from table, releases one reference
+ * - ObReferenceObjectByHandle: looks up + increments refcount (caller must deref)
+ * - ObDereferenceObject: decrements refcount
+ * - Objects survive handle close if additional references exist
  */
 class ObjectTable {
 public:
     ObjectTable();
     ~ObjectTable();
-    
+
     // Handle operations
     u32 add_object(std::shared_ptr<XObject> object);
     bool remove_handle(u32 handle);
     std::shared_ptr<XObject> lookup(u32 handle);
-    
+
+    /**
+     * Lookup with type checking. Returns nullptr and sets status if type mismatch.
+     */
+    std::shared_ptr<XObject> lookup_typed(u32 handle, XObjectType expected_type, u32* status_out = nullptr);
+
     template<typename T>
     std::shared_ptr<T> lookup_typed(u32 handle) {
         auto obj = lookup(handle);
@@ -148,20 +177,46 @@ public:
         }
         return nullptr;
     }
-    
+
+    /**
+     * Reference object by handle (ObReferenceObjectByHandle)
+     * Increments refcount on the XObject. Caller must call release() when done.
+     * @param expected_type If not None, validates the object type
+     * @return STATUS_SUCCESS, STATUS_INVALID_HANDLE, or STATUS_OBJECT_TYPE_MISMATCH
+     */
+    u32 reference_object_by_handle(u32 handle, XObjectType expected_type,
+                                    std::shared_ptr<XObject>* out_object);
+
+    /**
+     * Close handle (NtClose)
+     * Removes from handle table and releases the handle's reference.
+     * Object survives if other references exist.
+     * @return STATUS_SUCCESS or STATUS_INVALID_HANDLE
+     */
+    u32 close_handle(u32 handle);
+
+    /**
+     * Duplicate handle (NtDuplicateObject)
+     * Creates a new handle pointing to the same object, increments refcount.
+     * @return STATUS_SUCCESS or STATUS_INVALID_HANDLE
+     */
+    u32 duplicate_handle(u32 source_handle, u32* target_handle_out);
+
     // Find by name
     std::shared_ptr<XObject> lookup_by_name(const std::string& name);
-    
+
     // Statistics
     size_t object_count() const;
-    
+
     // Clear all objects (for shutdown)
     void clear();
-    
+
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::unordered_map<u32, std::shared_ptr<XObject>> objects_;
-    u32 next_handle_ = 0x10000;  // Start handles at a reasonable value
+    u32 next_handle_ = 4;  // NT-style: handles start at 4, increment by 4
+
+    u32 allocate_handle();
 };
 
 /**

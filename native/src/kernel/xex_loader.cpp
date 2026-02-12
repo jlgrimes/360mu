@@ -30,8 +30,9 @@
 
 namespace x360mu {
 
-// XEX2 magic value
+// XEX magic values
 constexpr u32 XEX2_MAGIC = 0x58455832;  // 'XEX2'
+constexpr u32 XEX1_MAGIC = 0x58455831;  // 'XEX1' (pre-release format)
 
 // PE signature
 constexpr u32 PE_SIGNATURE = 0x00004550;  // 'PE\0\0'
@@ -99,11 +100,18 @@ Status XexLoader::load_buffer(const u8* data, u32 size, const std::string& name,
         return status;
     }
     
-    LOGI("Loaded XEX: %s", name.c_str());
+    LOGI("Loaded XEX: %s (format: %s)", name.c_str(),
+         module_->file_header.magic == XEX1_MAGIC ? "XEX1" : "XEX2");
     LOGI("  Base address: 0x%08X", module_->base_address);
     LOGI("  Entry point:  0x%08X", module_->entry_point);
     LOGI("  Image size:   0x%08X", module_->image_size);
     LOGI("  Title ID:     0x%08X", module_->execution_info.title_id);
+    if (!module_->static_libraries.empty()) {
+        LOGI("  Static libs:  %zu", module_->static_libraries.size());
+    }
+    if (!module_->resources.empty()) {
+        LOGI("  Resources:    %zu", module_->resources.size());
+    }
     
     // Load image into emulator memory
     if (memory && !module_->image_data.empty()) {
@@ -133,12 +141,17 @@ Status XexLoader::parse_headers(const u8* data, u32 size) {
     module_->file_header.security_offset = read_u32_be(ptr); ptr += 4;
     module_->file_header.header_count = read_u32_be(ptr); ptr += 4;
     
-    // Verify magic
-    if (module_->file_header.magic != XEX2_MAGIC) {
+    // Verify magic (accept both XEX2 and XEX1)
+    if (module_->file_header.magic != XEX2_MAGIC &&
+        module_->file_header.magic != XEX1_MAGIC) {
         error_ = "Invalid XEX magic";
-        LOGE("Invalid magic: 0x%08X (expected 0x%08X)",
-             module_->file_header.magic, XEX2_MAGIC);
+        LOGE("Invalid magic: 0x%08X (expected 0x%08X or 0x%08X)",
+             module_->file_header.magic, XEX2_MAGIC, XEX1_MAGIC);
         return Status::Error;
+    }
+
+    if (module_->file_header.magic == XEX1_MAGIC) {
+        LOGI("Loading XEX1 (pre-release) format executable");
     }
     
     // Check if this is a title module
@@ -250,6 +263,70 @@ Status XexLoader::parse_optional_headers(const u8* data, u32 size, u32 count) {
                 
             case XexHeaderId::kImportLibraries:
                 parse_import_libraries(data, value, size);
+                break;
+
+            case XexHeaderId::kResourceInfo:
+                if (value < size - 4) {
+                    const u8* res = data + value;
+                    u32 res_size = read_u32_be(res);
+                    // Each resource entry: 8 bytes name + 4 bytes address + 4 bytes size = 16 bytes
+                    u32 entry_count = (res_size - 4) / 16;
+                    const u8* entry = res + 4;
+                    for (u32 r = 0; r < entry_count && entry + 16 <= data + size; r++) {
+                        XexResource resource;
+                        resource.name = read_string(entry, 8);
+                        resource.address = read_u32_be(entry + 8);
+                        resource.size = read_u32_be(entry + 12);
+                        module_->resources.push_back(resource);
+                        LOGD("Resource: %s addr=0x%08X size=0x%X",
+                             resource.name.c_str(), resource.address, resource.size);
+                        entry += 16;
+                    }
+                }
+                break;
+
+            case XexHeaderId::kStaticLibraries:
+                if (value < size - 4) {
+                    const u8* slib = data + value;
+                    u32 slib_size = read_u32_be(slib);
+                    // Each entry: 8 bytes name + 2 major + 2 minor + 2 build + 2 qfe + 2 approval = 18 bytes
+                    u32 entry_count = (slib_size - 4) / 16;
+                    const u8* entry = slib + 4;
+                    for (u32 s = 0; s < entry_count && entry + 16 <= data + size; s++) {
+                        XexStaticLibrary lib;
+                        lib.name = read_string(entry, 8);
+                        lib.version_major = read_u16_be(entry + 8);
+                        lib.version_minor = read_u16_be(entry + 10);
+                        lib.version_build = read_u16_be(entry + 12);
+                        lib.version_qfe = (entry[14] >> 2) & 0x3F;
+                        lib.approval_type = entry[14] & 0x03;
+                        module_->static_libraries.push_back(lib);
+                        LOGD("Static lib: %s %u.%u.%u.%u",
+                             lib.name.c_str(), lib.version_major,
+                             lib.version_minor, lib.version_build, lib.version_qfe);
+                        entry += 16;
+                    }
+                }
+                break;
+
+            case XexHeaderId::kChecksumTimestamp:
+                if (value < size - 8) {
+                    u32 checksum = read_u32_be(data + value);
+                    u32 timestamp = read_u32_be(data + value + 4);
+                    LOGD("Checksum: 0x%08X, Timestamp: 0x%08X", checksum, timestamp);
+                }
+                break;
+
+            case XexHeaderId::kSystemFlags:
+                LOGD("System flags: 0x%08X", value);
+                break;
+
+            case XexHeaderId::kGameRatings:
+                LOGD("Game ratings header at 0x%08X", value);
+                break;
+
+            case XexHeaderId::kLANKey:
+                LOGD("LAN key at 0x%08X", value);
                 break;
             
             case XexHeaderId::kBaseFileFormat:
@@ -505,20 +582,40 @@ Status XexLoader::parse_pe_image(const u8* data, u32 offset, u32 raw_size) {
     // For other modes, decrypt the whole image first
     if (module_->encryption_type == 1 && module_->compression_type != 1) {
         LOGI("Decrypting XEX image (%u bytes)...", raw_size);
-        
+
         XexDecryptor decryptor;
-        decryptor.set_key(module_->security_info.file_key);
-        
+
+        // Try auto-detecting the correct key type
+        // XEX1 format uses XEX1 key, otherwise try retail first then devkit
+        XexKeyType detected_key = XexKeyType::Retail;
+        if (module_->file_header.magic == XEX1_MAGIC) {
+            decryptor.set_key(module_->security_info.file_key, XexKeyType::XEX1);
+            LOGI("Using XEX1 key for pre-release format");
+        } else if (decryptor.try_keys(working_data.data(),
+                                       std::min(raw_size, (u32)64),
+                                       module_->security_info.file_key,
+                                       detected_key)) {
+            LOGI("Auto-detected key type: %s",
+                 detected_key == XexKeyType::Retail ? "retail" :
+                 detected_key == XexKeyType::DevKit ? "devkit" : "xex1");
+            decryptor.set_key(module_->security_info.file_key, detected_key);
+        } else {
+            LOGW("Key auto-detection failed, trying retail key");
+            decryptor.set_key(module_->security_info.file_key, XexKeyType::Retail);
+        }
+
         // Use zero IV for XEX decryption
         u8 iv[16] = {0};
-        
+
         Status status = decryptor.decrypt_image(working_data.data(), working_data.size(), iv);
         if (status != Status::Ok) {
             LOGE("Failed to decrypt XEX image");
             return status;
         }
-        
-        LOGI("Decryption complete");
+
+        LOGI("Decryption complete (key type: %s)",
+             decryptor.get_key_type() == XexKeyType::Retail ? "retail" :
+             decryptor.get_key_type() == XexKeyType::DevKit ? "devkit" : "xex1");
     }
     
     // Decompress if needed
@@ -555,8 +652,13 @@ Status XexLoader::parse_pe_image(const u8* data, u32 offset, u32 raw_size) {
                    std::min(working_data.size(), (size_t)module_->image_size));
         } else {
             XexDecryptor decryptor;
-            decryptor.set_key(module_->security_info.file_key);
-            
+            // Use appropriate key for basic compression too
+            if (module_->file_header.magic == XEX1_MAGIC) {
+                decryptor.set_key(module_->security_info.file_key, XexKeyType::XEX1);
+            } else {
+                decryptor.set_key(module_->security_info.file_key, XexKeyType::Retail);
+            }
+
             u32 src_offset = 0;
             u32 dst_offset = 0;
             u8 iv[16] = {0};  // IV chains across all blocks
@@ -638,12 +740,32 @@ Status XexLoader::parse_pe_image(const u8* data, u32 offset, u32 raw_size) {
                      module_->image_data[ep_offset+6], module_->image_data[ep_offset+7]);
             }
         }
+    } else if (module_->compression_type == 3) {
+        // Delta compression
+        LOGI("Decompressing delta patch...");
+        XexDecryptor decryptor;
+        // Delta compression requires a base image - for now warn and copy raw
+        LOGW("Delta compression requires base image, not yet supported at load time");
+        memcpy(module_->image_data.data(), working_data.data(),
+               std::min(working_data.size(), (size_t)module_->image_size));
     } else {
         // No compression, just copy
         memcpy(module_->image_data.data(), working_data.data(),
                std::min(working_data.size(), (size_t)module_->image_size));
     }
-    
+
+    // Verify image hash if available
+    {
+        Sha1 sha;
+        u8 computed_hash[20];
+        Sha1::hash(module_->image_data.data(), module_->image_size, computed_hash);
+        if (memcmp(computed_hash, module_->security_info.image_hash, 20) == 0) {
+            LOGI("Image hash verification: PASSED");
+        } else {
+            LOGW("Image hash verification: FAILED (image may still be usable)");
+        }
+    }
+
     // Step 3: Parse PE headers from the decrypted/decompressed image
     const u8* img = module_->image_data.data();
     
@@ -806,6 +928,30 @@ void XexTestHarness::print_module_info() const {
     printf("Is Title:       %s\n", mod->is_title ? "Yes" : "No");
     printf("Stack Size:     0x%08X\n", mod->default_stack_size);
     printf("Heap Size:      0x%08X\n", mod->default_heap_size);
+    printf("Encryption:     %s\n", mod->encryption_type == 0 ? "None" :
+           mod->encryption_type == 1 ? "Normal" : "Unknown");
+    printf("Compression:    %s\n", mod->compression_type == 0 ? "None" :
+           mod->compression_type == 1 ? "Basic" :
+           mod->compression_type == 2 ? "LZX" :
+           mod->compression_type == 3 ? "Delta" : "Unknown");
+
+    if (!mod->static_libraries.empty()) {
+        printf("\nStatic Libraries (%zu):\n", mod->static_libraries.size());
+        for (const auto& lib : mod->static_libraries) {
+            printf("  %-8s %u.%u.%u.%u\n", lib.name.c_str(),
+                   lib.version_major, lib.version_minor,
+                   lib.version_build, lib.version_qfe);
+        }
+    }
+
+    if (!mod->resources.empty()) {
+        printf("\nResources (%zu):\n", mod->resources.size());
+        for (const auto& res : mod->resources) {
+            printf("  %-8s addr=0x%08X size=0x%X\n",
+                   res.name.c_str(), res.address, res.size);
+        }
+    }
+
     printf("\n");
 }
 

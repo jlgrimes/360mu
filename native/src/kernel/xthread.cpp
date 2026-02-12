@@ -529,9 +529,9 @@ std::shared_ptr<XThread> XScheduler::get_thread(u32 thread_id) {
 }
 
 void XScheduler::run_for(u64 cycles) {
-    // Execute all ready threads
+    // Execute all ready threads, sorted by priority (highest first)
     std::vector<std::shared_ptr<XThread>> ready;
-    
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& thread : threads_) {
@@ -541,36 +541,58 @@ void XScheduler::run_for(u64 cycles) {
             }
         }
     }
-    
+
     if (ready.empty()) {
-        // No threads to run, just advance time
         advance_time(cycles);
         return;
     }
-    
-    // Divide cycles among threads
-    u64 per_thread = cycles / ready.size();
-    
-    for (const auto& thread : ready) {
+
+    // Sort by priority (highest priority = most positive value runs first)
+    std::sort(ready.begin(), ready.end(),
+        [](const std::shared_ptr<XThread>& a, const std::shared_ptr<XThread>& b) {
+            return static_cast<s8>(a->priority()) > static_cast<s8>(b->priority());
+        });
+
+    // Distribute cycles weighted by priority.
+    // Higher priority threads get proportionally more cycles.
+    // Base weight is 1, each priority level above Normal adds 1.
+    u64 total_weight = 0;
+    std::vector<u64> weights(ready.size());
+    for (size_t i = 0; i < ready.size(); i++) {
+        s8 prio = static_cast<s8>(ready[i]->priority());
+        // Map priority [-15..15] to weight [1..16]
+        weights[i] = static_cast<u64>(std::max(1, prio + 16));
+        total_weight += weights[i];
+    }
+
+    for (size_t i = 0; i < ready.size(); i++) {
+        const auto& thread = ready[i];
+
+        // Check affinity: only run if the thread can run on at least one core
+        if (thread->affinity_mask() == 0) continue;
+
         current_thread_ = thread;
         KernelState::instance().set_current_thread(thread.get());
-        
+
         thread->state_ = XThreadState::Running;
-        
-        // Execute on CPU
-        cpu_->execute_thread(thread->cpu_thread_id(), per_thread);
-        
+
+        // Weighted cycle allocation
+        u64 thread_cycles = (cycles * weights[i]) / total_weight;
+        if (thread_cycles == 0) thread_cycles = 1;
+
+        cpu_->execute_thread(thread->cpu_thread_id(), thread_cycles);
+
         // Deliver any pending APCs
         thread->deliver_apcs();
-        
+
         if (thread->state() == XThreadState::Running) {
             thread->state_ = XThreadState::Ready;
         }
     }
-    
+
     current_thread_ = nullptr;
     KernelState::instance().set_current_thread(nullptr);
-    
+
     advance_time(cycles);
 }
 
@@ -580,8 +602,30 @@ void XScheduler::yield() {
 }
 
 void XScheduler::schedule() {
-    // Simple round-robin for now
-    // TODO: Priority-based scheduling
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // Find highest priority ready thread
+    std::shared_ptr<XThread> best = nullptr;
+    for (const auto& thread : threads_) {
+        if (thread->state() != XThreadState::Ready) continue;
+        if (thread->affinity_mask() == 0) continue;
+
+        if (!best || static_cast<s8>(thread->priority()) > static_cast<s8>(best->priority())) {
+            best = thread;
+        }
+    }
+
+    if (best && best != current_thread_) {
+        // Preempt current thread if lower priority
+        if (current_thread_ && current_thread_->state() == XThreadState::Running) {
+            if (static_cast<s8>(best->priority()) > static_cast<s8>(current_thread_->priority())) {
+                current_thread_->state_ = XThreadState::Ready;
+                current_thread_ = best;
+            }
+        } else {
+            current_thread_ = best;
+        }
+    }
 }
 
 u32 XScheduler::wait_for_object(XThread* thread, XObject* object, u64 timeout_100ns) {
@@ -602,7 +646,8 @@ void XScheduler::advance_time(u64 cycles) {
 }
 
 void XScheduler::process_timers() {
-    // TODO: Process timer queue
+    // Process timers through the KernelState timer queue
+    KernelState::instance().process_timer_queue();
 }
 
 void XScheduler::process_dpcs() {

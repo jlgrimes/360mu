@@ -91,6 +91,27 @@ size_t WorkQueue::size() const {
     return items_.size();
 }
 
+bool WorkQueue::cancel(GuestAddr item_address) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    for (auto it = items_.begin(); it != items_.end(); ++it) {
+        if (it->item_address == item_address) {
+            LOGI("Cancelled work item: routine=0x%08X, param=0x%08X",
+                 (u32)it->worker_routine, (u32)it->parameter);
+            items_.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t WorkQueue::drain() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    size_t count = items_.size();
+    items_.clear();
+    return count;
+}
+
 void WorkQueue::reset() {
     std::lock_guard<std::mutex> lock(mutex_);
     shutdown_ = false;
@@ -162,6 +183,22 @@ size_t WorkQueueManager::get_total_queued() const {
 
 size_t WorkQueueManager::get_total_processed() const {
     return total_processed_.load();
+}
+
+bool WorkQueueManager::cancel(WorkQueueType type, GuestAddr item_address) {
+    size_t queue_idx = static_cast<size_t>(type);
+    if (queue_idx >= static_cast<size_t>(WorkQueueType::Maximum)) {
+        return false;
+    }
+    return queues_[queue_idx].cancel(item_address);
+}
+
+size_t WorkQueueManager::drain(WorkQueueType type) {
+    size_t queue_idx = static_cast<size_t>(type);
+    if (queue_idx >= static_cast<size_t>(WorkQueueType::Maximum)) {
+        return 0;
+    }
+    return queues_[queue_idx].drain();
 }
 
 } // namespace x360mu

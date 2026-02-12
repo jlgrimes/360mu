@@ -317,6 +317,22 @@ void TextureDecompressor::decompress_dxt5a_block(const u8* src, u8* dst) {
     }
 }
 
+void TextureDecompressor::decompress_dxn_block(const u8* src, u8* dst) {
+    // DXN/BC5: Two DXT5A channels (R and G) - 16 bytes total
+    // First 8 bytes: Red channel (DXT5A encoding)
+    // Last 8 bytes: Green channel (DXT5A encoding)
+    u8 red_block[16];
+    u8 green_block[16];
+    decompress_dxt5a_block(src, red_block);
+    decompress_dxt5a_block(src + 8, green_block);
+
+    // Combine into RG output (2 bytes per pixel, 4x4 block)
+    for (int i = 0; i < 16; i++) {
+        dst[i * 2 + 0] = red_block[i];
+        dst[i * 2 + 1] = green_block[i];
+    }
+}
+
 void TextureDecompressor::decompress_ctx1_block(const u8* src, u8* dst) {
     // CTX1: Xbox 360 specific 2-channel normal map format
     // 8 bytes: 2 endpoint colors (2 bytes each) + 4 bytes indices
@@ -385,21 +401,57 @@ void TextureDecompressor::decompress_texture(const u8* src, u8* dst,
                 case TextureFormat::k_DXT5A:
                     decompress_dxt5a_block(src + src_offset, block);
                     break;
-                    
+
+                case TextureFormat::k_DXT3A: {
+                    // DXT3A: 4-bit alpha only, 8 bytes per block
+                    for (int py = 0; py < 4; py++) {
+                        u16 row = src[src_offset + py * 2] | (src[src_offset + py * 2 + 1] << 8);
+                        for (int px = 0; px < 4; px++) {
+                            u8 a4 = (row >> (px * 4)) & 0xF;
+                            block[py * 4 + px] = (a4 << 4) | a4;
+                        }
+                    }
+                    break;
+                }
+
                 case TextureFormat::k_CTX1:
                     decompress_ctx1_block(src + src_offset, block);
                     break;
-                    
+
+                case TextureFormat::k_DXN: {
+                    // DXN/BC5: two-channel, decode to RG then expand to RGBA
+                    u8 rg_block[32];  // 16 pixels * 2 channels
+                    decompress_dxn_block(src + src_offset, rg_block);
+                    for (int i = 0; i < 16; i++) {
+                        block[i * 4 + 0] = rg_block[i * 2 + 0];
+                        block[i * 4 + 1] = rg_block[i * 2 + 1];
+                        block[i * 4 + 2] = 0;
+                        block[i * 4 + 3] = 255;
+                    }
+                    break;
+                }
+
                 default:
                     memset(block, 128, sizeof(block));
                     break;
             }
-            
+
             // Copy decompressed block to output
+            // DXT5A and DXT3A produce single-channel output; expand to RGBA
+            bool single_channel = (format == TextureFormat::k_DXT5A ||
+                                   format == TextureFormat::k_DXT3A);
             for (u32 py = 0; py < 4 && (by * 4 + py) < height; py++) {
                 for (u32 px = 0; px < 4 && (bx * 4 + px) < width; px++) {
                     u32 dst_offset = ((by * 4 + py) * width + (bx * 4 + px)) * 4;
-                    memcpy(dst + dst_offset, block + (py * 4 + px) * 4, 4);
+                    if (single_channel) {
+                        u8 v = block[py * 4 + px];
+                        dst[dst_offset + 0] = v;
+                        dst[dst_offset + 1] = v;
+                        dst[dst_offset + 2] = v;
+                        dst[dst_offset + 3] = 255;
+                    } else {
+                        memcpy(dst + dst_offset, block + (py * 4 + px) * 4, 4);
+                    }
                 }
             }
         }

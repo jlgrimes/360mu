@@ -71,10 +71,12 @@ namespace spv {
     
     // BuiltIn values
     constexpr u32 BuiltInPosition = 0;
+    constexpr u32 BuiltInPointSize = 1;
     constexpr u32 BuiltInVertexIndex = 42;
     constexpr u32 BuiltInInstanceIndex = 43;
     constexpr u32 BuiltInFragCoord = 15;
     constexpr u32 BuiltInFrontFacing = 17;
+    constexpr u32 BuiltInFragDepth = 22;
     
     // GLSL.std.450 extended instructions
     constexpr u32 GLSLstd450Trunc = 3;
@@ -135,10 +137,13 @@ Status ShaderMicrocode::parse(const void* data, u32 size, ShaderType type) {
         return Status::InvalidArgument;
     }
     
-    // Copy raw instruction data
+    // Copy raw instruction data and byte-swap from big-endian guest format
     u32 word_count = size / 4;
     instructions_.resize(word_count);
-    memcpy(instructions_.data(), data, size);
+    const u32* src = static_cast<const u32*>(data);
+    for (u32 i = 0; i < word_count; i++) {
+        instructions_[i] = byte_swap(src[i]);
+    }
     
     // Decode control flow instructions (first part of shader)
     decode_control_flow();
@@ -170,17 +175,33 @@ void ShaderMicrocode::decode_control_flow() {
         cf0.condition = (dword0 >> 20) & 1;
         cf_instructions_.push_back(cf0);
         
-        if (cf0.opcode == xenos_cf::EXEC || cf0.opcode == xenos_cf::EXEC_END) {
-            // Decode ALU/Fetch clauses referenced by this CF instruction
-            bool is_fetch = (dword0 >> 19) & 1;
-            if (is_fetch) {
+        // Extract additional fields
+        cf0.is_fetch = (dword0 >> 19) & 1;
+        cf0.bool_index = (dword0 >> 12) & 0x7F;
+        cf0.loop_id = (dword0 >> 12) & 0x1F;
+        cf0.clause_start = 0;
+        cf0.clause_count = 0;
+
+        // Decode ALU/Fetch clauses for all exec-type CF opcodes
+        if (cf0.opcode == xenos_cf::EXEC || cf0.opcode == xenos_cf::EXEC_END ||
+            cf0.opcode == xenos_cf::COND_EXEC || cf0.opcode == xenos_cf::COND_EXEC_END ||
+            cf0.opcode == xenos_cf::COND_PRED_EXEC || cf0.opcode == xenos_cf::COND_PRED_EXEC_END ||
+            cf0.opcode == xenos_cf::COND_EXEC_PRED_CLEAN || cf0.opcode == xenos_cf::COND_EXEC_PRED_CLEAN_END) {
+            if (cf0.is_fetch) {
+                cf0.clause_start = static_cast<u32>(fetch_instructions_.size());
                 decode_fetch_clause(cf0.address * 3, cf0.count + 1);
+                cf0.clause_count = static_cast<u32>(fetch_instructions_.size()) - cf0.clause_start;
             } else {
+                cf0.clause_start = static_cast<u32>(alu_instructions_.size());
                 decode_alu_clause(cf0.address * 3, cf0.count + 1);
+                cf0.clause_count = static_cast<u32>(alu_instructions_.size()) - cf0.clause_start;
             }
         }
-        
-        if (cf0.end_of_shader || cf0.opcode == xenos_cf::EXEC_END) {
+
+        if (cf0.end_of_shader || cf0.opcode == xenos_cf::EXEC_END ||
+            cf0.opcode == xenos_cf::COND_EXEC_END ||
+            cf0.opcode == xenos_cf::COND_PRED_EXEC_END ||
+            cf0.opcode == xenos_cf::COND_EXEC_PRED_CLEAN_END) {
             end_found = true;
         }
         
@@ -197,16 +218,33 @@ void ShaderMicrocode::decode_control_flow() {
             cf1.condition = (upper >> 20) & 1;
             cf_instructions_.push_back(cf1);
             
-            if (cf1.opcode == xenos_cf::EXEC || cf1.opcode == xenos_cf::EXEC_END) {
-                bool is_fetch = (upper >> 19) & 1;
-                if (is_fetch) {
+            // Extract additional fields
+            cf1.is_fetch = (upper >> 19) & 1;
+            cf1.bool_index = (upper >> 12) & 0x7F;
+            cf1.loop_id = (upper >> 12) & 0x1F;
+            cf1.clause_start = 0;
+            cf1.clause_count = 0;
+
+            // Decode ALU/Fetch clauses for all exec-type CF opcodes
+            if (cf1.opcode == xenos_cf::EXEC || cf1.opcode == xenos_cf::EXEC_END ||
+                cf1.opcode == xenos_cf::COND_EXEC || cf1.opcode == xenos_cf::COND_EXEC_END ||
+                cf1.opcode == xenos_cf::COND_PRED_EXEC || cf1.opcode == xenos_cf::COND_PRED_EXEC_END ||
+                cf1.opcode == xenos_cf::COND_EXEC_PRED_CLEAN || cf1.opcode == xenos_cf::COND_EXEC_PRED_CLEAN_END) {
+                if (cf1.is_fetch) {
+                    cf1.clause_start = static_cast<u32>(fetch_instructions_.size());
                     decode_fetch_clause(cf1.address * 3, cf1.count + 1);
+                    cf1.clause_count = static_cast<u32>(fetch_instructions_.size()) - cf1.clause_start;
                 } else {
+                    cf1.clause_start = static_cast<u32>(alu_instructions_.size());
                     decode_alu_clause(cf1.address * 3, cf1.count + 1);
+                    cf1.clause_count = static_cast<u32>(alu_instructions_.size()) - cf1.clause_start;
                 }
             }
-            
-            if (cf1.end_of_shader || cf1.opcode == xenos_cf::EXEC_END) {
+
+            if (cf1.end_of_shader || cf1.opcode == xenos_cf::EXEC_END ||
+                cf1.opcode == xenos_cf::COND_EXEC_END ||
+                cf1.opcode == xenos_cf::COND_PRED_EXEC_END ||
+                cf1.opcode == xenos_cf::COND_EXEC_PRED_CLEAN_END) {
                 end_found = true;
             }
         }
@@ -218,43 +256,88 @@ void ShaderMicrocode::decode_control_flow() {
 void ShaderMicrocode::decode_alu_clause(u32 address, u32 count) {
     // ALU instructions are 96 bits (3 dwords)
     for (u32 i = 0; i < count && (address + 2) < instructions_.size(); i++) {
-        AluInstruction inst;
+        AluInstruction inst = {};  // Zero-initialize all fields
         inst.words[0] = instructions_[address];
         inst.words[1] = instructions_[address + 1];
         inst.words[2] = instructions_[address + 2];
-        
+
         // Decode scalar operation (bits 54-59 of the 96-bit instruction)
         inst.scalar_opcode = (inst.words[1] >> 22) & 0x3F;
-        
+
         // Decode vector operation (bits 48-53)
         inst.vector_opcode = (inst.words[1] >> 16) & 0x3F;
-        
+
         // Decode destination register (bits 32-38)
         inst.dest_reg = inst.words[1] & 0x7F;
-        
+
+        // Vector and scalar share the same destination register
+        inst.vector_dest = inst.dest_reg;
+        inst.scalar_dest = inst.dest_reg;
+        inst.vector_dest_rel = 0;
+        inst.scalar_dest_rel = 0;
+
         // Decode source registers (packed in words[0] and words[2])
         inst.src_regs[0] = inst.words[0] & 0x7F;
         inst.src_regs[1] = (inst.words[0] >> 7) & 0x7F;
         inst.src_regs[2] = (inst.words[0] >> 14) & 0x7F;
-        
-        // Source modifiers
+
+        // Source modifiers (combined fields)
         inst.abs[0] = (inst.words[0] >> 21) & 1;
         inst.abs[1] = (inst.words[0] >> 22) & 1;
         inst.abs[2] = (inst.words[0] >> 23) & 1;
         inst.negate[0] = (inst.words[0] >> 24) & 1;
         inst.negate[1] = (inst.words[0] >> 25) & 1;
         inst.negate[2] = (inst.words[0] >> 26) & 1;
-        
-        // Write mask (bits 39-42 of word 1)
+
+        // Copy to per-source fields used by the translator
+        inst.src_abs[0] = inst.abs[0];
+        inst.src_abs[1] = inst.abs[1];
+        inst.src_abs[2] = inst.abs[2];
+        inst.src_negate[0] = inst.negate[0];
+        inst.src_negate[1] = inst.negate[1];
+        inst.src_negate[2] = inst.negate[2];
+
+        // Source swizzles - default to identity (xyzw = 0xE4)
+        inst.src_swizzles[0] = 0xE4;
+        inst.src_swizzles[1] = 0xE4;
+        inst.src_swizzles[2] = 0xE4;
+
+        // Source constant flags (bits 27-29 of word 0)
+        inst.src_is_const[0] = (inst.words[0] >> 27) & 1;
+        inst.src_is_const[1] = (inst.words[0] >> 28) & 1;
+        inst.src_is_const[2] = (inst.words[0] >> 29) & 1;
+
+        // Write mask (bits 39-42 of word 1) - applies to vector op
         inst.write_mask = (inst.words[1] >> 7) & 0xF;
-        
+        inst.vector_write_mask = inst.write_mask;
+
+        // Scalar write mask - default W component for scalar ops
+        inst.scalar_write_mask = (inst.scalar_opcode != 0) ? 0x8 : 0;
+
+        // Saturation flags (from word 2)
+        inst.vector_saturate = (inst.words[2] >> 0) & 1;
+        inst.scalar_saturate = (inst.words[2] >> 1) & 1;
+
+        // Predication (from word 2)
+        inst.predicated = (inst.words[2] >> 2) & 1;
+        inst.predicate_condition = (inst.words[2] >> 3) & 1;
+
         // Export data flag
         inst.export_data = (inst.words[1] >> 15) & 1;
         inst.export_type = (inst.words[1] >> 11) & 0xF;
-        
+        inst.export_index = (inst.words[2] >> 4) & 0xF;
+
         alu_instructions_.push_back(inst);
         address += 3;
     }
+}
+
+void ShaderMicrocode::decode_alu_instruction(AluInstruction& inst) {
+    (void)inst;  // Decoding done inline in decode_alu_clause
+}
+
+void ShaderMicrocode::decode_fetch_instruction(FetchInstruction& inst) {
+    (void)inst;  // Decoding done inline in decode_fetch_clause
 }
 
 void ShaderMicrocode::decode_fetch_clause(u32 address, u32 count) {
@@ -264,37 +347,95 @@ void ShaderMicrocode::decode_fetch_clause(u32 address, u32 count) {
         inst.words[0] = instructions_[address];
         inst.words[1] = instructions_[address + 1];
         inst.words[2] = instructions_[address + 2];
-        
+
         // Decode opcode (bits 0-4)
         inst.opcode = inst.words[0] & 0x1F;
-        
+
         // Destination register (bits 5-11)
         inst.dest_reg = (inst.words[0] >> 5) & 0x7F;
-        
+
         // Source register (bits 12-18)
         inst.src_reg = (inst.words[0] >> 12) & 0x7F;
-        
+
         // Constant index (bits 19-24)
         inst.const_index = (inst.words[0] >> 19) & 0x3F;
-        
+
         // Fetch type (0 = vertex, 1 = texture)
         inst.fetch_type = (inst.words[0] >> 25) & 1;
-        
-        // Offset (bits 26-31 + bits 0-7 of word 1)
-        inst.offset = ((inst.words[0] >> 26) & 0x3F) | ((inst.words[1] & 0xFF) << 6);
-        
-        // Data format (bits 8-15 of word 1)
-        inst.data_format = (inst.words[1] >> 8) & 0x3F;
-        
-        // Signed
-        inst.signed_rf = (inst.words[1] >> 14) & 1;
-        
-        // Num format (bits 15-16 of word 1)
-        inst.num_format = (inst.words[1] >> 15) & 3;
-        
-        // Stride (bits 20-31 of word 1)
-        inst.stride = (inst.words[1] >> 20) & 0xFFF;
-        
+
+        if (inst.fetch_type == 1) {
+            // === Texture fetch specific fields ===
+
+            // Texture dimension (bits 26-27 of word 0)
+            inst.dimension = static_cast<TextureDimension>((inst.words[0] >> 26) & 0x3);
+
+            // Destination swizzle (bits 0-7 of word 1)
+            inst.dest_swizzle = inst.words[1] & 0xFF;
+
+            // Source swizzle (bits 8-13 of word 1)
+            inst.src_swizzle = (inst.words[1] >> 8) & 0x3F;
+
+            // LOD modes (word 2)
+            inst.use_computed_lod = (inst.words[2] >> 0) & 1;
+            inst.use_register_lod = (inst.words[2] >> 1) & 1;
+            inst.use_register_gradients = (inst.words[2] >> 2) & 1;
+
+            // LOD bias (bits 3-9 of word 2, signed 7-bit, fixed-point 1/16)
+            s32 lod_bias_raw = static_cast<s32>((inst.words[2] >> 3) & 0x7F);
+            if (lod_bias_raw & 0x40) lod_bias_raw |= ~0x7F;  // Sign extend
+            inst.lod_bias = static_cast<f32>(lod_bias_raw) / 16.0f;
+
+            // Texture coordinate offsets (bits 10-14, 15-19, 20-24 of word 2)
+            inst.offset_x = (inst.words[2] >> 10) & 0x1F;
+            inst.offset_y = (inst.words[2] >> 15) & 0x1F;
+            inst.offset_z = (inst.words[2] >> 20) & 0x1F;
+
+            // Predication (bits 25-26 of word 2)
+            inst.predicated = (inst.words[2] >> 25) & 1;
+            inst.predicate_condition = (inst.words[2] >> 26) & 1;
+
+            // Zero out vertex-specific fields
+            inst.offset = 0;
+            inst.data_format = 0;
+            inst.signed_rf = false;
+            inst.num_format = 0;
+            inst.stride = 0;
+        } else {
+            // === Vertex fetch specific fields ===
+
+            // Offset (bits 26-31 of word 0 + bits 0-7 of word 1)
+            inst.offset = ((inst.words[0] >> 26) & 0x3F) | ((inst.words[1] & 0xFF) << 6);
+
+            // Data format (bits 8-13 of word 1)
+            inst.data_format = (inst.words[1] >> 8) & 0x3F;
+
+            // Signed
+            inst.signed_rf = (inst.words[1] >> 14) & 1;
+
+            // Num format (bits 15-16 of word 1)
+            inst.num_format = (inst.words[1] >> 15) & 3;
+
+            // Stride (bits 20-31 of word 1)
+            inst.stride = (inst.words[1] >> 20) & 0xFFF;
+
+            // Destination swizzle (bits 0-7 of word 2)
+            inst.dest_swizzle = inst.words[2] & 0xFF;
+
+            // Predication (bits 25-26 of word 2)
+            inst.predicated = (inst.words[2] >> 25) & 1;
+            inst.predicate_condition = (inst.words[2] >> 26) & 1;
+
+            // Zero out texture-specific fields
+            inst.dimension = TextureDimension::k2D;
+            inst.use_computed_lod = false;
+            inst.use_register_lod = false;
+            inst.use_register_gradients = false;
+            inst.lod_bias = 0.0f;
+            inst.offset_x = 0;
+            inst.offset_y = 0;
+            inst.offset_z = 0;
+        }
+
         fetch_instructions_.push_back(inst);
         address += 3;
     }
@@ -418,7 +559,7 @@ std::vector<u32> ShaderTranslator::translate(const void* microcode, u32 size, Sh
     ShaderInfo info = analyze(microcode, size, type);
     
     // Create translation context
-    TranslationContext ctx;
+    TranslationContext ctx{};
     ctx.type = type;
     ctx.microcode = &parsed;
     ctx.info = info;
@@ -498,7 +639,14 @@ std::vector<u32> ShaderTranslator::translate(const void* microcode, u32 size, Sh
         if (ctx.vertex_id_var != 0) interface_vars.push_back(ctx.vertex_id_var);
         if (ctx.instance_id_var != 0) interface_vars.push_back(ctx.instance_id_var);
         if (ctx.point_size_var != 0) interface_vars.push_back(ctx.point_size_var);
-        
+
+        // Add vertex input attributes
+        for (u32 i = 0; i < 16; i++) {
+            if (ctx.vertex_input_vars[i] != 0) {
+                interface_vars.push_back(ctx.vertex_input_vars[i]);
+            }
+        }
+
         // Add interpolant outputs
         for (u32 i = 0; i < 16; i++) {
             if (ctx.interpolant_vars[i] != 0) {
@@ -583,38 +731,73 @@ void ShaderTranslator::setup_inputs(TranslationContext& ctx) {
         u32 uint_ptr = ctx.builder.type_pointer(spv::StorageClassInput, ctx.uint_type);
         ctx.vertex_id_var = ctx.builder.variable(uint_ptr, spv::StorageClassInput);
         ctx.builder.decorate(ctx.vertex_id_var, spv::DecorationBuiltIn, {spv::BuiltInVertexIndex});
+        ctx.builder.name(ctx.vertex_id_var, "gl_VertexIndex");
+
+        // gl_InstanceIndex
+        ctx.instance_id_var = ctx.builder.variable(uint_ptr, spv::StorageClassInput);
+        ctx.builder.decorate(ctx.instance_id_var, spv::DecorationBuiltIn, {spv::BuiltInInstanceIndex});
+        ctx.builder.name(ctx.instance_id_var, "gl_InstanceIndex");
     } else {
         // gl_FragCoord
         u32 vec4_in_ptr = ctx.builder.type_pointer(spv::StorageClassInput, ctx.vec4_type);
         ctx.frag_coord_var = ctx.builder.variable(vec4_in_ptr, spv::StorageClassInput);
         ctx.builder.decorate(ctx.frag_coord_var, spv::DecorationBuiltIn, {spv::BuiltInFragCoord});
-        
+        ctx.builder.name(ctx.frag_coord_var, "gl_FragCoord");
+
         // gl_FrontFacing
         u32 bool_in_ptr = ctx.builder.type_pointer(spv::StorageClassInput, ctx.bool_type);
         ctx.front_facing_var = ctx.builder.variable(bool_in_ptr, spv::StorageClassInput);
         ctx.builder.decorate(ctx.front_facing_var, spv::DecorationBuiltIn, {spv::BuiltInFrontFacing});
+        ctx.builder.name(ctx.front_facing_var, "gl_FrontFacing");
     }
 }
 
 void ShaderTranslator::setup_outputs(TranslationContext& ctx) {
+    u32 vec4_out_ptr = ctx.builder.type_pointer(spv::StorageClassOutput, ctx.vec4_type);
+
     if (ctx.type == ShaderType::Vertex) {
         // gl_Position
-        u32 vec4_out_ptr = ctx.builder.type_pointer(spv::StorageClassOutput, ctx.vec4_type);
         ctx.position_var = ctx.builder.variable(vec4_out_ptr, spv::StorageClassOutput);
         ctx.builder.decorate(ctx.position_var, spv::DecorationBuiltIn, {spv::BuiltInPosition});
+        ctx.builder.name(ctx.position_var, "gl_Position");
+
+        // gl_PointSize (if shader exports point size)
+        if (ctx.info.exports_point_size) {
+            u32 float_out_ptr = ctx.builder.type_pointer(spv::StorageClassOutput, ctx.float_type);
+            ctx.point_size_var = ctx.builder.variable(float_out_ptr, spv::StorageClassOutput);
+            ctx.builder.decorate(ctx.point_size_var, spv::DecorationBuiltIn, {spv::BuiltInPointSize});
+            ctx.builder.name(ctx.point_size_var, "gl_PointSize");
+        }
     } else {
-        // Fragment color output
-        u32 vec4_out_ptr = ctx.builder.type_pointer(spv::StorageClassOutput, ctx.vec4_type);
+        // Primary fragment color output (location 0)
         ctx.frag_color_var = ctx.builder.variable(vec4_out_ptr, spv::StorageClassOutput);
         ctx.builder.decorate(ctx.frag_color_var, spv::DecorationLocation, {0});
+        ctx.builder.name(ctx.frag_color_var, "fragColor0");
+        ctx.color_outputs[0] = ctx.frag_color_var;
+
+        // Additional MRT outputs (locations 1-3)
+        for (u32 i = 1; i < ctx.info.color_export_count && i < 4; i++) {
+            ctx.color_outputs[i] = ctx.builder.variable(vec4_out_ptr, spv::StorageClassOutput);
+            ctx.builder.decorate(ctx.color_outputs[i], spv::DecorationLocation, {i});
+            ctx.builder.name(ctx.color_outputs[i], "fragColor" + std::to_string(i));
+        }
+
+        // gl_FragDepth (if shader exports depth)
+        if (ctx.info.exports_depth) {
+            u32 float_out_ptr = ctx.builder.type_pointer(spv::StorageClassOutput, ctx.float_type);
+            ctx.frag_depth_var = ctx.builder.variable(float_out_ptr, spv::StorageClassOutput);
+            ctx.builder.decorate(ctx.frag_depth_var, spv::DecorationBuiltIn, {spv::BuiltInFragDepth});
+            ctx.builder.name(ctx.frag_depth_var, "gl_FragDepth");
+        }
     }
 }
 
 void ShaderTranslator::setup_uniforms(TranslationContext& ctx) {
     // Create uniform buffer for constants (256 vec4 constants)
-    u32 const_array_type = ctx.builder.type_array(ctx.vec4_type, 
+    u32 const_array_type = ctx.builder.type_array(ctx.vec4_type,
         ctx.builder.const_uint(256));
-    
+    ctx.builder.decorate_array_stride(const_array_type, 16);  // vec4 = 16 bytes
+
     u32 uniform_struct = ctx.builder.type_struct({const_array_type});
     ctx.builder.decorate(uniform_struct, spv::DecorationBlock);
     ctx.builder.member_decorate(uniform_struct, 0, spv::DecorationOffset, {0});
@@ -625,220 +808,279 @@ void ShaderTranslator::setup_uniforms(TranslationContext& ctx) {
         ctx.vertex_constants_var = ctx.builder.variable(uniform_ptr, spv::StorageClassUniform);
         ctx.builder.decorate(ctx.vertex_constants_var, spv::DecorationDescriptorSet, {0});
         ctx.builder.decorate(ctx.vertex_constants_var, spv::DecorationBinding, {0});
+        ctx.builder.name(ctx.vertex_constants_var, "vs_constants");
+        ctx.builder.name(uniform_struct, "ConstantBuffer");
+        ctx.builder.member_name(uniform_struct, 0, "c");
     } else {
         ctx.pixel_constants_var = ctx.builder.variable(uniform_ptr, spv::StorageClassUniform);
         ctx.builder.decorate(ctx.pixel_constants_var, spv::DecorationDescriptorSet, {0});
         ctx.builder.decorate(ctx.pixel_constants_var, spv::DecorationBinding, {1});
+        ctx.builder.name(ctx.pixel_constants_var, "ps_constants");
+        ctx.builder.name(uniform_struct, "ConstantBuffer");
+        ctx.builder.member_name(uniform_struct, 0, "c");
     }
+
+    // Bool constants buffer (256 bools packed as 8 uint32 words)
+    u32 uint_array_type = ctx.builder.type_array(ctx.uint_type, ctx.builder.const_uint(8));
+    ctx.builder.decorate_array_stride(uint_array_type, 4);
+
+    u32 bool_struct = ctx.builder.type_struct({uint_array_type});
+    ctx.builder.decorate(bool_struct, spv::DecorationBlock);
+    ctx.builder.member_decorate(bool_struct, 0, spv::DecorationOffset, {0});
+    ctx.builder.name(bool_struct, "BoolConstantBuffer");
+    ctx.builder.member_name(bool_struct, 0, "b");
+
+    u32 bool_ubo_ptr = ctx.builder.type_pointer(spv::StorageClassUniform, bool_struct);
+    ctx.bool_constants_var = ctx.builder.variable(bool_ubo_ptr, spv::StorageClassUniform);
+    ctx.builder.decorate(ctx.bool_constants_var, spv::DecorationDescriptorSet, {0});
+    ctx.builder.decorate(ctx.bool_constants_var, spv::DecorationBinding, {2});
+    ctx.builder.name(ctx.bool_constants_var, "bool_constants");
+
+    // Loop constants buffer (32 uvec4 values)
+    u32 uvec4_array_type = ctx.builder.type_array(ctx.uvec4_type, ctx.builder.const_uint(32));
+    ctx.builder.decorate_array_stride(uvec4_array_type, 16);
+
+    u32 loop_struct = ctx.builder.type_struct({uvec4_array_type});
+    ctx.builder.decorate(loop_struct, spv::DecorationBlock);
+    ctx.builder.member_decorate(loop_struct, 0, spv::DecorationOffset, {0});
+    ctx.builder.name(loop_struct, "LoopConstantBuffer");
+    ctx.builder.member_name(loop_struct, 0, "l");
+
+    u32 loop_ubo_ptr = ctx.builder.type_pointer(spv::StorageClassUniform, loop_struct);
+    ctx.loop_constants_var = ctx.builder.variable(loop_ubo_ptr, spv::StorageClassUniform);
+    ctx.builder.decorate(ctx.loop_constants_var, spv::DecorationDescriptorSet, {0});
+    ctx.builder.decorate(ctx.loop_constants_var, spv::DecorationBinding, {3});
+    ctx.builder.name(ctx.loop_constants_var, "loop_constants");
 }
 
 void ShaderTranslator::translate_control_flow(TranslationContext& ctx, const ShaderMicrocode& microcode) {
-    // Track which ALU/fetch instructions are inside loops/conditionals
-    // For now, translate all instructions after setting up control flow structure
-    
-    // Process each control flow instruction
+    // Walk CF instructions, translating ALU/fetch clauses inline within control flow
     for (const auto& cf : microcode.cf_instructions()) {
         switch (cf.opcode) {
             case xenos_cf::NOP:
-                // No operation
                 break;
-                
+
             case xenos_cf::EXEC:
             case xenos_cf::EXEC_END:
-                // Execute ALU or fetch clause
-                // The clause has already been decoded, translate it
+                // Unconditionally execute ALU/fetch clause
+                translate_exec_clause(ctx, cf, microcode);
                 break;
-                
+
             case xenos_cf::COND_EXEC:
-            case xenos_cf::COND_EXEC_END:
+            case xenos_cf::COND_EXEC_END: {
+                // Execute clause if bool constant matches condition
+                if (cf.clause_count == 0) break;
+
+                u32 bool_val = get_bool_constant(ctx, cf.bool_index);
+                if (!cf.condition) {
+                    bool_val = ctx.builder.logical_not(ctx.bool_type, bool_val);
+                }
+
+                u32 then_label = ctx.builder.allocate_id();
+                u32 merge_label = ctx.builder.allocate_id();
+                ctx.builder.selection_merge(merge_label, 0);
+                ctx.builder.branch_conditional(bool_val, then_label, merge_label);
+                ctx.builder.label(then_label);
+
+                translate_exec_clause(ctx, cf, microcode);
+
+                ctx.builder.branch(merge_label);
+                ctx.builder.label(merge_label);
+                break;
+            }
+
             case xenos_cf::COND_PRED_EXEC:
             case xenos_cf::COND_PRED_EXEC_END:
             case xenos_cf::COND_EXEC_PRED_CLEAN:
             case xenos_cf::COND_EXEC_PRED_CLEAN_END: {
-                // Conditional execution based on predicate
-                bool is_end = (cf.opcode == xenos_cf::COND_EXEC_END || 
-                               cf.opcode == xenos_cf::COND_PRED_EXEC_END ||
-                               cf.opcode == xenos_cf::COND_EXEC_PRED_CLEAN_END);
-                
-                if (is_end && ctx.in_predicated_block) {
-                    // End of predicated block - branch to merge and set label
-                    ctx.builder.branch(ctx.predicate_merge_label);
-                    ctx.builder.label(ctx.predicate_merge_label);
-                    ctx.in_predicated_block = false;
-                    ctx.predicate_merge_label = 0;
-                    LOGD("COND_EXEC_END: merged");
-                } else if (!is_end && !ctx.in_predicated_block) {
-                    // Start of predicated block
-                    bool pred_condition = cf.condition;  // true or false branch
-                    
-                    // Load current predicate value
-                    u32 pred_value = ctx.builder.load(ctx.bool_type, ctx.predicate_var);
-                    
-                    // If we need the inverse, negate it
-                    if (!pred_condition) {
-                        pred_value = ctx.builder.logical_not(ctx.bool_type, pred_value);
-                    }
-                    
-                    // Create labels for if-then structure
-                    u32 then_label = ctx.builder.allocate_id();
-                    u32 merge_label = ctx.builder.allocate_id();
-                    
-                    // Emit selection merge (required for structured control flow)
-                    ctx.builder.selection_merge(merge_label, 0);  // 0 = no control flags
-                    
-                    // Conditional branch
-                    ctx.builder.branch_conditional(pred_value, then_label, merge_label);
-                    ctx.builder.label(then_label);
-                    
-                    // Track that we're in a predicated block
-                    ctx.in_predicated_block = true;
-                    ctx.predicate_merge_label = merge_label;
-                    
-                    LOGD("COND_EXEC: predicate=%s", pred_condition ? "true" : "false");
+                // Execute clause if predicate matches condition
+                if (cf.clause_count == 0) break;
+
+                u32 pred_val = ctx.builder.load(ctx.bool_type, ctx.predicate_var);
+                if (!cf.condition) {
+                    pred_val = ctx.builder.logical_not(ctx.bool_type, pred_val);
+                }
+
+                u32 then_label = ctx.builder.allocate_id();
+                u32 merge_label = ctx.builder.allocate_id();
+                ctx.builder.selection_merge(merge_label, 0);
+                ctx.builder.branch_conditional(pred_val, then_label, merge_label);
+                ctx.builder.label(then_label);
+
+                translate_exec_clause(ctx, cf, microcode);
+
+                ctx.builder.branch(merge_label);
+                ctx.builder.label(merge_label);
+
+                // Clean variants reset predicate after execution
+                if (cf.opcode == xenos_cf::COND_EXEC_PRED_CLEAN ||
+                    cf.opcode == xenos_cf::COND_EXEC_PRED_CLEAN_END) {
+                    u32 false_val = ctx.builder.const_bool(false);
+                    ctx.builder.store(ctx.predicate_var, false_val);
                 }
                 break;
             }
-                
+
             case xenos_cf::LOOP_START: {
-                // Get loop constant index from CF instruction
                 u32 loop_const_idx = cf.loop_id;
-                
-                // Create SPIR-V labels for structured loop
+                if (loop_const_idx >= 32) loop_const_idx = 0;
+
                 u32 header_label = ctx.builder.allocate_id();
                 u32 merge_label = ctx.builder.allocate_id();
                 u32 continue_label = ctx.builder.allocate_id();
                 u32 body_label = ctx.builder.allocate_id();
-                
-                // Get loop constant (contains start, count, step)
-                // Loop constants are packed: bits 0-7 = count, bits 8-15 = start, bits 16-23 = step
+
+                // Get loop constant (packed: bits 0-7=count, 8-15=start, 16-23=step)
                 u32 loop_const = get_loop_constant_value(ctx, loop_const_idx);
                 u32 loop_count = (loop_const >> 0) & 0xFF;
                 u32 loop_start = (loop_const >> 8) & 0xFF;
                 u32 loop_step = (loop_const >> 16) & 0xFF;
                 if (loop_step == 0) loop_step = 1;
-                
-                // Initialize loop counter (aL / address register) to start value
+
+                // Use pre-allocated loop counter variable (separate from address register)
+                u32 counter_var = ctx.loop_counter_vars[loop_const_idx];
+
+                // Initialize counter and address register to start value
                 u32 start_const = ctx.builder.const_int(static_cast<s32>(loop_start));
+                ctx.builder.store(counter_var, start_const);
                 ctx.builder.store(ctx.address_reg_var, start_const);
-                
-                // Branch to header
+
+                // Structured loop: header -> body, with merge and continue targets
                 ctx.builder.branch(header_label);
                 ctx.builder.label(header_label);
-                
-                // Loop header - emit OpLoopMerge
-                ctx.builder.loop_merge(merge_label, continue_label, 0);  // 0 = no loop control
+                ctx.builder.loop_merge(merge_label, continue_label, 0);
                 ctx.builder.branch(body_label);
                 ctx.builder.label(body_label);
-                
-                // Push loop info onto stack
+
+                // Push loop info
                 TranslationContext::LoopInfo info;
                 info.header_label = header_label;
                 info.merge_label = merge_label;
                 info.continue_label = continue_label;
-                info.counter_var = ctx.address_reg_var;
+                info.counter_var = counter_var;
                 info.loop_const_idx = loop_const_idx;
                 ctx.loop_stack.push_back(info);
-                
+
                 LOGD("LOOP_START: const=%u, count=%u, start=%u, step=%u",
                      loop_const_idx, loop_count, loop_start, loop_step);
                 break;
             }
-                
+
             case xenos_cf::LOOP_END: {
                 if (ctx.loop_stack.empty()) {
                     LOGE("LOOP_END without matching LOOP_START");
                     break;
                 }
-                
+
                 auto loop_info = ctx.loop_stack.back();
                 ctx.loop_stack.pop_back();
-                
-                // Get loop constant for this loop
+
                 u32 loop_const = get_loop_constant_value(ctx, loop_info.loop_const_idx);
                 u32 loop_count = (loop_const >> 0) & 0xFF;
                 u32 loop_start = (loop_const >> 8) & 0xFF;
                 u32 loop_step = (loop_const >> 16) & 0xFF;
                 if (loop_step == 0) loop_step = 1;
-                
+
                 // Branch to continue block
                 ctx.builder.branch(loop_info.continue_label);
                 ctx.builder.label(loop_info.continue_label);
-                
-                // Increment loop counter: aL = aL + step
-                u32 current_al = ctx.builder.load(ctx.int_type, ctx.address_reg_var);
+
+                // Increment counter (separate from address register)
+                u32 current = ctx.builder.load(ctx.int_type, loop_info.counter_var);
                 u32 step_const = ctx.builder.const_int(static_cast<s32>(loop_step));
-                u32 new_al = ctx.builder.i_add(ctx.int_type, current_al, step_const);
-                ctx.builder.store(ctx.address_reg_var, new_al);
-                
-                // Compare: aL < (start + count * step)
+                u32 next = ctx.builder.i_add(ctx.int_type, current, step_const);
+                ctx.builder.store(loop_info.counter_var, next);
+
+                // Sync address register for ALU instructions that read aL
+                ctx.builder.store(ctx.address_reg_var, next);
+
+                // Check loop condition: counter < (start + count * step)
                 u32 end_value = loop_start + loop_count * loop_step;
                 u32 end_const = ctx.builder.const_int(static_cast<s32>(end_value));
-                u32 condition = ctx.builder.s_less_than(ctx.bool_type, new_al, end_const);
-                
-                // Conditional branch: if (aL < end) goto header, else goto merge
-                ctx.builder.branch_conditional(condition, 
+                u32 condition = ctx.builder.s_less_than(ctx.bool_type, next, end_const);
+
+                ctx.builder.branch_conditional(condition,
                                                loop_info.header_label,
                                                loop_info.merge_label);
-                
-                // Continue after merge
                 ctx.builder.label(loop_info.merge_label);
-                
-                LOGD("LOOP_END: merged at label %u", loop_info.merge_label);
+
+                LOGD("LOOP_END: merged");
                 break;
             }
-                
+
             case xenos_cf::ALLOC:
-                // Allocation - handled at pipeline setup
+                LOGD("ALLOC: type=%d count=%d", cf.alloc_type, cf.alloc_count);
+                // alloc_type: 0=position, 1=interpolator, 2=memory export
+                if (cf.alloc_type == 2 && !ctx.uses_memexport) {
+                    setup_memexport(ctx);
+                    ctx.info.uses_memexport = true;
+                }
                 break;
-                
+
             case xenos_cf::COND_CALL:
-            case xenos_cf::RETURN:
+                LOGD("COND_CALL: addr=%d (not supported in structured CF)", cf.address);
+                break;
+
+            case xenos_cf::RETURN: {
+                // Early return from shader
+                ctx.builder.return_void();
+                // Need a label for any subsequent (unreachable) code
+                u32 unreachable = ctx.builder.allocate_id();
+                ctx.builder.label(unreachable);
+                LOGD("RETURN");
+                break;
+            }
+
             case xenos_cf::COND_JMP:
-                // These require more complex control flow handling
-                LOGD("Unhandled CF opcode: %d (call/return/jmp)", cf.opcode);
+                LOGD("COND_JMP: addr=%d (approximated as noop)", cf.address);
                 break;
-                
+
             case xenos_cf::MARK_VS_FETCH_DONE:
-                // Marker instruction - no action needed
                 break;
-                
+
             default:
-                LOGD("Unhandled CF opcode: %d", cf.opcode);
+                LOGD("Unknown CF opcode: %d", cf.opcode);
                 break;
         }
     }
-    
-    // Close any unclosed predicated blocks
-    if (ctx.in_predicated_block && ctx.predicate_merge_label != 0) {
-        ctx.builder.branch(ctx.predicate_merge_label);
-        ctx.builder.label(ctx.predicate_merge_label);
-        ctx.in_predicated_block = false;
-        LOGD("Closed unclosed predicated block");
-    }
-    
-    // Translate ALU instructions
-    for (const auto& inst : microcode.alu_instructions()) {
-        translate_alu_instruction(ctx, inst);
-    }
-    
-    // Translate fetch instructions
-    for (const auto& inst : microcode.fetch_instructions()) {
-        translate_fetch_instruction(ctx, inst);
+}
+
+void ShaderTranslator::translate_exec_clause(TranslationContext& ctx,
+                                              const ShaderMicrocode::ControlFlowInstruction& cf,
+                                              const ShaderMicrocode& microcode) {
+    if (cf.clause_count == 0) return;
+
+    if (cf.is_fetch) {
+        const auto& fetches = microcode.fetch_instructions();
+        u32 end = std::min(cf.clause_start + cf.clause_count, static_cast<u32>(fetches.size()));
+        for (u32 i = cf.clause_start; i < end; i++) {
+            translate_fetch_instruction(ctx, fetches[i]);
+        }
+    } else {
+        const auto& alus = microcode.alu_instructions();
+        u32 end = std::min(cf.clause_start + cf.clause_count, static_cast<u32>(alus.size()));
+        for (u32 i = cf.clause_start; i < end; i++) {
+            translate_alu_instruction(ctx, alus[i]);
+        }
     }
 }
 
 void ShaderTranslator::translate_alu_instruction(TranslationContext& ctx, 
                                                   const ShaderMicrocode::AluInstruction& inst) {
-    // Check predication
+    // Per-instruction predication: wrap entire instruction in conditional block
+    u32 pred_merge_label = 0;
     if (inst.predicated) {
         u32 pred = ctx.builder.load(ctx.bool_type, ctx.predicate_var);
         if (!inst.predicate_condition) {
             pred = ctx.builder.logical_not(ctx.bool_type, pred);
         }
-        // For simplicity, we don't emit conditional blocks for every instruction
-        // A more complete impl would create selection blocks
+        u32 pred_then_label = ctx.builder.allocate_id();
+        pred_merge_label = ctx.builder.allocate_id();
+        ctx.builder.selection_merge(pred_merge_label, 0);
+        ctx.builder.branch_conditional(pred, pred_then_label, pred_merge_label);
+        ctx.builder.label(pred_then_label);
     }
-    
+
     // Get source values with swizzle and modifiers
     std::vector<u32> sources;
     for (int i = 0; i < 3; i++) {
@@ -914,12 +1156,31 @@ void ShaderTranslator::translate_alu_instruction(TranslationContext& ctx,
             write_dest_register(ctx, dest_reg, final_result, final_write_mask);
         }
     }
+
+    // Close per-instruction predication block
+    if (pred_merge_label != 0) {
+        ctx.builder.branch(pred_merge_label);
+        ctx.builder.label(pred_merge_label);
+    }
 }
 
 void ShaderTranslator::translate_fetch_instruction(TranslationContext& ctx,
                                                     const ShaderMicrocode::FetchInstruction& inst) {
+    // Handle predication for fetch instructions
+    u32 pred_merge_label = 0;
+    if (inst.predicated) {
+        u32 pred = ctx.builder.load(ctx.bool_type, ctx.predicate_var);
+        if (!inst.predicate_condition) {
+            pred = ctx.builder.logical_not(ctx.bool_type, pred);
+        }
+        u32 then_label = ctx.builder.allocate_id();
+        pred_merge_label = ctx.builder.allocate_id();
+        ctx.builder.selection_merge(pred_merge_label, 0);
+        ctx.builder.branch_conditional(pred, then_label, pred_merge_label);
+        ctx.builder.label(then_label);
+    }
+
     u32 result;
-    
     if (inst.fetch_type == 0) {
         // Vertex fetch
         result = translate_vertex_fetch(ctx, inst);
@@ -927,30 +1188,36 @@ void ShaderTranslator::translate_fetch_instruction(TranslationContext& ctx,
         // Texture fetch
         result = translate_texture_fetch(ctx, inst);
     }
-    
-    // Apply destination swizzle if present
-    if (inst.dest_swizzle != 0xE4) {
+
+    // Apply destination swizzle if non-identity
+    if (inst.dest_swizzle != 0xE4 && inst.dest_swizzle != 0) {
         result = apply_swizzle(ctx, result, inst.dest_swizzle);
     }
-    
+
     // Store result to destination register
     ctx.builder.store(ctx.temp_vars[inst.dest_reg & 0x7F], result);
+
+    // Close predication block
+    if (pred_merge_label != 0) {
+        ctx.builder.branch(pred_merge_label);
+        ctx.builder.label(pred_merge_label);
+    }
 }
 
 u32 ShaderTranslator::translate_scalar_op(TranslationContext& ctx, AluScalarOp op, 
                                           u32 src, u32 type) {
     switch (op) {
         case AluScalarOp::ADDs:
-            return src;  // Single operand add (identity)
+            return ctx.builder.f_add(type, src, src);  // src + src = 2*src
             
         case AluScalarOp::MULs:
             return ctx.builder.f_mul(type, src, src);
             
         case AluScalarOp::MAXs:
-            return ctx.builder.ext_inst(type, ctx.glsl_ext, spv::GLSLstd450FMax, {src, src});
+            return src;  // max(x, x) = x; commonly used as scalar MOV
             
         case AluScalarOp::MINs:
-            return ctx.builder.ext_inst(type, ctx.glsl_ext, spv::GLSLstd450FMin, {src, src});
+            return src;  // min(x, x) = x; commonly used as scalar MOV
             
         case AluScalarOp::FRACs:
             return ctx.builder.ext_inst(type, ctx.glsl_ext, spv::GLSLstd450Fract, {src});
@@ -1701,20 +1968,22 @@ u32 ShaderTranslator::get_bool_constant(TranslationContext& ctx, u32 index) {
     if (ctx.bool_constants_var == 0) {
         return ctx.builder.const_bool(false);
     }
-    
+
     u32 const_idx = ctx.builder.const_uint(index / 32);
     u32 bit_idx = index % 32;
-    
+
     u32 uint_ptr = ctx.builder.type_pointer(spv::StorageClassUniform, ctx.uint_type);
     u32 zero_idx = ctx.builder.const_uint(0);
     u32 ptr = ctx.builder.access_chain(uint_ptr, ctx.bool_constants_var, {zero_idx, const_idx});
     u32 word = ctx.builder.load(ctx.uint_type, ptr);
-    
-    // Extract bit
-    u32 shifted = ctx.builder.i_sub(ctx.uint_type, word, ctx.builder.const_uint(bit_idx));
-    u32 masked = ctx.builder.bitcast(ctx.uint_type, shifted);  // Would need proper AND
+
+    // Extract bit: (word >> bit_idx) & 1
+    u32 shift_amount = ctx.builder.const_uint(bit_idx);
+    u32 shifted = ctx.builder.shift_right_logical(ctx.uint_type, word, shift_amount);
+    u32 one = ctx.builder.const_uint(1);
+    u32 masked = ctx.builder.bitwise_and(ctx.uint_type, shifted, one);
     u32 cmp = ctx.builder.i_not_equal(ctx.bool_type, masked, ctx.builder.const_uint(0));
-    
+
     return cmp;
 }
 
@@ -1827,6 +2096,9 @@ void ShaderTranslator::handle_export(TranslationContext& ctx, u32 value, u8 expo
                 ctx.builder.store(ctx.frag_depth_var, depth);
             }
             break;
+        case ExportType::MemExport:
+            handle_memexport(ctx, value, export_index);
+            break;
     }
 }
 
@@ -1850,93 +2122,262 @@ void ShaderTranslator::write_color(TranslationContext& ctx, u32 value, u8 index)
     }
 }
 
-u32 ShaderTranslator::translate_texture_fetch(TranslationContext& ctx, 
-                                               const ShaderMicrocode::FetchInstruction& inst) {
-    u8 sampler_idx = inst.const_index & 0xF;
-    
-    // Get texture coordinate from source register
-    u32 src_val = ctx.builder.load(ctx.vec4_type, ctx.temp_vars[inst.src_reg & 0x7F]);
-    
-    // Get appropriate coordinate based on dimension
-    u32 coord;
-    u32 result_type = ctx.vec4_type;
-    
-    switch (inst.dimension) {
-        case TextureDimension::k1D: {
-            coord = ctx.builder.composite_extract(ctx.float_type, src_val, {0});
-            break;
-        }
+void ShaderTranslator::setup_memexport(TranslationContext& ctx) {
+    // Create SSBO for memexport: layout(set=2, binding=0) buffer MemExportBuffer { vec4 data[]; };
+    // Xenos memexport allows shaders to write vec4 values to arbitrary memory addresses.
+    // The eA register provides the base address/stride, eM0-eM3 are the data exports.
+    // Set 0 = UBOs, Set 1 = samplers, Set 2 = storage buffers (memexport)
+
+    // Runtime array of vec4
+    u32 rt_array_type = ctx.builder.type_runtime_array(ctx.vec4_type);
+    ctx.builder.decorate_array_stride(rt_array_type, 16);  // vec4 stride
+
+    // Struct wrapping the runtime array
+    u32 ssbo_struct = ctx.builder.type_struct({rt_array_type});
+    ctx.builder.decorate(ssbo_struct, spv::DecorationBufferBlock);
+    ctx.builder.member_decorate(ssbo_struct, 0, spv::DecorationOffset, {0});
+    ctx.builder.name(ssbo_struct, "MemExportBuffer");
+    ctx.builder.member_name(ssbo_struct, 0, "data");
+
+    // Pointer to SSBO struct (StorageBuffer storage class)
+    u32 ssbo_ptr_type = ctx.builder.type_pointer(spv::StorageClassStorageBuffer, ssbo_struct);
+
+    // The SSBO variable
+    ctx.memexport_ssbo_var = ctx.builder.variable(ssbo_ptr_type, spv::StorageClassStorageBuffer);
+    ctx.builder.decorate(ctx.memexport_ssbo_var, spv::DecorationDescriptorSet, {2});
+    ctx.builder.decorate(ctx.memexport_ssbo_var, spv::DecorationBinding, {0});
+    ctx.builder.name(ctx.memexport_ssbo_var, "memexport_buf");
+
+    // Pointer type for accessing vec4 elements within SSBO
+    ctx.memexport_vec4_ssbo_ptr = ctx.builder.type_pointer(spv::StorageClassStorageBuffer, ctx.vec4_type);
+
+    // eA (export address register) — stored as a function-local uint variable
+    // Holds base_offset (in vec4 units) computed from the alloc export instruction
+    u32 uint_func_ptr = ctx.builder.type_pointer(spv::StorageClassFunction, ctx.uint_type);
+    ctx.memexport_addr_var = ctx.builder.variable(uint_func_ptr, spv::StorageClassFunction,
+                                                   ctx.builder.const_uint(0));
+    ctx.builder.name(ctx.memexport_addr_var, "eA");
+
+    ctx.uses_memexport = true;
+}
+
+void ShaderTranslator::handle_memexport(TranslationContext& ctx, u32 value, u8 export_index) {
+    // Lazily set up the SSBO on first memexport use
+    if (!ctx.uses_memexport) {
+        setup_memexport(ctx);
+    }
+
+    if (ctx.memexport_ssbo_var == 0) return;
+
+    // export_index: 0-3 maps to eM0-eM3
+    // The write offset = eA_base + export_index
+    u32 base_addr = ctx.builder.load(ctx.uint_type, ctx.memexport_addr_var);
+    u32 offset = ctx.builder.i_add(ctx.uint_type, base_addr,
+                                    ctx.builder.const_uint(export_index));
+
+    // Access chain into SSBO: memexport_buf.data[offset]
+    u32 element_ptr = ctx.builder.access_chain(ctx.memexport_vec4_ssbo_ptr,
+                                                ctx.memexport_ssbo_var,
+                                                {ctx.builder.const_uint(0), offset});
+
+    // Store the vec4 value
+    ctx.builder.store(element_ptr, value);
+
+    LOGD("Memexport: eM%u write at offset from eA", export_index);
+}
+
+u32 ShaderTranslator::get_texture_coord(TranslationContext& ctx, u8 src_reg, u8 swizzle,
+                                         TextureDimension dim) {
+    u32 src_val = ctx.builder.load(ctx.vec4_type, ctx.temp_vars[src_reg & 0x7F]);
+
+    // Apply source swizzle if non-identity
+    if (swizzle != 0 && swizzle != 0xE4) {
+        src_val = apply_swizzle(ctx, src_val, swizzle);
+    }
+
+    switch (dim) {
+        case TextureDimension::k1D:
+            return ctx.builder.composite_extract(ctx.float_type, src_val, {0});
+
         case TextureDimension::k2D: {
             u32 x = ctx.builder.composite_extract(ctx.float_type, src_val, {0});
             u32 y = ctx.builder.composite_extract(ctx.float_type, src_val, {1});
-            coord = ctx.builder.composite_construct(ctx.vec2_type, {x, y});
-            break;
+            return ctx.builder.composite_construct(ctx.vec2_type, {x, y});
         }
+
         case TextureDimension::k3D: {
             u32 x = ctx.builder.composite_extract(ctx.float_type, src_val, {0});
             u32 y = ctx.builder.composite_extract(ctx.float_type, src_val, {1});
             u32 z = ctx.builder.composite_extract(ctx.float_type, src_val, {2});
-            coord = ctx.builder.composite_construct(ctx.vec3_type, {x, y, z});
-            break;
+            return ctx.builder.composite_construct(ctx.vec3_type, {x, y, z});
         }
+
         case TextureDimension::kCube: {
             u32 x = ctx.builder.composite_extract(ctx.float_type, src_val, {0});
             u32 y = ctx.builder.composite_extract(ctx.float_type, src_val, {1});
             u32 z = ctx.builder.composite_extract(ctx.float_type, src_val, {2});
-            coord = ctx.builder.composite_construct(ctx.vec3_type, {x, y, z});
-            break;
+            return ctx.builder.composite_construct(ctx.vec3_type, {x, y, z});
         }
+
         default: {
             u32 x = ctx.builder.composite_extract(ctx.float_type, src_val, {0});
             u32 y = ctx.builder.composite_extract(ctx.float_type, src_val, {1});
-            coord = ctx.builder.composite_construct(ctx.vec2_type, {x, y});
-            break;
+            return ctx.builder.composite_construct(ctx.vec2_type, {x, y});
         }
     }
-    
-    // Sample the texture
-    u32 result;
-    if (ctx.sampler_vars[sampler_idx] != 0 && ctx.texture_vars[sampler_idx] != 0) {
-        // Create sampled image
-        u32 sampled_img = ctx.builder.sampled_image(
-            ctx.sampled_image_types[sampler_idx],
-            ctx.texture_vars[sampler_idx],
-            ctx.sampler_vars[sampler_idx]
-        );
-        
-        // Sample with optional LOD bias
-        if (inst.use_register_lod) {
-            u32 lod = ctx.builder.composite_extract(ctx.float_type, src_val, {3});
-            result = ctx.builder.image_sample_lod(result_type, sampled_img, coord, lod);
-        } else if (inst.lod_bias != 0.0f) {
-            u32 bias = ctx.builder.const_float(inst.lod_bias);
-            result = ctx.builder.image_sample(result_type, sampled_img, coord, bias);
-        } else {
-            result = ctx.builder.image_sample(result_type, sampled_img, coord);
-        }
-    } else {
-        // No texture bound - return default color
+}
+
+u32 ShaderTranslator::translate_texture_fetch(TranslationContext& ctx,
+                                               const ShaderMicrocode::FetchInstruction& inst) {
+    u8 sampler_idx = inst.const_index & 0xF;
+
+    // Extract texture coordinate from source register based on dimension
+    u32 coord = get_texture_coord(ctx, inst.src_reg, inst.src_swizzle, inst.dimension);
+    u32 result_type = ctx.vec4_type;
+
+    // Check if the combined image sampler is bound
+    if (ctx.texture_vars[sampler_idx] == 0) {
+        // No texture bound - return default magenta for debugging
         u32 one = ctx.builder.const_float(1.0f);
         u32 half = ctx.builder.const_float(0.5f);
-        result = ctx.builder.composite_construct(ctx.vec4_type, {half, half, half, one});
+        return ctx.builder.composite_construct(ctx.vec4_type, {half, half, half, one});
     }
-    
+
+    // Load the combined image sampler directly
+    u32 sampled_img = ctx.builder.load(ctx.sampled_image_types[sampler_idx],
+                                        ctx.texture_vars[sampler_idx]);
+
+    // Determine LOD mode and sample accordingly
+    u32 result;
+    if (inst.use_register_gradients) {
+        // Gradient-based LOD: OpImageSampleGrad
+        // Gradients are stored in adjacent temp registers (src_reg+1 for ddx, src_reg+2 for ddy)
+        u32 ddx_val = ctx.builder.load(ctx.vec4_type, ctx.temp_vars[(inst.src_reg + 1) & 0x7F]);
+        u32 ddy_val = ctx.builder.load(ctx.vec4_type, ctx.temp_vars[(inst.src_reg + 2) & 0x7F]);
+
+        // Extract gradient components matching the texture dimension
+        u32 ddx_coord, ddy_coord;
+        switch (inst.dimension) {
+            case TextureDimension::k1D:
+                ddx_coord = ctx.builder.composite_extract(ctx.float_type, ddx_val, {0});
+                ddy_coord = ctx.builder.composite_extract(ctx.float_type, ddy_val, {0});
+                break;
+            case TextureDimension::k3D:
+            case TextureDimension::kCube: {
+                u32 ddx_x = ctx.builder.composite_extract(ctx.float_type, ddx_val, {0});
+                u32 ddx_y = ctx.builder.composite_extract(ctx.float_type, ddx_val, {1});
+                u32 ddx_z = ctx.builder.composite_extract(ctx.float_type, ddx_val, {2});
+                ddx_coord = ctx.builder.composite_construct(ctx.vec3_type, {ddx_x, ddx_y, ddx_z});
+                u32 ddy_x = ctx.builder.composite_extract(ctx.float_type, ddy_val, {0});
+                u32 ddy_y = ctx.builder.composite_extract(ctx.float_type, ddy_val, {1});
+                u32 ddy_z = ctx.builder.composite_extract(ctx.float_type, ddy_val, {2});
+                ddy_coord = ctx.builder.composite_construct(ctx.vec3_type, {ddy_x, ddy_y, ddy_z});
+                break;
+            }
+            default: {
+                // 2D
+                u32 ddx_x = ctx.builder.composite_extract(ctx.float_type, ddx_val, {0});
+                u32 ddx_y = ctx.builder.composite_extract(ctx.float_type, ddx_val, {1});
+                ddx_coord = ctx.builder.composite_construct(ctx.vec2_type, {ddx_x, ddx_y});
+                u32 ddy_x = ctx.builder.composite_extract(ctx.float_type, ddy_val, {0});
+                u32 ddy_y = ctx.builder.composite_extract(ctx.float_type, ddy_val, {1});
+                ddy_coord = ctx.builder.composite_construct(ctx.vec2_type, {ddy_x, ddy_y});
+                break;
+            }
+        }
+
+        result = ctx.builder.image_sample_grad(result_type, sampled_img, coord, ddx_coord, ddy_coord);
+
+    } else if (inst.use_register_lod) {
+        // Explicit LOD from source register W component: OpImageSampleExplicitLod
+        u32 src_val = ctx.builder.load(ctx.vec4_type, ctx.temp_vars[inst.src_reg & 0x7F]);
+        u32 lod = ctx.builder.composite_extract(ctx.float_type, src_val, {3});
+        result = ctx.builder.image_sample_lod(result_type, sampled_img, coord, lod);
+
+    } else if (inst.lod_bias != 0.0f) {
+        // Implicit LOD with bias: OpImageSampleImplicitLod + Bias operand
+        u32 bias = ctx.builder.const_float(inst.lod_bias);
+        result = ctx.builder.image_sample(result_type, sampled_img, coord, bias);
+
+    } else {
+        // Implicit LOD (default): OpImageSampleImplicitLod
+        result = ctx.builder.image_sample(result_type, sampled_img, coord);
+    }
+
     return result;
 }
 
 u32 ShaderTranslator::translate_vertex_fetch(TranslationContext& ctx,
                                               const ShaderMicrocode::FetchInstruction& inst) {
-    // Vertex fetch from vertex buffer
+    // Vertex fetch from vertex buffer via input attribute
     u8 slot = inst.const_index & 0xF;
-    
-    if (ctx.vertex_input_vars[slot] != 0) {
-        // Load from vertex input
-        return ctx.builder.load(ctx.vec4_type, ctx.vertex_input_vars[slot]);
-    } else {
-        // Fallback: load from constant buffer
-        u32 const_val = get_constant(ctx, inst.const_index);
-        return const_val;
+
+    if (ctx.vertex_input_vars[slot] == 0) {
+        // No vertex input bound for this slot - return zero
+        LOGD("VFETCH slot %u not bound, returning zero", slot);
+        return ctx.const_vec4_zero;
     }
+
+    // Load raw vertex attribute data (comes in as vec4 from the pipeline)
+    u32 raw = ctx.builder.load(ctx.vec4_type, ctx.vertex_input_vars[slot]);
+
+    // Xenos vertex data formats (data_format field)
+    // The pipeline's vertex input description handles most format conversion,
+    // but we may need to handle num_format normalization in the shader.
+    //
+    // num_format:
+    //   0 = integer (as-is from format conversion)
+    //   1 = normalized to [0,1] or [-1,1] (depends on signed_rf)
+    //   2 = integer-to-float (cast without normalization)
+    //
+    // Common Xenos vertex data formats:
+    //   6  = FMT_8_8_8_8       (4x 8-bit)
+    //   38 = FMT_32_32_32_FLOAT (3x 32-bit float)
+    //   57 = FMT_32_32_FLOAT   (2x 32-bit float)
+    //   58 = FMT_32_32_32_32_FLOAT (4x 32-bit float)
+    //   33 = FMT_16_16_FLOAT   (2x 16-bit float)
+    //   34 = FMT_16_16_16_16_FLOAT (4x 16-bit float)
+    //   2  = FMT_8             (1x 8-bit)
+    //   10 = FMT_8_8           (2x 8-bit)
+    //   22 = FMT_16_16         (2x 16-bit)
+    //   24 = FMT_16_16_16_16   (4x 16-bit)
+
+    // Handle num_format normalization/expansion in the shader
+    u32 result = raw;
+    switch (inst.num_format) {
+        case 1: {
+            // Normalized: already handled by Vulkan vertex input format if set up correctly.
+            // For safety, if signed, map from [-1,1]; if unsigned, already [0,1].
+            // No extra work needed - the vertex input description specifies SNORM/UNORM format.
+            break;
+        }
+        case 2: {
+            // Integer-to-float conversion: bitcast the integer input to float.
+            // This handles cases where vertex data is fetched as raw integers
+            // and interpreted as float in the shader.
+            // The Vulkan input already provides float data, so this is a noop here.
+            break;
+        }
+        default:
+            // Format 0 or other: use as-is (float from vertex input)
+            break;
+    }
+
+    // Apply offset: if the instruction specifies a byte offset within the vertex element,
+    // we need to adjust. For standard vertex attributes this is handled by the pipeline
+    // vertex input state, but for runtime-computed offsets we'd need buffer loads.
+    // The offset field is typically used with VFETCH mini-fetches within a single
+    // vertex element (e.g., fetching position and then normal from the same stream).
+    // Here we log it for debugging; the pipeline setup uses stride/offset from fetch constants.
+    if (inst.offset != 0) {
+        LOGD("VFETCH slot %u has byte offset %u (handled by pipeline vertex input)",
+             slot, inst.offset);
+    }
+
+    // Expand to vec4 if the format provides fewer components
+    // The raw load is always vec4 (unused components are 0 or 1 from the pipeline)
+
+    return result;
 }
 
 ShaderInfo ShaderTranslator::analyze(const void* microcode, u32 size, ShaderType type) {
@@ -2091,6 +2532,11 @@ void ShaderTranslator::setup_temporaries(TranslationContext& ctx) {
     u32 int_ptr_type = ctx.builder.type_pointer(spv::StorageClassFunction, ctx.int_type);
     ctx.address_reg_var = ctx.builder.variable(int_ptr_type, spv::StorageClassFunction);
     
+    // Initialize loop counter variables (one per loop constant slot)
+    for (u32 i = 0; i < 32; i++) {
+        ctx.loop_counter_vars[i] = ctx.builder.variable(int_ptr_type, spv::StorageClassFunction);
+    }
+
     // Initialize previous result storage
     ctx.prev_scalar = 0;
     ctx.prev_vector = 0;
@@ -2098,37 +2544,52 @@ void ShaderTranslator::setup_temporaries(TranslationContext& ctx) {
 
 void ShaderTranslator::setup_samplers(TranslationContext& ctx, const ShaderInfo& info) {
     if (info.texture_bindings.empty()) return;
-    
+
+    // Add ImageQuery capability if any textures are used
+    ctx.builder.capability(50);  // CapabilityImageQuery
+
+    // Set up vertex input variables for vertex shaders
+    if (ctx.type == ShaderType::Vertex && !info.vertex_fetch_slots.empty()) {
+        u32 vec4_in_ptr = ctx.builder.type_pointer(spv::StorageClassInput, ctx.vec4_type);
+        for (u32 slot : info.vertex_fetch_slots) {
+            if (slot >= 16) continue;
+            ctx.vertex_input_vars[slot] = ctx.builder.variable(vec4_in_ptr, spv::StorageClassInput);
+            ctx.builder.decorate(ctx.vertex_input_vars[slot], spv::DecorationLocation, {slot});
+            ctx.builder.name(ctx.vertex_input_vars[slot], "vtx_attr" + std::to_string(slot));
+        }
+    }
+
     for (size_t i = 0; i < info.texture_bindings.size(); i++) {
         u32 binding = info.texture_bindings[i];
-        TextureDimension dim = i < info.texture_dimensions.size() ? 
+        TextureDimension dim = i < info.texture_dimensions.size() ?
                                info.texture_dimensions[i] : TextureDimension::k2D;
-        
+
         // Create image type based on dimension
         u32 spv_dim;
         switch (dim) {
-            case TextureDimension::k1D: spv_dim = spv::Dim1D; break;
+            case TextureDimension::k1D:
+                spv_dim = spv::Dim1D;
+                ctx.builder.capability(43);  // CapabilitySampled1D
+                break;
             case TextureDimension::k3D: spv_dim = spv::Dim3D; break;
             case TextureDimension::kCube: spv_dim = spv::DimCube; break;
             default: spv_dim = spv::Dim2D; break;
         }
-        
+
+        // sampled=1 means the image will be used with a sampler
         u32 image_type = ctx.builder.type_image(ctx.float_type, spv_dim, false, false, false, 1);
         u32 sampled_image_type = ctx.builder.type_sampled_image(image_type);
         ctx.sampled_image_types[binding] = sampled_image_type;
-        
-        // Create sampler variable
-        u32 sampler_type = ctx.builder.type_sampler();
-        u32 sampler_ptr = ctx.builder.type_pointer(spv::StorageClassUniformConstant, sampler_type);
-        ctx.sampler_vars[binding] = ctx.builder.variable(sampler_ptr, spv::StorageClassUniformConstant);
-        ctx.builder.decorate(ctx.sampler_vars[binding], spv::DecorationDescriptorSet, {1});
-        ctx.builder.decorate(ctx.sampler_vars[binding], spv::DecorationBinding, {binding});
-        
-        // Create texture variable
-        u32 image_ptr = ctx.builder.type_pointer(spv::StorageClassUniformConstant, image_type);
-        ctx.texture_vars[binding] = ctx.builder.variable(image_ptr, spv::StorageClassUniformConstant);
+
+        // Combined image sampler descriptor: one binding per texture slot
+        u32 combined_ptr = ctx.builder.type_pointer(spv::StorageClassUniformConstant, sampled_image_type);
+        ctx.texture_vars[binding] = ctx.builder.variable(combined_ptr, spv::StorageClassUniformConstant);
         ctx.builder.decorate(ctx.texture_vars[binding], spv::DecorationDescriptorSet, {1});
-        ctx.builder.decorate(ctx.texture_vars[binding], spv::DecorationBinding, {binding + 16});
+        ctx.builder.decorate(ctx.texture_vars[binding], spv::DecorationBinding, {binding});
+        ctx.builder.name(ctx.texture_vars[binding], "tex" + std::to_string(binding));
+
+        // Mark sampler_vars same as texture_vars for combined image sampler usage
+        ctx.sampler_vars[binding] = ctx.texture_vars[binding];
     }
 }
 
@@ -2149,11 +2610,195 @@ void ShaderTranslator::setup_interpolants(TranslationContext& ctx, const ShaderI
         
         ctx.interpolant_vars[interp.index] = ctx.builder.variable(vec4_ptr, storage_class);
         ctx.builder.decorate(ctx.interpolant_vars[interp.index], spv::DecorationLocation, {interp.index});
+        ctx.builder.name(ctx.interpolant_vars[interp.index], "interp" + std::to_string(interp.index));
         
         if (interp.flat) {
             ctx.builder.decorate(ctx.interpolant_vars[interp.index], spv::DecorationFlat);
         }
     }
+}
+
+//=============================================================================
+// SPIR-V Reflection
+//=============================================================================
+
+SpirvReflection reflect_spirv(const std::vector<u32>& spirv) {
+    SpirvReflection result;
+
+    if (spirv.size() < 5 || spirv[0] != 0x07230203) {
+        return result;  // Invalid SPIR-V
+    }
+
+    // Per-ID decoration accumulator
+    struct DecInfo {
+        u32 location = 0xFFFFFFFF;
+        u32 binding = 0xFFFFFFFF;
+        u32 descriptor_set = 0xFFFFFFFF;
+        u32 builtin = 0xFFFFFFFF;
+    };
+    std::unordered_map<u32, DecInfo> decs;
+
+    // Collected variables
+    struct VarRec { u32 id; u32 storage_class; };
+    std::vector<VarRec> vars;
+
+    // Single-pass parse
+    u32 pos = 5;  // skip header
+    while (pos < spirv.size()) {
+        u32 w0 = spirv[pos];
+        u32 wc = w0 >> 16;
+        u32 op = w0 & 0xFFFF;
+
+        if (wc == 0 || pos + wc > spirv.size()) break;
+
+        if (op == 71 && wc >= 3) {  // OpDecorate
+            u32 target = spirv[pos + 1];
+            u32 decoration = spirv[pos + 2];
+            auto& d = decs[target];
+            if (decoration == 30 && wc >= 4) d.location = spirv[pos + 3];            // Location
+            else if (decoration == 33 && wc >= 4) d.binding = spirv[pos + 3];        // Binding
+            else if (decoration == 34 && wc >= 4) d.descriptor_set = spirv[pos + 3]; // DescriptorSet
+            else if (decoration == 11 && wc >= 4) d.builtin = spirv[pos + 3];        // BuiltIn
+        }
+        else if (op == 59 && wc >= 4) {  // OpVariable
+            vars.push_back({spirv[pos + 2], spirv[pos + 3]});
+        }
+
+        pos += wc;
+    }
+
+    // Cross-reference variables with decorations
+    for (const auto& v : vars) {
+        auto it = decs.find(v.id);
+        const DecInfo* d = (it != decs.end()) ? &it->second : nullptr;
+
+        switch (v.storage_class) {
+            case 1: {  // Input
+                SpirvInterfaceVar iv;
+                iv.variable_id = v.id;
+                iv.storage_class = 1;
+                iv.location = d ? d->location : 0xFFFFFFFF;
+                iv.builtin = d ? d->builtin : 0xFFFFFFFF;
+                result.inputs.push_back(iv);
+                break;
+            }
+            case 3: {  // Output
+                SpirvInterfaceVar iv;
+                iv.variable_id = v.id;
+                iv.storage_class = 3;
+                iv.location = d ? d->location : 0xFFFFFFFF;
+                iv.builtin = d ? d->builtin : 0xFFFFFFFF;
+                result.outputs.push_back(iv);
+                break;
+            }
+            case 0:    // UniformConstant (combined image samplers)
+            case 2: {  // Uniform (UBOs)
+                if (d && (d->binding != 0xFFFFFFFF || d->descriptor_set != 0xFFFFFFFF)) {
+                    SpirvBinding sb;
+                    sb.variable_id = v.id;
+                    sb.set = (d->descriptor_set != 0xFFFFFFFF) ? d->descriptor_set : 0;
+                    sb.binding = (d->binding != 0xFFFFFFFF) ? d->binding : 0;
+                    sb.descriptor_type = (v.storage_class == 2) ? 0 : 1;  // UBO vs combined_image_sampler
+                    result.bindings.push_back(sb);
+                }
+                break;
+            }
+        }
+    }
+
+    return result;
+}
+
+u32 validate_shader_bindings(const SpirvReflection& reflection,
+                              const ShaderInfo& info,
+                              ShaderType type) {
+    u32 warnings = 0;
+    const char* shader_name = (type == ShaderType::Vertex) ? "vertex" : "pixel";
+
+    // Validate vertex input locations (vertex shaders only)
+    if (type == ShaderType::Vertex) {
+        for (u32 slot : info.vertex_fetch_slots) {
+            if (!reflection.has_input_location(slot)) {
+                LOGW("Shader validation [%s]: vertex fetch slot %u has no SPIR-V input at location %u",
+                     shader_name, slot, slot);
+                warnings++;
+            }
+        }
+        for (const auto& input : reflection.inputs) {
+            if (input.builtin != 0xFFFFFFFF) continue;
+            bool expected = false;
+            for (u32 slot : info.vertex_fetch_slots) {
+                if (slot == input.location) { expected = true; break; }
+            }
+            if (!expected) {
+                LOGW("Shader validation [%s]: unexpected SPIR-V input location %u",
+                     shader_name, input.location);
+                warnings++;
+            }
+        }
+    }
+
+    // Validate UBO bindings (set 0)
+    u32 expected_ubo = (type == ShaderType::Vertex) ? 0 : 1;
+    if (!reflection.has_binding(0, expected_ubo)) {
+        LOGW("Shader validation [%s]: missing primary constant UBO (set=0, binding=%u)",
+             shader_name, expected_ubo);
+        warnings++;
+    }
+
+    // Validate texture bindings (set 1)
+    for (u32 binding : info.texture_bindings) {
+        if (!reflection.has_binding(1, binding)) {
+            LOGW("Shader validation [%s]: texture binding %u declared but no SPIR-V binding at set=1",
+                 shader_name, binding);
+            warnings++;
+        }
+    }
+    for (const auto& b : reflection.bindings) {
+        if (b.set != 1) continue;
+        bool expected = false;
+        for (u32 tb : info.texture_bindings) {
+            if (tb == b.binding) { expected = true; break; }
+        }
+        if (!expected) {
+            LOGW("Shader validation [%s]: unexpected SPIR-V texture binding (set=1, binding=%u)",
+                 shader_name, b.binding);
+            warnings++;
+        }
+    }
+
+    // Validate interpolants
+    for (const auto& interp : info.interpolants) {
+        if (type == ShaderType::Vertex) {
+            bool found = false;
+            for (const auto& out : reflection.outputs) {
+                if (out.builtin == 0xFFFFFFFF && out.location == interp.index) {
+                    found = true; break;
+                }
+            }
+            if (!found) {
+                LOGW("Shader validation [%s]: interpolant %u has no SPIR-V output",
+                     shader_name, interp.index);
+                warnings++;
+            }
+        } else {
+            if (!reflection.has_input_location(interp.index)) {
+                LOGW("Shader validation [%s]: interpolant %u has no SPIR-V input",
+                     shader_name, interp.index);
+                warnings++;
+            }
+        }
+    }
+
+    if (warnings == 0) {
+        LOGI("Shader validation [%s]: OK (%zu inputs, %zu outputs, %zu bindings)",
+             shader_name, reflection.inputs.size(), reflection.outputs.size(),
+             reflection.bindings.size());
+    } else {
+        LOGW("Shader validation [%s]: %u mismatches found", shader_name, warnings);
+    }
+
+    return warnings;
 }
 
 } // namespace x360mu

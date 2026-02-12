@@ -931,6 +931,18 @@ void ARM64Emitter::FMADD_vec(int vd, int vn, int vm, int va, bool is_double) {
     emit32(0x4E20CC00 | (sz << 22) | (vm << 16) | (vn << 5) | vd);
 }
 
+void ARM64Emitter::FMLA_vec(int vd, int vn, int vm, bool is_double) {
+    // FMLA Vd.4S, Vn.4S, Vm.4S - Vd += Vn * Vm
+    u32 sz = is_double ? 1 : 0;
+    emit32(0x4E20CC00 | (sz << 22) | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::FMLS_vec(int vd, int vn, int vm, bool is_double) {
+    // FMLS Vd.4S, Vn.4S, Vm.4S - Vd -= Vn * Vm
+    u32 sz = is_double ? 1 : 0;
+    emit32(0x4EA0CC00 | (sz << 22) | (vm << 16) | (vn << 5) | vd);
+}
+
 void ARM64Emitter::FCMP_vec(int vd, int vn, int vm, bool is_double) {
     // FCMEQ Vd.4S, Vn.4S, Vm.4S
     u32 sz = is_double ? 1 : 0;
@@ -1041,6 +1053,29 @@ void ARM64Emitter::CMGT_vec(int vd, int vn, int vm, int size) {
 
 void ARM64Emitter::CMGE_vec(int vd, int vn, int vm, int size) {
     emit32(0x4E203C00 | (size << 22) | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::CMHI_vec(int vd, int vn, int vm, int size) {
+    // CMHI Vd, Vn, Vm (unsigned greater than)
+    emit32(0x6E203400 | (size << 22) | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::FCMEQ_vec(int vd, int vn, int vm, bool is_double) {
+    // FCMEQ Vd.4S, Vn.4S, Vm.4S
+    u32 sz = is_double ? 1 : 0;
+    emit32(0x4E20E400 | (sz << 22) | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::FCMGE_vec(int vd, int vn, int vm, bool is_double) {
+    // FCMGE Vd.4S, Vn.4S, Vm.4S
+    u32 sz = is_double ? 1 : 0;
+    emit32(0x6E20E400 | (sz << 22) | (vm << 16) | (vn << 5) | vd);
+}
+
+void ARM64Emitter::FCMGT_vec(int vd, int vn, int vm, bool is_double) {
+    // FCMGT Vd.4S, Vn.4S, Vm.4S
+    u32 sz = is_double ? 1 : 0;
+    emit32(0x6EA0E400 | (sz << 22) | (vm << 16) | (vn << 5) | vd);
 }
 
 //=============================================================================

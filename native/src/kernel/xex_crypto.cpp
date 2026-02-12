@@ -188,23 +188,74 @@ const u8 XexDecryptor::devkit_key_[16] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
+// XEX1 key (pre-release format, used in early dev/beta builds)
+const u8 XexDecryptor::xex1_key_[16] = {
+    0xA2, 0x6C, 0x10, 0xF7, 0x1F, 0xD9, 0x35, 0xE9,
+    0x8B, 0x99, 0x92, 0x2C, 0xE9, 0x32, 0x15, 0x72
+};
+
 XexDecryptor::XexDecryptor() = default;
 XexDecryptor::~XexDecryptor() = default;
 
-void XexDecryptor::set_key(const u8* file_key) {
+void XexDecryptor::set_key(const u8* file_key, XexKeyType key_type) {
     u8 derived_key[16];
-    derive_key(file_key, derived_key);
+    derive_key(file_key, derived_key, key_type);
     aes_.set_key(derived_key);
     key_set_ = true;
-    
-    LOGI("XEX encryption key set");
+    key_type_ = key_type;
+
+    const char* key_name = "unknown";
+    switch (key_type) {
+        case XexKeyType::Retail: key_name = "retail"; break;
+        case XexKeyType::DevKit: key_name = "devkit"; break;
+        case XexKeyType::XEX1:   key_name = "xex1"; break;
+    }
+    LOGI("XEX encryption key set (type: %s)", key_name);
 }
 
-void XexDecryptor::derive_key(const u8* file_key, u8* derived_key) {
-    // Decrypt file key with retail key
-    Aes128 master_aes;
-    master_aes.set_key(retail_key_);
+bool XexDecryptor::try_keys(u8* data, u32 size, const u8* file_key,
+                             XexKeyType& out_key_type) {
+    // Try each key type and check if decryption produces valid data
+    // We test by decrypting a copy and checking for MZ/PE header
+    static const XexKeyType key_order[] = {
+        XexKeyType::Retail, XexKeyType::DevKit, XexKeyType::XEX1
+    };
 
+    for (auto kt : key_order) {
+        std::vector<u8> test_data(data, data + std::min(size, 32u));
+
+        u8 derived[16];
+        derive_key(file_key, derived, kt);
+
+        Aes128 test_aes;
+        test_aes.set_key(derived);
+        u8 iv[16] = {0};
+        test_aes.decrypt_cbc(test_data.data(), static_cast<u32>(test_data.size()), iv);
+
+        // Check for MZ header (DOS stub) as validation
+        if (test_data.size() >= 2 && test_data[0] == 'M' && test_data[1] == 'Z') {
+            out_key_type = kt;
+            set_key(file_key, kt);
+            return true;
+        }
+    }
+
+    // Default to retail if no key produced valid header
+    out_key_type = XexKeyType::Retail;
+    set_key(file_key, XexKeyType::Retail);
+    return false;
+}
+
+void XexDecryptor::derive_key(const u8* file_key, u8* derived_key, XexKeyType key_type) {
+    const u8* master_key;
+    switch (key_type) {
+        case XexKeyType::DevKit: master_key = devkit_key_; break;
+        case XexKeyType::XEX1:   master_key = xex1_key_; break;
+        default:                 master_key = retail_key_; break;
+    }
+
+    Aes128 master_aes;
+    master_aes.set_key(master_key);
     memcpy(derived_key, file_key, 16);
     master_aes.decrypt_ecb(derived_key, 16);
 }
@@ -245,10 +296,52 @@ Status XexDecryptor::decompress_image(const u8* compressed, u32 comp_size,
         case XexCompression::Normal:
             return decompress_lzx(compressed, comp_size, decompressed, decomp_size);
             
+        case XexCompression::Delta:
+            LOGE("Delta compression requires base image data");
+            return Status::Error;
+
         default:
             LOGE("Unknown compression type: %d", static_cast<int>(type));
             return Status::Error;
     }
+}
+
+Status XexDecryptor::decompress_delta(const u8* src, u32 src_size,
+                                       const u8* base_data, u32 base_size,
+                                       u8* dst, u32 dst_size) {
+    // Delta compression applies patches to a base image
+    // Format: series of (offset, size, data) tuples
+    // Start with copy of base image
+    if (base_size > dst_size) {
+        LOGE("Base image larger than destination buffer");
+        return Status::Error;
+    }
+
+    memcpy(dst, base_data, std::min(base_size, dst_size));
+
+    // Parse delta patch blocks
+    u32 src_pos = 0;
+    while (src_pos + 8 <= src_size) {
+        u32 patch_offset = (src[src_pos] << 24) | (src[src_pos+1] << 16) |
+                           (src[src_pos+2] << 8) | src[src_pos+3];
+        src_pos += 4;
+        u32 patch_size = (src[src_pos] << 24) | (src[src_pos+1] << 16) |
+                         (src[src_pos+2] << 8) | src[src_pos+3];
+        src_pos += 4;
+
+        if (patch_size == 0 && patch_offset == 0) break;  // End marker
+
+        if (src_pos + patch_size > src_size || patch_offset + patch_size > dst_size) {
+            LOGW("Delta patch out of bounds: offset=0x%X, size=0x%X", patch_offset, patch_size);
+            break;
+        }
+
+        memcpy(dst + patch_offset, src + src_pos, patch_size);
+        src_pos += patch_size;
+    }
+
+    LOGI("Applied delta patches: %u bytes of patch data", src_pos);
+    return Status::Ok;
 }
 
 Status XexDecryptor::decompress_basic(const u8* src, u32 src_size,

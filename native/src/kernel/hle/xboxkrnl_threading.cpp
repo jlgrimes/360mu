@@ -14,6 +14,7 @@
 #include "../kernel.h"
 #include "../threading.h"
 #include "../work_queue.h"
+#include "../xobject.h"
 #include "../../cpu/xenon/cpu.h"
 #include "../../cpu/xenon/threading.h"
 #include "../../memory/memory.h"
@@ -1000,6 +1001,374 @@ static void HLE_ExQueueWorkItem(Cpu* cpu, Memory* memory, u64* args, u64* result
 }
 
 //=============================================================================
+// Timer HLE Functions
+//=============================================================================
+
+/**
+ * NtCreateTimer - Create a timer object
+ *
+ * Ordinal: 193
+ */
+static void HLE_NtCreateTimer(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr handle_ptr = static_cast<GuestAddr>(args[0]);
+    u32 access_mask = static_cast<u32>(args[1]);
+    GuestAddr obj_attr = static_cast<GuestAddr>(args[2]);
+    u32 timer_type = static_cast<u32>(args[3]);
+
+    LOGD("NtCreateTimer: type=%u", timer_type);
+
+    if (!g_ktm) {
+        *result = nt::STATUS_UNSUCCESSFUL;
+        return;
+    }
+
+    u32 handle = 0;
+    u32 status = g_ktm->create_timer(&handle, access_mask, obj_attr, timer_type);
+
+    if (status == nt::STATUS_SUCCESS && handle_ptr) {
+        memory->write_u32(handle_ptr, handle);
+    }
+
+    *result = status;
+}
+
+/**
+ * NtSetTimerEx / NtSetTimer - Set a timer
+ *
+ * Ordinal: 212
+ */
+static void HLE_NtSetTimer(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    u32 handle = static_cast<u32>(args[0]);
+    GuestAddr due_time_ptr = static_cast<GuestAddr>(args[1]);
+    GuestAddr timer_apc_routine = static_cast<GuestAddr>(args[2]);
+    GuestAddr timer_context = static_cast<GuestAddr>(args[3]);
+    u32 resume = static_cast<u32>(args[4]);
+    u32 period = static_cast<u32>(args[5]);
+    GuestAddr prev_state_ptr = static_cast<GuestAddr>(args[6]);
+
+    s64 due_time = 0;
+    if (due_time_ptr) {
+        due_time = static_cast<s64>(memory->read_u64(due_time_ptr));
+    }
+
+    LOGD("NtSetTimer: handle=0x%X, due=%lld, period=%u", handle, (long long)due_time, period);
+
+    if (!g_ktm) {
+        *result = nt::STATUS_UNSUCCESSFUL;
+        return;
+    }
+
+    bool prev_state = false;
+    u32 status = g_ktm->set_timer(handle, due_time, period,
+                                   timer_apc_routine, timer_context,
+                                   resume != 0, &prev_state);
+
+    if (status == nt::STATUS_SUCCESS && prev_state_ptr) {
+        memory->write_u32(prev_state_ptr, prev_state ? 1 : 0);
+    }
+
+    *result = status;
+}
+
+/**
+ * NtCancelTimer - Cancel a timer
+ *
+ * Ordinal: 186
+ */
+static void HLE_NtCancelTimer(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    u32 handle = static_cast<u32>(args[0]);
+    GuestAddr was_set_ptr = static_cast<GuestAddr>(args[1]);
+
+    if (!g_ktm) {
+        *result = nt::STATUS_UNSUCCESSFUL;
+        return;
+    }
+
+    bool was_set = false;
+    u32 status = g_ktm->cancel_timer(handle, &was_set);
+
+    if (status == nt::STATUS_SUCCESS && was_set_ptr) {
+        memory->write_u32(was_set_ptr, was_set ? 1 : 0);
+    }
+
+    *result = status;
+}
+
+//=============================================================================
+// I/O Completion Port HLE Functions
+//=============================================================================
+
+/**
+ * NtCreateIoCompletion - Create an I/O completion port
+ *
+ * Ordinal: 196
+ */
+static void HLE_NtCreateIoCompletion(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr handle_ptr = static_cast<GuestAddr>(args[0]);
+    u32 access_mask = static_cast<u32>(args[1]);
+    GuestAddr obj_attr = static_cast<GuestAddr>(args[2]);
+    u32 max_threads = static_cast<u32>(args[3]);
+
+    LOGD("NtCreateIoCompletion: max_threads=%u", max_threads);
+
+    if (!g_ktm) {
+        *result = nt::STATUS_UNSUCCESSFUL;
+        return;
+    }
+
+    u32 handle = 0;
+    u32 status = g_ktm->create_io_completion(&handle, access_mask, obj_attr, max_threads);
+
+    if (status == nt::STATUS_SUCCESS && handle_ptr) {
+        memory->write_u32(handle_ptr, handle);
+    }
+
+    *result = status;
+}
+
+/**
+ * NtSetIoCompletion - Post a packet to I/O completion port
+ *
+ * Ordinal: 211
+ */
+static void HLE_NtSetIoCompletion(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    u32 handle = static_cast<u32>(args[0]);
+    GuestAddr key_context = static_cast<GuestAddr>(args[1]);
+    GuestAddr apc_context = static_cast<GuestAddr>(args[2]);
+    u32 status_code = static_cast<u32>(args[3]);
+    u32 bytes = static_cast<u32>(args[4]);
+
+    if (!g_ktm) {
+        *result = nt::STATUS_UNSUCCESSFUL;
+        return;
+    }
+
+    *result = g_ktm->set_io_completion(handle, key_context, apc_context, status_code, bytes);
+}
+
+/**
+ * NtRemoveIoCompletion - Dequeue a packet from I/O completion port
+ *
+ * Ordinal: 197
+ */
+static void HLE_NtRemoveIoCompletion(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    u32 handle = static_cast<u32>(args[0]);
+    GuestAddr key_ptr = static_cast<GuestAddr>(args[1]);
+    GuestAddr apc_ptr = static_cast<GuestAddr>(args[2]);
+    GuestAddr status_ptr = static_cast<GuestAddr>(args[3]);
+    GuestAddr bytes_ptr = static_cast<GuestAddr>(args[4]);
+    GuestAddr timeout_ptr = static_cast<GuestAddr>(args[5]);
+
+    if (!g_ktm) {
+        *result = nt::STATUS_UNSUCCESSFUL;
+        return;
+    }
+
+    s64 timeout = 0;
+    s64* timeout_p = nullptr;
+    if (timeout_ptr) {
+        timeout = static_cast<s64>(memory->read_u64(timeout_ptr));
+        timeout_p = &timeout;
+    }
+
+    IoCompletionPacket packet = {};
+    u32 status = g_ktm->remove_io_completion(handle, &packet, timeout_p);
+
+    if (status == nt::STATUS_SUCCESS) {
+        if (key_ptr) memory->write_u32(key_ptr, packet.key_context);
+        if (apc_ptr) memory->write_u32(apc_ptr, packet.apc_context);
+        if (status_ptr) memory->write_u32(status_ptr, packet.status);
+        if (bytes_ptr) memory->write_u32(bytes_ptr, packet.bytes_transferred);
+    }
+
+    *result = status;
+}
+
+//=============================================================================
+// DPC (Deferred Procedure Call) HLE Functions
+//=============================================================================
+
+/**
+ * KeInitializeDpc - Initialize a DPC object
+ *
+ * Ordinal: 107
+ */
+static void HLE_KeInitializeDpc(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr dpc_ptr = static_cast<GuestAddr>(args[0]);
+    GuestAddr routine = static_cast<GuestAddr>(args[1]);
+    GuestAddr context = static_cast<GuestAddr>(args[2]);
+
+    LOGD("KeInitializeDpc: dpc=0x%08X, routine=0x%08X, context=0x%08X",
+         dpc_ptr, routine, context);
+
+    // KDPC structure layout (Xbox 360):
+    // +0x00: Type (SHORT) = 19 (DpcObject)
+    // +0x02: Importance (UCHAR)
+    // +0x03: Number (UCHAR) - target processor
+    // +0x04: DpcListEntry (LIST_ENTRY)
+    // +0x0C: DeferredRoutine
+    // +0x10: DeferredContext
+    // +0x14: SystemArgument1
+    // +0x18: SystemArgument2
+    // +0x1C: DpcData (PVOID)
+
+    memory->write_u16(dpc_ptr + 0x00, 19);        // Type = DpcObject
+    memory->write_u8(dpc_ptr + 0x02, 1);           // Importance = Medium
+    memory->write_u8(dpc_ptr + 0x03, 0);           // Number = 0 (any processor)
+    memory->write_u32(dpc_ptr + 0x04, 0);          // DpcListEntry.Flink
+    memory->write_u32(dpc_ptr + 0x08, 0);          // DpcListEntry.Blink
+    memory->write_u32(dpc_ptr + 0x0C, routine);    // DeferredRoutine
+    memory->write_u32(dpc_ptr + 0x10, context);    // DeferredContext
+    memory->write_u32(dpc_ptr + 0x14, 0);          // SystemArgument1
+    memory->write_u32(dpc_ptr + 0x18, 0);          // SystemArgument2
+    memory->write_u32(dpc_ptr + 0x1C, 0);          // DpcData
+
+    // void function
+}
+
+/**
+ * KeInsertQueueDpc - Queue a DPC for execution
+ *
+ * Ordinal: 109
+ */
+static void HLE_KeInsertQueueDpc(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr dpc_ptr = static_cast<GuestAddr>(args[0]);
+    GuestAddr system_arg1 = static_cast<GuestAddr>(args[1]);
+    GuestAddr system_arg2 = static_cast<GuestAddr>(args[2]);
+
+    // Store system arguments
+    memory->write_u32(dpc_ptr + 0x14, system_arg1);
+    memory->write_u32(dpc_ptr + 0x18, system_arg2);
+
+    // Read routine and context
+    GuestAddr routine = memory->read_u32(dpc_ptr + 0x0C);
+    GuestAddr context = memory->read_u32(dpc_ptr + 0x10);
+
+    LOGI("KeInsertQueueDpc: dpc=0x%08X, routine=0x%08X, ctx=0x%08X, arg1=0x%08X, arg2=0x%08X",
+         dpc_ptr, routine, context, system_arg1, system_arg2);
+
+    if (routine != 0) {
+        KernelState::instance().queue_dpc(dpc_ptr, routine, context, system_arg1, system_arg2);
+        *result = 1;  // TRUE - inserted
+    } else {
+        *result = 0;  // FALSE
+    }
+}
+
+/**
+ * KeRemoveQueueDpc - Remove a DPC from the queue
+ *
+ * Ordinal: 134
+ */
+static void HLE_KeRemoveQueueDpc(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    // We don't track individual DPCs for removal in our simplified model
+    // Just return FALSE (not removed) - this is rarely called
+    *result = 0;
+}
+
+/**
+ * KeSetImportanceDpc - Set the importance level of a DPC
+ *
+ * Ordinal: 153
+ */
+static void HLE_KeSetImportanceDpc(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr dpc_ptr = static_cast<GuestAddr>(args[0]);
+    u32 importance = static_cast<u32>(args[1]);
+
+    memory->write_u8(dpc_ptr + 0x02, static_cast<u8>(importance));
+    // void function
+}
+
+/**
+ * KeSetTargetProcessorDpc - Set the target processor for a DPC
+ *
+ * Ordinal: 154
+ */
+static void HLE_KeSetTargetProcessorDpc(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr dpc_ptr = static_cast<GuestAddr>(args[0]);
+    u32 processor = static_cast<u32>(args[1]);
+
+    memory->write_u8(dpc_ptr + 0x03, static_cast<u8>(processor));
+    // void function
+}
+
+//=============================================================================
+// Timer Ke-level HLE Functions
+//=============================================================================
+
+/**
+ * KeInitializeTimerEx - Initialize a timer object in guest memory
+ *
+ * Ordinal: 111
+ */
+static void HLE_KeInitializeTimerEx(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr timer_ptr = static_cast<GuestAddr>(args[0]);
+    u32 timer_type = static_cast<u32>(args[1]);
+
+    LOGD("KeInitializeTimerEx: timer=0x%08X, type=%u", timer_ptr, timer_type);
+
+    // KTIMER structure (DispatcherHeader + timer fields)
+    u8 type_val = (timer_type == 0) ? 0x08 : 0x09;  // Notification vs Synchronization
+    memory->write_u8(timer_ptr + 0x00, type_val);
+    memory->write_u8(timer_ptr + 0x01, 0);
+    memory->write_u16(timer_ptr + 0x02, 0x0A);  // Size in dwords
+    memory->write_u32(timer_ptr + 0x04, 0);      // SignalState = not signaled
+    // void function
+}
+
+/**
+ * KeSetTimerEx - Set a timer in guest memory
+ *
+ * Ordinal: 150
+ */
+static void HLE_KeSetTimerEx(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr timer_ptr = static_cast<GuestAddr>(args[0]);
+    s64 due_time = static_cast<s64>(args[1]);
+    u32 period = static_cast<u32>(args[2]);
+    GuestAddr dpc_ptr = static_cast<GuestAddr>(args[3]);
+
+    LOGD("KeSetTimerEx: timer=0x%08X, due=%lld, period=%u, dpc=0x%08X",
+         timer_ptr, (long long)due_time, period, dpc_ptr);
+
+    // Read previous signal state
+    s32 prev_state = static_cast<s32>(memory->read_u32(timer_ptr + 0x04));
+
+    // Reset signal state
+    memory->write_u32(timer_ptr + 0x04, 0);
+
+    // Queue the timer through KernelState
+    u64 abs_due_time;
+    if (due_time < 0) {
+        // Relative time
+        abs_due_time = KernelState::instance().system_time() + static_cast<u64>(-due_time);
+    } else {
+        abs_due_time = static_cast<u64>(due_time);
+    }
+
+    u64 period_100ns = static_cast<u64>(period) * 10000ULL;
+
+    KernelState::instance().queue_timer(timer_ptr, abs_due_time, period_100ns, dpc_ptr);
+
+    *result = (prev_state != 0) ? 1 : 0;  // TRUE if timer was already set
+}
+
+/**
+ * KeCancelTimer - Cancel a timer
+ *
+ * Ordinal: 36
+ */
+static void HLE_KeCancelTimer(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr timer_ptr = static_cast<GuestAddr>(args[0]);
+
+    bool was_set = KernelState::instance().cancel_timer(timer_ptr);
+
+    // Clear signal state
+    memory->write_u32(timer_ptr + 0x04, 0);
+
+    *result = was_set ? 1 : 0;
+}
+
+//=============================================================================
 // Registration
 //=============================================================================
 
@@ -1069,8 +1438,30 @@ void register_xboxkrnl_threading(Kernel* kernel) {
     
     // Handle management
     funcs[make_key(0, 192)] = HLE_NtDuplicateObject;
-    
-    LOGI("Registered xboxkrnl.exe threading HLE functions");
+
+    // Timers (Nt-level)
+    funcs[make_key(0, 193)] = HLE_NtCreateTimer;
+    funcs[make_key(0, 212)] = HLE_NtSetTimer;
+    funcs[make_key(0, 186)] = HLE_NtCancelTimer;
+
+    // Timers (Ke-level)
+    funcs[make_key(0, 111)] = HLE_KeInitializeTimerEx;
+    funcs[make_key(0, 150)] = HLE_KeSetTimerEx;
+    funcs[make_key(0, 36)] = HLE_KeCancelTimer;
+
+    // I/O Completion Ports
+    funcs[make_key(0, 196)] = HLE_NtCreateIoCompletion;
+    funcs[make_key(0, 211)] = HLE_NtSetIoCompletion;
+    funcs[make_key(0, 197)] = HLE_NtRemoveIoCompletion;
+
+    // DPC functions
+    funcs[make_key(0, 107)] = HLE_KeInitializeDpc;
+    funcs[make_key(0, 109)] = HLE_KeInsertQueueDpc;
+    funcs[make_key(0, 134)] = HLE_KeRemoveQueueDpc;
+    funcs[make_key(0, 153)] = HLE_KeSetImportanceDpc;
+    funcs[make_key(0, 154)] = HLE_KeSetTargetProcessorDpc;
+
+    LOGI("Registered xboxkrnl.exe threading HLE functions (%zu total)", funcs.size());
 }
 
 } // namespace x360mu

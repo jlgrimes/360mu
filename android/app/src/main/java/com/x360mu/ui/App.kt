@@ -17,6 +17,7 @@ import androidx.navigation.navArgument
 import com.x360mu.core.NativeEmulator
 import com.x360mu.ui.screens.GameScreen
 import com.x360mu.ui.screens.LibraryScreen
+import com.x360mu.ui.screens.LogScreen
 import com.x360mu.ui.screens.SettingsScreen
 import com.x360mu.ui.screens.TestRenderScreen
 import java.io.File
@@ -29,23 +30,19 @@ sealed class Screen(val route: String) {
     object Library : Screen("library")
     object Settings : Screen("settings")
     object TestRender : Screen("test_render")
+    object Logs : Screen("logs")
     object Game : Screen("game/{gamePath}") {
         fun createRoute(gamePath: String) = "game/${URLEncoder.encode(gamePath, "UTF-8")}"
     }
 }
 
 @Composable
-fun App() {
+fun App(onEmulatorCreated: (NativeEmulator) -> Unit = {}) {
     Log.i(TAG, "App() composable starting")
-    
+
     val navController = rememberNavController()
     val context = LocalContext.current
-    
-    LaunchedEffect(Unit) {
-        Log.i(TAG, "App LaunchedEffect - composition complete")
-    }
-    
-    // Create emulator instance
+
     val emulator = remember {
         Log.i(TAG, "Creating NativeEmulator instance...")
         try {
@@ -53,12 +50,7 @@ fun App() {
                 val dataDir = context.filesDir.absolutePath
                 val cacheDir = context.cacheDir.absolutePath
                 val saveDir = File(context.filesDir, "saves").apply { mkdirs() }.absolutePath
-                
-                Log.i(TAG, "Emulator paths:")
-                Log.i(TAG, "  dataDir: $dataDir")
-                Log.i(TAG, "  cacheDir: $cacheDir")
-                Log.i(TAG, "  saveDir: $saveDir")
-                
+
                 val result = initialize(
                     dataPath = dataDir,
                     cachePath = cacheDir,
@@ -66,38 +58,41 @@ fun App() {
                     enableJit = true,
                     enableVulkan = true
                 )
-                
-                Log.i(TAG, "Emulator initialize() returned: $result")
-                Log.i(TAG, "Emulator state: $state")
+                Log.i(TAG, "Emulator initialize() returned: $result, state: $state")
+
+                // Install crash handler
+                val crashDir = File(context.filesDir, "crashes").apply { mkdirs() }.absolutePath
+                installCrashHandler(crashDir)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create/initialize emulator: ${e.message}", e)
             throw e
-        }.also {
-            Log.i(TAG, "NativeEmulator instance created successfully")
         }
     }
-    
+
+    val crashDir = remember {
+        File(context.filesDir, "crashes").apply { mkdirs() }.absolutePath
+    }
+
+    // Expose emulator reference for lifecycle handling
+    LaunchedEffect(emulator) {
+        onEmulatorCreated(emulator)
+    }
+
     DisposableEffect(Unit) {
-        Log.i(TAG, "DisposableEffect setup")
         onDispose {
             Log.i(TAG, "DisposableEffect onDispose - closing emulator")
             emulator.close()
         }
     }
-    
-    Log.i(TAG, "Setting up Scaffold...")
-    
+
     Scaffold { innerPadding ->
-        Log.i(TAG, "Scaffold content - innerPadding: $innerPadding")
-        
         NavHost(
             navController = navController,
             startDestination = Screen.Library.route,
             modifier = Modifier.padding(innerPadding)
         ) {
             composable(Screen.Library.route) {
-                Log.i(TAG, "Navigated to Library screen")
                 LibraryScreen(
                     emulator = emulator,
                     onGameSelected = { path ->
@@ -105,53 +100,49 @@ fun App() {
                         navController.navigate(Screen.Game.createRoute(path))
                     },
                     onSettingsClick = {
-                        Log.i(TAG, "Settings clicked")
                         navController.navigate(Screen.Settings.route)
                     },
                     onTestRenderClick = {
-                        Log.i(TAG, "Test Render clicked")
                         navController.navigate(Screen.TestRender.route)
-                    }
-                )
-            }
-            
-            composable(Screen.Settings.route) {
-                Log.i(TAG, "Navigated to Settings screen")
-                SettingsScreen(
-                    onBackClick = {
-                        Log.i(TAG, "Settings back clicked")
-                        navController.popBackStack()
+                    },
+                    onLogsClick = {
+                        navController.navigate(Screen.Logs.route)
                     }
                 )
             }
 
+            composable(Screen.Settings.route) {
+                SettingsScreen(
+                    onBackClick = { navController.popBackStack() }
+                )
+            }
+
+            composable(Screen.Logs.route) {
+                LogScreen(
+                    emulator = emulator,
+                    onBackClick = { navController.popBackStack() },
+                    crashDir = crashDir
+                )
+            }
+
             composable(Screen.TestRender.route) {
-                Log.i(TAG, "Navigated to TestRender screen")
                 TestRenderScreen(
                     emulator = emulator,
-                    onBack = {
-                        Log.i(TAG, "TestRender back clicked")
-                        navController.popBackStack()
-                    }
+                    onBack = { navController.popBackStack() }
                 )
             }
 
             composable(
                 route = Screen.Game.route,
-                arguments = listOf(
-                    navArgument("gamePath") { type = NavType.StringType }
-                )
+                arguments = listOf(navArgument("gamePath") { type = NavType.StringType })
             ) { backStackEntry ->
                 val encodedPath = backStackEntry.arguments?.getString("gamePath") ?: ""
                 val gamePath = URLDecoder.decode(encodedPath, "UTF-8")
-                
-                Log.i(TAG, "Navigated to Game screen, path: $gamePath")
-                
+
                 GameScreen(
                     emulator = emulator,
                     gamePath = gamePath,
                     onBack = {
-                        Log.i(TAG, "Game back clicked")
                         emulator.stop()
                         navController.popBackStack()
                     }
@@ -159,7 +150,4 @@ fun App() {
             }
         }
     }
-    
-    Log.i(TAG, "App() composable completed")
 }
-

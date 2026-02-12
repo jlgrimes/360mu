@@ -196,7 +196,13 @@ public:
      * 2-channel normal map compression
      */
     static void decompress_ctx1_block(const u8* src, u8* dst);
-    
+
+    /**
+     * Decompress DXN/BC5 block (two-channel normal map)
+     * 4x4 pixels, 16 bytes -> 32 bytes RG
+     */
+    static void decompress_dxn_block(const u8* src, u8* dst);
+
     /**
      * Decompress an entire texture
      */

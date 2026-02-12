@@ -17,6 +17,7 @@
 #include "../kernel.h"
 #include "../../cpu/xenon/cpu.h"
 #include "../../memory/memory.h"
+#include "../../input/input_manager.h"
 #include <cstring>
 #include <ctime>
 #include <chrono>
@@ -639,8 +640,9 @@ static void HLE_XamInputGetCapabilities(Cpu* cpu, Memory* memory, u64* args, u64
     u32 user_index = static_cast<u32>(args[0]);
     u32 flags = static_cast<u32>(args[1]);
     GuestAddr caps_ptr = static_cast<GuestAddr>(args[2]);
-    
-    if (user_index >= XUSER_MAX_COUNT) {
+
+    if (user_index >= XUSER_MAX_COUNT ||
+        !get_input_manager().is_controller_connected(user_index)) {
         *result = ERROR_FUNCTION_FAILED;
         return;
     }
@@ -670,18 +672,26 @@ static void HLE_XamInputGetState(Cpu* cpu, Memory* memory, u64* args, u64* resul
     u32 user_index = static_cast<u32>(args[0]);
     u32 flags = static_cast<u32>(args[1]);
     GuestAddr state_ptr = static_cast<GuestAddr>(args[2]);
-    
+
     if (user_index >= XUSER_MAX_COUNT) {
         *result = ERROR_FUNCTION_FAILED;
         return;
     }
-    
+
+    // Check if controller is connected via InputManager
+    auto& input_mgr = get_input_manager();
+    if (!input_mgr.is_controller_connected(user_index)) {
+        *result = ERROR_FUNCTION_FAILED; // ERROR_DEVICE_NOT_CONNECTED
+        return;
+    }
+
+    // Read from XAM state (synced by InputManager)
     std::lock_guard<std::mutex> lock(g_xam.input_mutex);
     const auto& input = g_xam.input_states[user_index];
-    
+
     // XINPUT_STATE structure
     memory->write_u32(state_ptr + 0, input.packet_number);
-    
+
     // XINPUT_GAMEPAD
     memory->write_u16(state_ptr + 4, input.buttons);
     memory->write_u8(state_ptr + 6, input.left_trigger);
@@ -690,7 +700,7 @@ static void HLE_XamInputGetState(Cpu* cpu, Memory* memory, u64* args, u64* resul
     memory->write_u16(state_ptr + 10, static_cast<u16>(input.left_stick_y));
     memory->write_u16(state_ptr + 12, static_cast<u16>(input.right_stick_x));
     memory->write_u16(state_ptr + 14, static_cast<u16>(input.right_stick_y));
-    
+
     *result = ERROR_SUCCESS;
 }
 
@@ -698,10 +708,19 @@ static void HLE_XamInputSetState(Cpu* cpu, Memory* memory, u64* args, u64* resul
     u32 user_index = static_cast<u32>(args[0]);
     u32 flags = static_cast<u32>(args[1]);
     GuestAddr vibration_ptr = static_cast<GuestAddr>(args[2]);
-    
-    // Would forward vibration to Android haptics
+
+    if (user_index >= XUSER_MAX_COUNT) {
+        *result = ERROR_FUNCTION_FAILED;
+        return;
+    }
+
     // XINPUT_VIBRATION: u16 wLeftMotorSpeed, u16 wRightMotorSpeed
-    
+    if (vibration_ptr) {
+        u16 left_motor = memory->read_u16(vibration_ptr + 0);
+        u16 right_motor = memory->read_u16(vibration_ptr + 2);
+        get_input_manager().set_vibration(user_index, left_motor, right_motor);
+    }
+
     *result = ERROR_SUCCESS;
 }
 
@@ -1050,6 +1069,181 @@ static void HLE_XamUserWriteStats(Cpu* cpu, Memory* memory, u64* args, u64* resu
 }
 
 //=============================================================================
+// NetDll_* Winsock Stubs (for games using direct socket API)
+//=============================================================================
+
+static void HLE_NetDll_WSAStartup(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr wsadata_ptr = static_cast<GuestAddr>(args[2]);
+    if (wsadata_ptr) {
+        memory->write_u16(wsadata_ptr + 0, 0x0202);
+        memory->write_u16(wsadata_ptr + 2, 0x0202);
+        memory->zero_bytes(wsadata_ptr + 4, 400);
+    }
+    LOGD("NetDll_WSAStartup: stubbed");
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_NetDll_WSACleanup(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_NetDll_WSAGetLastError(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = 10038;  // WSAENOTSOCK
+}
+
+static void HLE_NetDll_socket(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = static_cast<u64>(-1);  // INVALID_SOCKET
+}
+
+static void HLE_NetDll_closesocket(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_NetDll_connect(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = static_cast<u64>(-1);
+}
+
+static void HLE_NetDll_send(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = static_cast<u64>(-1);
+}
+
+static void HLE_NetDll_recv(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = static_cast<u64>(-1);
+}
+
+static void HLE_NetDll_sendto(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = static_cast<u64>(-1);
+}
+
+static void HLE_NetDll_recvfrom(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = static_cast<u64>(-1);
+}
+
+static void HLE_NetDll_bind(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = static_cast<u64>(-1);
+}
+
+static void HLE_NetDll_listen(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = static_cast<u64>(-1);
+}
+
+static void HLE_NetDll_accept(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = static_cast<u64>(-1);
+}
+
+static void HLE_NetDll_select(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = 0;
+}
+
+static void HLE_NetDll_setsockopt(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_NetDll_ioctlsocket(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_NetDll_htons(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = static_cast<u16>(args[1]);
+}
+
+static void HLE_NetDll_ntohs(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = static_cast<u16>(args[1]);
+}
+
+static void HLE_NetDll_htonl(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = static_cast<u32>(args[1]);
+}
+
+static void HLE_NetDll_ntohl(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = static_cast<u32>(args[1]);
+}
+
+static void HLE_NetDll_inet_addr(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = 0;
+}
+
+//=============================================================================
+// Additional XAM Functions
+//=============================================================================
+
+static void HLE_XamShowDeviceSelectorUI(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr device_id_ptr = static_cast<GuestAddr>(args[4]);
+    GuestAddr overlapped = static_cast<GuestAddr>(args[5]);
+
+    if (device_id_ptr) {
+        memory->write_u32(device_id_ptr, 1);
+    }
+    if (overlapped) {
+        memory->write_u32(overlapped + 0, ERROR_SUCCESS);
+        memory->write_u32(overlapped + 4, 0);
+        memory->write_u32(overlapped + 8, 0);
+    }
+
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_XamContentFlush(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_XamUserGetMembershipTier(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = 1;  // Silver tier (offline)
+}
+
+static void HLE_XamPartyGetUserList(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr count_ptr = static_cast<GuestAddr>(args[0]);
+    if (count_ptr) memory->write_u32(count_ptr, 0);
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_XamUserCreateStatsEnumerator(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr buffer_size_ptr = static_cast<GuestAddr>(args[5]);
+    GuestAddr handle_ptr = static_cast<GuestAddr>(args[6]);
+
+    if (buffer_size_ptr) memory->write_u32(buffer_size_ptr, 0);
+
+    u32 handle = g_xam.next_enum_handle++;
+    if (handle_ptr) memory->write_u32(handle_ptr, handle);
+
+    g_xam.enumerators[handle] = { .handle = handle, .type = 3, .current_index = 0, .items = {} };
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_XamContentGetThumbnail(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    *result = ERROR_NOT_FOUND;
+}
+
+static void HLE_XamUserGetOnlineXUID(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    u32 user_index = static_cast<u32>(args[0]);
+    GuestAddr xuid_ptr = static_cast<GuestAddr>(args[1]);
+
+    if (user_index >= XUSER_MAX_COUNT || !g_xam.users[user_index].signed_in) {
+        *result = ERROR_NOT_LOGGED_ON;
+        return;
+    }
+
+    if (xuid_ptr) memory->write_u64(xuid_ptr, g_xam.users[user_index].xuid);
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_XamGetOverlappedResult(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr overlapped = static_cast<GuestAddr>(args[0]);
+    GuestAddr result_ptr = static_cast<GuestAddr>(args[1]);
+
+    if (overlapped) {
+        u32 status = memory->read_u32(overlapped);
+        if (result_ptr) memory->write_u32(result_ptr, status);
+    }
+    *result = ERROR_SUCCESS;
+}
+
+static void HLE_XamGetOverlappedExtendedError(Cpu* cpu, Memory* memory, u64* args, u64* result) {
+    GuestAddr overlapped = static_cast<GuestAddr>(args[0]);
+    *result = overlapped ? memory->read_u32(overlapped + 4) : ERROR_SUCCESS;
+}
+
+//=============================================================================
 // Registration
 //=============================================================================
 
@@ -1143,7 +1337,59 @@ void Kernel::register_xam() {
     // Stats
     hle_functions_[make_import_key(1, 130)] = HLE_XamUserReadStats;
     hle_functions_[make_import_key(1, 131)] = HLE_XamUserWriteStats;
-    
+    hle_functions_[make_import_key(1, 132)] = HLE_XamUserCreateStatsEnumerator;
+
+    // NetDll_* Winsock stubs (ordinals 1-25 in module 2 = wsock32/NetDll)
+    hle_functions_[make_import_key(2, 1)] = HLE_NetDll_WSAStartup;
+    hle_functions_[make_import_key(2, 2)] = HLE_NetDll_WSACleanup;
+    hle_functions_[make_import_key(2, 3)] = HLE_NetDll_socket;
+    hle_functions_[make_import_key(2, 4)] = HLE_NetDll_closesocket;
+    hle_functions_[make_import_key(2, 5)] = HLE_NetDll_send;
+    hle_functions_[make_import_key(2, 6)] = HLE_NetDll_sendto;
+    hle_functions_[make_import_key(2, 7)] = HLE_NetDll_recv;
+    hle_functions_[make_import_key(2, 8)] = HLE_NetDll_recvfrom;
+    hle_functions_[make_import_key(2, 9)] = HLE_NetDll_connect;
+    hle_functions_[make_import_key(2, 10)] = HLE_NetDll_bind;
+    hle_functions_[make_import_key(2, 11)] = HLE_NetDll_listen;
+    hle_functions_[make_import_key(2, 12)] = HLE_NetDll_accept;
+    hle_functions_[make_import_key(2, 13)] = HLE_NetDll_select;
+    hle_functions_[make_import_key(2, 14)] = HLE_NetDll_setsockopt;
+    hle_functions_[make_import_key(2, 15)] = HLE_NetDll_ioctlsocket;
+    hle_functions_[make_import_key(2, 16)] = HLE_NetDll_htons;
+    hle_functions_[make_import_key(2, 17)] = HLE_NetDll_ntohs;
+    hle_functions_[make_import_key(2, 18)] = HLE_NetDll_htonl;
+    hle_functions_[make_import_key(2, 19)] = HLE_NetDll_ntohl;
+    hle_functions_[make_import_key(2, 20)] = HLE_NetDll_inet_addr;
+    hle_functions_[make_import_key(2, 24)] = HLE_NetDll_WSAGetLastError;
+
+    // Also register NetDll_* under XAM ordinals (some games import them via xam.xex)
+    hle_functions_[make_import_key(1, 651)] = HLE_NetDll_WSAStartup;
+    hle_functions_[make_import_key(1, 652)] = HLE_NetDll_WSACleanup;
+    hle_functions_[make_import_key(1, 653)] = HLE_NetDll_socket;
+    hle_functions_[make_import_key(1, 654)] = HLE_NetDll_closesocket;
+    hle_functions_[make_import_key(1, 655)] = HLE_NetDll_send;
+    hle_functions_[make_import_key(1, 656)] = HLE_NetDll_sendto;
+    hle_functions_[make_import_key(1, 657)] = HLE_NetDll_recv;
+    hle_functions_[make_import_key(1, 658)] = HLE_NetDll_recvfrom;
+    hle_functions_[make_import_key(1, 659)] = HLE_NetDll_connect;
+    hle_functions_[make_import_key(1, 660)] = HLE_NetDll_bind;
+    hle_functions_[make_import_key(1, 661)] = HLE_NetDll_listen;
+    hle_functions_[make_import_key(1, 662)] = HLE_NetDll_accept;
+    hle_functions_[make_import_key(1, 663)] = HLE_NetDll_select;
+    hle_functions_[make_import_key(1, 664)] = HLE_NetDll_setsockopt;
+    hle_functions_[make_import_key(1, 665)] = HLE_NetDll_ioctlsocket;
+    hle_functions_[make_import_key(1, 667)] = HLE_NetDll_WSAGetLastError;
+
+    // Additional XAM functions
+    hle_functions_[make_import_key(1, 25)] = HLE_XamContentFlush;
+    hle_functions_[make_import_key(1, 26)] = HLE_XamContentGetThumbnail;
+    hle_functions_[make_import_key(1, 78)] = HLE_XamShowDeviceSelectorUI;
+    hle_functions_[make_import_key(1, 7)] = HLE_XamUserGetOnlineXUID;
+    hle_functions_[make_import_key(1, 8)] = HLE_XamUserGetMembershipTier;
+    hle_functions_[make_import_key(1, 112)] = HLE_XamGetOverlappedResult;
+    hle_functions_[make_import_key(1, 113)] = HLE_XamGetOverlappedExtendedError;
+    hle_functions_[make_import_key(1, 140)] = HLE_XamPartyGetUserList;
+
     LOGI("Registered XAM HLE functions (%zu total)", hle_functions_.size());
 }
 

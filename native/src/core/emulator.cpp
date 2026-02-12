@@ -5,6 +5,8 @@
  */
 
 #include "x360mu/emulator.h"
+#include "kernel/game_info.h"
+#include "save_state.h"
 #include "cpu/xenon/cpu.h"
 #include "cpu/xenon/threading.h"
 #include "gpu/xenos/gpu.h"
@@ -13,6 +15,7 @@
 #include "kernel/kernel.h"
 #include "kernel/xkernel.h"
 #include "kernel/filesystem/vfs.h"
+#include "input/input_manager.h"
 
 #include <atomic>
 #include <thread>
@@ -286,6 +289,13 @@ Status Emulator::load_game(const std::string& path) {
         return Status::InvalidFormat;
     }
     
+    // Notify GPU shader cache of the game's title ID for per-game caching
+    const GameInfo* game_info = kernel_->get_game_info();
+    if (game_info && game_info->title_id != 0 && gpu_) {
+        gpu_->set_title_id(game_info->title_id);
+        LOGI("Shader cache set to title ID: 0x%08X", game_info->title_id);
+    }
+
     state_ = EmulatorState::Loaded;
     LOGI("Game loaded successfully");
     return Status::Ok;
@@ -301,6 +311,11 @@ void Emulator::unload_game() {
     memory_->reset();
     
     state_ = EmulatorState::Ready;
+}
+
+const GameInfo* Emulator::get_game_info() const {
+    if (kernel_) return kernel_->get_game_info();
+    return nullptr;
 }
 
 Status Emulator::run() {
@@ -415,10 +430,10 @@ void Emulator::emulation_thread_main() {
     using Clock = std::chrono::high_resolution_clock;
     auto last_frame_time = Clock::now();
     auto last_log_time = Clock::now();
-    auto target_frame_time = FRAME_TIME_30FPS; // TODO: configurable
 
     u64 loop_iterations = 0;
     u64 frames_since_log = 0;
+    u64 frames_skipped = 0;
 
     while (!emu_thread_->should_stop) {
         // Wait for run signal or step
@@ -519,36 +534,54 @@ void Emulator::emulation_thread_main() {
                  loop_iterations, cpu_batches, frame_complete);
         }
         
-        // Present frame
+        // Sync input state to XAM before presenting
+        get_input_manager().sync_to_xam();
+
+        // Present frame (with frame skip support)
         if (frame_complete || cpu_batches >= 100) {
-            // Even if frame isn't "complete", try to present to show something
-            gpu_->present();
-            stats_.frames_rendered++;
-            frames_since_log++;
-            
+            u32 skip = gpu_ ? gpu_->frame_skip() : 0;
+            bool should_present = (skip == 0) || (frames_skipped >= skip);
+
+            if (should_present) {
+                gpu_->present();
+                stats_.frames_rendered++;
+                frames_since_log++;
+                frames_skipped = 0;
+            } else {
+                // Skip present but still advance frame state
+                gpu_->begin_new_frame();
+                frames_skipped++;
+            }
+
             // Signal VBlank - this processes timer DPCs and signals VBlank events
             // Games rely on VBlank for frame synchronization
             XKernel::instance().signal_vblank();
-            
+
             if (frame_callback_) {
                 frame_callback_();
             }
         }
-        
+
         // Frame timing
         auto frame_end = Clock::now();
         auto frame_duration = std::chrono::duration_cast<std::chrono::microseconds>(frame_end - frame_start);
         stats_.frame_time_ms = frame_duration.count() / 1000.0;
-        
+
         // Calculate FPS
         auto since_last = std::chrono::duration_cast<std::chrono::microseconds>(frame_end - last_frame_time);
         if (since_last.count() > 0) {
             stats_.fps = 1000000.0 / since_last.count();
         }
         last_frame_time = frame_end;
-        
+
+        // Compute target frame time from GPU's target FPS setting
+        u32 tfps = gpu_ ? gpu_->target_fps() : 30;
+        auto target_frame_time = (tfps > 0)
+            ? std::chrono::microseconds(1000000 / tfps)
+            : std::chrono::microseconds(0);
+
         // Sync to target frame rate (if we're ahead)
-        if (!single_step && frame_duration < target_frame_time) {
+        if (!single_step && tfps > 0 && frame_duration < target_frame_time) {
             std::this_thread::sleep_for(target_frame_time - frame_duration);
         }
         
@@ -602,6 +635,25 @@ void Emulator::test_render() {
     }
 }
 
+void Emulator::set_vsync(bool enabled) {
+    config_.enable_vsync = enabled;
+    if (gpu_) {
+        gpu_->set_vsync(enabled);
+    }
+}
+
+void Emulator::set_frame_skip(u32 count) {
+    if (gpu_) {
+        gpu_->set_frame_skip(count);
+    }
+}
+
+void Emulator::set_target_fps(u32 fps) {
+    if (gpu_) {
+        gpu_->set_target_fps(fps);
+    }
+}
+
 void Emulator::set_frame_callback(FrameCallback callback) {
     frame_callback_ = std::move(callback);
 }
@@ -612,15 +664,61 @@ Emulator::Stats Emulator::get_stats() const {
 
 // Save states
 Status Emulator::save_state(const std::string& path) {
-    // TODO: Implement save states
-    (void)path;
-    return Status::NotImplemented;
+    if (state_ != EmulatorState::Paused && state_ != EmulatorState::Running) {
+        LOGE("Cannot save state: emulator not running/paused");
+        return Status::Error;
+    }
+
+    // Pause if running
+    bool was_running = (state_ == EmulatorState::Running);
+    if (was_running) {
+        pause();
+    }
+
+    LOGI("Saving emulator state to: %s", path.c_str());
+    Status status = SaveState::save(path, cpu_.get(), gpu_.get(),
+                                     memory_.get(), kernel_.get());
+
+    if (was_running) {
+        run();
+    }
+
+    if (status == Status::Ok) {
+        LOGI("State saved successfully");
+    } else {
+        LOGE("Failed to save state: %s", status_to_string(status));
+    }
+    return status;
 }
 
 Status Emulator::load_state(const std::string& path) {
-    // TODO: Implement save states
-    (void)path;
-    return Status::NotImplemented;
+    if (state_ == EmulatorState::Uninitialized) {
+        LOGE("Cannot load state: emulator not initialized");
+        return Status::Error;
+    }
+
+    // Pause if running
+    bool was_running = (state_ == EmulatorState::Running);
+    if (was_running) {
+        pause();
+    }
+
+    LOGI("Loading emulator state from: %s", path.c_str());
+    Status status = SaveState::load(path, cpu_.get(), gpu_.get(),
+                                     memory_.get(), kernel_.get());
+
+    if (status == Status::Ok) {
+        LOGI("State loaded successfully");
+        state_ = EmulatorState::Paused;
+    } else {
+        LOGE("Failed to load state: %s", status_to_string(status));
+    }
+
+    if (was_running && status == Status::Ok) {
+        run();
+    }
+
+    return status;
 }
 
 } // namespace x360mu

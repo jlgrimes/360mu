@@ -14,6 +14,7 @@
 #include "command_processor.h"
 #include "shader_translator.h"
 #include "texture.h"
+#include "edram.h"
 #include "gpu/vulkan/vulkan_backend.h"
 #include "gpu/shader_cache.h"
 #include "gpu/descriptor_manager.h"
@@ -21,8 +22,11 @@
 #include "gpu/texture_cache.h"
 #include "gpu/render_target.h"
 #include "memory/memory.h"
+#include "kernel/xobject.h"
 #include <cstring>
 #include <cstdio>
+#include <chrono>
+#include <thread>
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -75,6 +79,13 @@ Status Gpu::initialize(Memory* memory, const GpuConfig& config) {
     // Create texture cache
     texture_cache_ = std::make_unique<TextureCache>();
 
+    // Create eDRAM manager
+    edram_manager_ = std::make_unique<EdramManager>();
+    if (edram_manager_->initialize() != Status::Ok) {
+        LOGE("Failed to initialize eDRAM manager");
+        return Status::ErrorInit;
+    }
+
     // Create render target manager
     render_target_manager_ = std::make_unique<RenderTargetManager>();
 
@@ -97,6 +108,8 @@ Status Gpu::initialize(Memory* memory, const GpuConfig& config) {
 }
 
 void Gpu::shutdown() {
+    surface_active_ = false;
+
     if (command_processor_) {
         command_processor_->shutdown();
         command_processor_.reset();
@@ -105,6 +118,11 @@ void Gpu::shutdown() {
     if (render_target_manager_) {
         render_target_manager_->shutdown();
         render_target_manager_.reset();
+    }
+
+    if (edram_manager_) {
+        edram_manager_->shutdown();
+        edram_manager_.reset();
     }
 
     if (texture_cache_) {
@@ -167,9 +185,11 @@ void Gpu::reset() {
         command_processor_->reset();
     }
     
-    // Reset stats
+    // Reset stats and frame pacing
     stats_ = {};
-    
+    frame_count_ = 0;
+    last_present_time_ = {};
+
     LOGI("GPU reset");
 }
 
@@ -183,7 +203,31 @@ void Gpu::set_surface(void* native_window) {
     
     if (!native_window) {
         LOGI("Clearing surface (window is null)");
-        // TODO: Handle surface destruction
+
+        // Tear down subsystems that depend on Vulkan surface
+        surface_active_ = false;
+        in_frame_ = false;
+
+        if (command_processor_) {
+            command_processor_->shutdown();
+        }
+        if (render_target_manager_) {
+            render_target_manager_->shutdown();
+        }
+        if (buffer_pool_) {
+            buffer_pool_->shutdown();
+        }
+        if (descriptor_manager_) {
+            descriptor_manager_->shutdown();
+        }
+        if (shader_cache_) {
+            shader_cache_->shutdown();
+        }
+        if (vulkan_) {
+            vulkan_->shutdown();
+        }
+
+        LOGI("Surface cleared, GPU subsystems shut down");
         return;
     }
     
@@ -241,15 +285,15 @@ void Gpu::set_surface(void* native_window) {
         LOGI("Texture cache initialized");
     }
 
-    // Initialize render target manager (no EDRAM manager for now - pass nullptr)
+    // Initialize render target manager with eDRAM manager
     if (render_target_manager_) {
         LOGI("Initializing render target manager...");
-        status = render_target_manager_->initialize(vulkan_.get(), memory_, nullptr);
+        status = render_target_manager_->initialize(vulkan_.get(), memory_, edram_manager_.get());
         if (status != Status::Ok) {
             LOGE("Failed to initialize render target manager");
             return;
         }
-        LOGI("Render target manager initialized");
+        LOGI("Render target manager initialized with eDRAM");
     }
 
     // Now initialize command processor with all subsystems
@@ -273,11 +317,14 @@ void Gpu::set_surface(void* native_window) {
     vulkan_->clear_screen(0.4f, 0.1f, 0.6f);  // Purple color for debugging
     LOGI("Test render complete");
     
+    surface_active_ = true;
     LOGI("Vulkan surface fully initialized");
 }
 
 void Gpu::resize(u32 width, u32 height) {
-    if (vulkan_) {
+    if (vulkan_ && surface_active_) {
+        // width=0, height=0 means recreate at current dimensions
+        // (used for swapchain error recovery)
         vulkan_->resize(width, height);
     }
 }
@@ -303,7 +350,14 @@ void Gpu::process_commands() {
     
     // Store updated read pointer with release semantics
     read_ptr_.store(rp, std::memory_order_release);
-    
+
+    // CP_RB_RPTR writeback: write read pointer to guest memory so CPU can track GPU progress
+    // Games configure CP_RB_RPTR_ADDR to specify where the GPU writes back the read pointer
+    u32 rptr_addr = registers_[xenos_reg::CP_RB_RPTR_ADDR];
+    if (rptr_addr != 0) {
+        memory_->write_u32(rptr_addr, rp);
+    }
+
     // Signal GPU fence: we've processed up to the current CPU fence
     // This tells waiting CPU threads that GPU has caught up
     u64 current_cpu_fence = cpu_fence_.load(std::memory_order_acquire);
@@ -318,39 +372,109 @@ void Gpu::process_commands() {
 }
 
 void Gpu::present() {
-    static u64 present_count = 0;
-    present_count++;
-    
-    // Log every 60 frames (roughly every second at 60fps)
-    if (present_count % 60 == 1) {
-        LOGI("GPU::present() called (frame %llu)", present_count);
+    frame_count_++;
+
+    // Log every 60 frames
+    if (frame_count_ % 60 == 1) {
+        LOGI("GPU::present() called (frame %llu)", (unsigned long long)frame_count_);
     }
-    
-    if (vulkan_) {
-        // If we're not in a frame, start one and clear to a debug color
-        if (!in_frame_) {
-            Status status = vulkan_->begin_frame();
-            if (status != Status::Ok) {
-                if (present_count % 60 == 1) {
-                    LOGE("Failed to begin frame for present");
-                }
-                return;
+
+    if (!vulkan_ || !surface_active_) {
+        if (frame_count_ % 60 == 1) {
+            LOGE("GPU::present() - vulkan not ready (vulkan_=%p, surface_active_=%d)",
+                 (void*)vulkan_.get(), surface_active_);
+        }
+        frame_complete_ = true;
+        in_frame_ = false;
+        return;
+    }
+
+    // Frame skip: only present every (frame_skip_ + 1) frames
+    if (frame_skip_ > 0 && (frame_count_ % (frame_skip_ + 1)) != 0) {
+        frame_complete_ = true;
+        in_frame_ = false;
+        return;
+    }
+
+    // Begin frame if not already in one
+    if (!in_frame_) {
+        Status status = vulkan_->begin_frame();
+        if (status == Status::ErrorSwapchain) {
+            // Swapchain out of date - recreate and retry once
+            LOGI("Swapchain out of date on begin_frame, recreating...");
+            Status resize_status = vulkan_->resize(0, 0);
+            if (resize_status == Status::Ok) {
+                status = vulkan_->begin_frame();
             }
         }
-        
-        Status status = vulkan_->end_frame();
         if (status != Status::Ok) {
-            if (present_count % 60 == 1) {
-                LOGE("end_frame() failed");
+            if (frame_count_ % 60 == 1) {
+                LOGE("Failed to begin frame for present");
             }
+            frame_complete_ = true;
+            in_frame_ = false;
+            return;
         }
-        stats_.frames++;
-    } else {
-        LOGE("GPU::present() - vulkan_ is null!");
     }
-    
+
+    // End frame and present
+    Status status = vulkan_->end_frame();
+    if (status == Status::ErrorSwapchain) {
+        // Swapchain suboptimal or out of date during present
+        // Recreate for the next frame
+        LOGI("Swapchain error on end_frame, will recreate next frame");
+        vulkan_->resize(0, 0);
+    } else if (status != Status::Ok) {
+        if (frame_count_ % 60 == 1) {
+            LOGE("end_frame() failed with status %d", static_cast<int>(status));
+        }
+    }
+
+    stats_.frames++;
     frame_complete_ = true;
     in_frame_ = false;
+
+    // Frame pacing: sleep to hit target FPS
+    if (target_fps_ > 0) {
+        auto now = std::chrono::steady_clock::now();
+        auto target_interval = std::chrono::nanoseconds(1000000000ULL / target_fps_);
+
+        if (last_present_time_.time_since_epoch().count() > 0) {
+            auto elapsed = now - last_present_time_;
+            if (elapsed < target_interval) {
+                auto sleep_time = target_interval - elapsed;
+                std::this_thread::sleep_for(sleep_time);
+                now = std::chrono::steady_clock::now();
+            }
+        }
+        last_present_time_ = now;
+    }
+}
+
+void Gpu::set_vsync(bool enabled) {
+    config_.enable_vsync = enabled;
+    if (vulkan_) {
+        VkPresentModeKHR mode = enabled ?
+            VK_PRESENT_MODE_FIFO_KHR : VK_PRESENT_MODE_MAILBOX_KHR;
+        vulkan_->set_present_mode(mode);
+        LOGI("VSync %s (present mode %d)", enabled ? "enabled" : "disabled", mode);
+    }
+}
+
+void Gpu::set_frame_skip(u32 skip_count) {
+    frame_skip_ = skip_count;
+    LOGI("Frame skip set to %u", skip_count);
+}
+
+void Gpu::set_target_fps(u32 fps) {
+    target_fps_ = fps;
+    LOGI("Target FPS set to %u", fps);
+}
+
+void Gpu::set_title_id(u32 title_id) {
+    if (shader_cache_) {
+        shader_cache_->set_title_id(title_id);
+    }
 }
 
 void Gpu::test_render() {
@@ -414,6 +538,16 @@ void Gpu::write_register(u32 offset, u32 value) {
                 // that the CPU made before updating the write pointer
                 write_ptr_.store(value, std::memory_order_release);
                 LOGD("Ring buffer write pointer updated: %u", value);
+                break;
+
+            // Render target registers - trigger RT update
+            case xenos_reg::RB_SURFACE_INFO:
+            case xenos_reg::RB_COLOR_INFO:
+            case xenos_reg::RB_COLOR1_INFO:
+            case xenos_reg::RB_COLOR2_INFO:
+            case xenos_reg::RB_COLOR3_INFO:
+            case xenos_reg::RB_DEPTH_INFO:
+                update_render_targets();
                 break;
         }
     }
@@ -572,12 +706,22 @@ void Gpu::cmd_draw_auto(PrimitiveType type, u32 vertex_count) {
 
 void Gpu::cmd_resolve() {
     // Resolve eDRAM render targets to main memory
-    // This typically happens at the end of a frame
     LOGD("Resolve command");
-    
-    // For now, just present
+
+    // Perform the actual eDRAM → main memory resolve using register state
+    if (render_target_manager_) {
+        render_target_manager_->resolve_edram_to_memory(registers_.data());
+    }
+
+    // Present after resolve (resolves typically mark end of rendering pass)
     if (in_frame_) {
         present();
+    }
+}
+
+void Gpu::update_render_targets() {
+    if (render_target_manager_) {
+        render_target_manager_->update_from_registers(registers_.data());
     }
 }
 
@@ -603,6 +747,24 @@ void Gpu::update_shaders() {
 
 void Gpu::update_textures() {
     // Texture state is handled by the texture cache when samplers are bound
+}
+
+//=============================================================================
+// VSync Interrupt
+//=============================================================================
+
+void Gpu::signal_vsync() {
+    // Increment VSync counter in GPU register space
+    // Xbox 360 uses RBBM_STATUS (0x0E40) bit 0 for VBlank, and a VSync counter
+    // at COHER_STATUS_HOST (used by D3D for VBlank queries)
+    static u32 vsync_count = 0;
+    vsync_count++;
+    registers_[0x0E40] = vsync_count;  // VSync counter register
+
+    // Signal GPU interrupt so kernel event waiters (VBlank wait) get woken
+    KernelState::instance().queue_gpu_interrupt();
+
+    LOGD("VSync signal #%u", vsync_count);
 }
 
 //=============================================================================

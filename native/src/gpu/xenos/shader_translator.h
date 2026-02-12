@@ -183,6 +183,7 @@ enum class ExportType : u8 {
     PointSize = 2,     // Point size output
     Color = 3,         // Color output (pixel shader)
     Depth = 4,         // Depth output (pixel shader)
+    MemExport = 5,     // Memory export (eM0-eM3 → SSBO write)
 };
 
 /**
@@ -287,6 +288,20 @@ public:
     u32 i_add(u32 type, u32 a, u32 b);
     u32 i_sub(u32 type, u32 a, u32 b);
     u32 i_mul(u32 type, u32 a, u32 b);
+    u32 s_div(u32 type, u32 a, u32 b);
+    u32 u_div(u32 type, u32 a, u32 b);
+    u32 s_mod(u32 type, u32 a, u32 b);
+    u32 u_mod(u32 type, u32 a, u32 b);
+    u32 s_negate(u32 type, u32 a);
+
+    // === Bitwise operations ===
+    u32 bitwise_and(u32 type, u32 a, u32 b);
+    u32 bitwise_or(u32 type, u32 a, u32 b);
+    u32 bitwise_xor(u32 type, u32 a, u32 b);
+    u32 bitwise_not(u32 type, u32 a);
+    u32 shift_left_logical(u32 type, u32 base, u32 shift);
+    u32 shift_right_logical(u32 type, u32 base, u32 shift);
+    u32 shift_right_arithmetic(u32 type, u32 base, u32 shift);
     
     // === Conversions ===
     u32 convert_f_to_s(u32 type, u32 value);
@@ -319,7 +334,11 @@ public:
     u32 i_equal(u32 type, u32 a, u32 b);
     u32 i_not_equal(u32 type, u32 a, u32 b);
     u32 s_less_than(u32 type, u32 a, u32 b);
+    u32 s_less_than_equal(u32 type, u32 a, u32 b);
+    u32 s_greater_than(u32 type, u32 a, u32 b);
     u32 s_greater_than_equal(u32 type, u32 a, u32 b);
+    u32 u_less_than(u32 type, u32 a, u32 b);
+    u32 u_greater_than_equal(u32 type, u32 a, u32 b);
     
     // === Logical ===
     u32 logical_and(u32 type, u32 a, u32 b);
@@ -346,6 +365,10 @@ public:
     u32 image_sample_grad(u32 type, u32 sampled_image, u32 coord, u32 ddx, u32 ddy);
     u32 image_fetch(u32 type, u32 image, u32 coord, u32 lod = 0);
     u32 image_query_size_lod(u32 type, u32 image, u32 lod);
+    u32 image_query_size(u32 type, u32 image);
+    u32 image_query_levels(u32 type, u32 image);
+    u32 image_sample_dref(u32 type, u32 sampled_image, u32 coord, u32 dref);
+    u32 image_sample_dref_lod(u32 type, u32 sampled_image, u32 coord, u32 dref, u32 lod);
     
     // === Decorations ===
     void decorate(u32 target, u32 decoration, const std::vector<u32>& operands = {});
@@ -365,7 +388,11 @@ public:
     u32 import_extension(const std::string& name);
     void capability(u32 cap);
     void memory_model(u32 addressing, u32 memory);
-    
+
+    // === Validation ===
+    bool validate(std::string* error_out = nullptr) const;
+    std::vector<u32> end_validated(std::string* error_out = nullptr);
+
     // === ID management ===
     u32 allocate_id() { return next_id_++; }
     u32 reserve_id() { return next_id_++; }
@@ -522,6 +549,13 @@ public:
         
         // Loop fields
         u8 loop_id;
+
+        // Bool constant index (for COND_EXEC)
+        u8 bool_index;
+
+        // Clause tracking (indices into alu/fetch instruction arrays)
+        u32 clause_start;
+        u32 clause_count;
     };
     
     // Access decoded instructions
@@ -584,13 +618,72 @@ struct ShaderInfo {
     bool exports_point_size;
     u32 color_export_count;
     bool exports_depth;
-    
+    bool uses_memexport;     // Shader uses eM0-eM3 memory export
+
     // Control flow complexity
     u32 loop_count;
     u32 conditional_count;
     bool uses_predication;
     bool uses_kill;
 };
+
+//=============================================================================
+// SPIR-V Reflection
+//=============================================================================
+
+/**
+ * Descriptor binding info extracted from SPIR-V
+ */
+struct SpirvBinding {
+    u32 set;
+    u32 binding;
+    u32 descriptor_type;  // 0=UBO, 1=combined_image_sampler, 2=sampler, 3=sampled_image
+    u32 variable_id;
+};
+
+/**
+ * Input/output variable info extracted from SPIR-V
+ */
+struct SpirvInterfaceVar {
+    u32 location;
+    u32 builtin;       // 0xFFFFFFFF if not a builtin
+    u32 storage_class;  // 1=Input, 3=Output
+    u32 variable_id;
+};
+
+/**
+ * Complete SPIR-V reflection data for shader validation
+ */
+struct SpirvReflection {
+    std::vector<SpirvInterfaceVar> inputs;
+    std::vector<SpirvInterfaceVar> outputs;
+    std::vector<SpirvBinding> bindings;
+
+    // Convenience lookups
+    bool has_input_location(u32 loc) const {
+        for (const auto& v : inputs)
+            if (v.location == loc && v.builtin == 0xFFFFFFFF) return true;
+        return false;
+    }
+    bool has_binding(u32 set, u32 binding) const {
+        for (const auto& b : bindings)
+            if (b.set == set && b.binding == binding) return true;
+        return false;
+    }
+};
+
+/**
+ * Reflect SPIR-V bytecode to extract interface information
+ */
+SpirvReflection reflect_spirv(const std::vector<u32>& spirv);
+
+/**
+ * Validate shader SPIR-V against expected pipeline layout.
+ * Returns number of warnings/mismatches logged.
+ */
+u32 validate_shader_bindings(const SpirvReflection& reflection,
+                             const ShaderInfo& info,
+                             ShaderType type);
 
 //=============================================================================
 // Shader Translator
@@ -742,8 +835,8 @@ private:
         u32 prev_scalar;
         u32 prev_vector;
         
-        // Loop counter stack
-        std::vector<u32> loop_counter_vars;
+        // Loop counter variables (pre-allocated, one per loop constant)
+        std::array<u32, 32> loop_counter_vars;
         
         // GLSL.std.450 extension ID
         u32 glsl_ext;
@@ -780,8 +873,14 @@ private:
         u32 vec4_uniform_ptr;
         u32 bool_func_ptr;
         u32 int_func_ptr;
+
+        // Memexport SSBO (for eM0-eM3 memory export writes)
+        u32 memexport_ssbo_var = 0;      // SSBO variable for memexport
+        u32 memexport_addr_var = 0;      // eA register (export address)
+        u32 memexport_vec4_ssbo_ptr = 0; // Pointer type for SSBO access
+        bool uses_memexport = false;     // Whether this shader uses memexport
     };
-    
+
     // Setup functions
     void setup_types(TranslationContext& ctx);
     void setup_constants(TranslationContext& ctx);
@@ -822,6 +921,10 @@ private:
     void write_position(TranslationContext& ctx, u32 value);
     void write_interpolant(TranslationContext& ctx, u32 value, u8 index);
     void write_color(TranslationContext& ctx, u32 value, u8 index);
+
+    // Memexport (eM0-eM3 → SSBO)
+    void setup_memexport(TranslationContext& ctx);
+    void handle_memexport(TranslationContext& ctx, u32 value, u8 export_index);
     
     // Texture operations
     u32 translate_texture_fetch(TranslationContext& ctx, const ShaderMicrocode::FetchInstruction& inst);

@@ -148,15 +148,53 @@ public:
                           u32 src_pitch, u32 width, u32 height);
     
     /**
+     * Update render targets from GPU register values
+     * Parses RB_SURFACE_INFO, RB_COLOR_INFO, RB_DEPTH_INFO etc.
+     */
+    void update_from_registers(const u32* registers);
+
+    /**
+     * Full eDRAM resolve: eDRAM → Vulkan RT → staging → guest memory
+     * Uses RB_COPY_CONTROL, RB_COPY_DEST_BASE, RB_COPY_DEST_PITCH registers
+     */
+    void resolve_edram_to_memory(const u32* registers);
+
+    /**
+     * Copy staging buffer contents to a render target image
+     */
+    void copy_buffer_to_image(const VulkanRenderTarget& rt,
+                              VkBuffer src, u64 offset);
+
+    /**
+     * Get bytes per pixel for a given surface format
+     */
+    static u32 get_format_bytes_per_pixel(SurfaceFormat format);
+
+    /**
      * Get color render target image view
      */
     VkImageView get_color_view(u32 index);
-    
+
     /**
      * Get depth render target image view
      */
     VkImageView get_depth_view();
-    
+
+    /**
+     * Get color render target (for external access)
+     */
+    const VulkanRenderTarget* get_color_target(u32 index) const {
+        if (index >= MAX_COLOR_TARGETS) return nullptr;
+        return color_targets_[index].is_valid() ? &color_targets_[index] : nullptr;
+    }
+
+    /**
+     * Get depth render target (for external access)
+     */
+    const VulkanRenderTarget* get_depth_target() const {
+        return depth_target_.is_valid() ? &depth_target_ : nullptr;
+    }
+
     // Configuration
     static constexpr u32 MAX_COLOR_TARGETS = 4;
     

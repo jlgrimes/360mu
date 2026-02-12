@@ -305,22 +305,36 @@ VkPresentModeKHR VulkanSwapchain::choose_present_mode() {
     vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device_, surface_, &mode_count, nullptr);
     std::vector<VkPresentModeKHR> modes(mode_count);
     vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device_, surface_, &mode_count, modes.data());
-    
-    // Prefer mailbox for low-latency
-    for (const auto& mode : modes) {
-        if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
-            return mode;
-        }
-    }
-    
-    // Check for configured mode
+
+    // First try the configured/requested mode
     for (const auto& mode : modes) {
         if (mode == config_.present_mode) {
+            LOGI("Using requested present mode: %d", config_.present_mode);
             return mode;
         }
     }
-    
-    // FIFO is always available
+
+    // VSync on: prefer FIFO (always available)
+    if (config_.present_mode == VK_PRESENT_MODE_FIFO_KHR) {
+        return VK_PRESENT_MODE_FIFO_KHR;
+    }
+
+    // VSync off: prefer MAILBOX (low latency, no tearing), then IMMEDIATE
+    for (const auto& mode : modes) {
+        if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
+            LOGI("Falling back to MAILBOX present mode");
+            return mode;
+        }
+    }
+    for (const auto& mode : modes) {
+        if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+            LOGI("Falling back to IMMEDIATE present mode");
+            return mode;
+        }
+    }
+
+    // FIFO is always available per Vulkan spec
+    LOGI("Falling back to FIFO present mode");
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 

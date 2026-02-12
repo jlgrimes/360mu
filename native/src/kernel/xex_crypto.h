@@ -73,66 +73,95 @@ struct CompressionBlock {
 };
 
 /**
+ * Key type used for XEX decryption
+ */
+enum class XexKeyType : u8 {
+    Retail = 0,     // Standard retail disc key
+    DevKit = 1,     // Development kit key
+    XEX1 = 2,       // XEX1 format key (pre-release)
+};
+
+/**
  * XEX Decryptor
- * 
+ *
  * Handles all cryptographic operations for XEX files.
  */
 class XexDecryptor {
 public:
     XexDecryptor();
     ~XexDecryptor();
-    
+
     /**
-     * Set the encryption key from security info
+     * Set the encryption key from security info with automatic key selection
      */
-    void set_key(const u8* file_key);
-    
+    void set_key(const u8* file_key, XexKeyType key_type = XexKeyType::Retail);
+
+    /**
+     * Try multiple keys until decryption succeeds (PE header validates)
+     * Returns the key type that worked, or false if none worked
+     */
+    bool try_keys(u8* data, u32 size, const u8* file_key, XexKeyType& out_key_type);
+
     /**
      * Decrypt XEX header
      */
     Status decrypt_header(u8* data, u32 size);
-    
+
     /**
      * Decrypt PE image data
      */
     Status decrypt_image(u8* data, u32 size, const u8* iv);
-    
+
     /**
      * Decompress image data
      */
     Status decompress_image(const u8* compressed, u32 comp_size,
                             u8* decompressed, u32 decomp_size,
                             XexCompression type);
-    
+
     /**
      * Decompress basic compression blocks
      */
     Status decompress_basic(const u8* src, u32 src_size,
                             u8* dst, u32 dst_size,
                             const CompressionBlock* blocks, u32 block_count);
-    
+
     /**
      * Decompress LZX compression
      */
     Status decompress_lzx(const u8* src, u32 src_size,
                           u8* dst, u32 dst_size,
                           u32 window_size = 0x20000);
-    
+
+    /**
+     * Decompress delta patch data
+     */
+    Status decompress_delta(const u8* src, u32 src_size,
+                            const u8* base_data, u32 base_size,
+                            u8* dst, u32 dst_size);
+
     /**
      * Verify SHA-1 hash
      */
     bool verify_hash(const u8* data, u32 size, const u8* expected_hash);
-    
+
+    /**
+     * Get the key type that was used
+     */
+    XexKeyType get_key_type() const { return key_type_; }
+
 private:
     Aes128 aes_;
     bool key_set_ = false;
-    
+    XexKeyType key_type_ = XexKeyType::Retail;
+
     // XEX keys
     static const u8 retail_key_[16];
     static const u8 devkit_key_[16];
-    
+    static const u8 xex1_key_[16];
+
     // Derive per-file key from master key
-    void derive_key(const u8* file_key, u8* derived_key);
+    void derive_key(const u8* file_key, u8* derived_key, XexKeyType key_type);
 };
 
 /**

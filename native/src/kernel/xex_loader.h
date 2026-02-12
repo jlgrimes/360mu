@@ -132,6 +132,27 @@ struct XexTlsInfo {
 };
 
 /**
+ * XEX resource entry
+ */
+struct XexResource {
+    std::string name;
+    u32 address;
+    u32 size;
+};
+
+/**
+ * XEX static library reference
+ */
+struct XexStaticLibrary {
+    std::string name;     // 8-char library name
+    u16 version_major;
+    u16 version_minor;
+    u16 version_build;
+    u16 version_qfe;
+    u16 approval_type;
+};
+
+/**
  * Single import entry info
  */
 struct XexImportEntry {
@@ -197,9 +218,11 @@ struct XexModule {
     // Sections
     std::vector<XexSection> sections;
     
-    // Imports and exports
+    // Imports, exports, resources, and static libs
     std::vector<XexImportLibrary> imports;
     std::vector<XexExport> exports;
+    std::vector<XexResource> resources;
+    std::vector<XexStaticLibrary> static_libraries;
     
     // Stack/heap configuration
     u32 default_stack_size;

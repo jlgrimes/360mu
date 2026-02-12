@@ -10,6 +10,8 @@
 #include "vulkan_backend.h"
 #include <cstring>
 #include <algorithm>
+#include <fstream>
+#include <string>
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -18,11 +20,13 @@
 #define LOG_TAG "360mu-vulkan"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #else
 #include <cstdio>
 #define LOGI(...) printf("[VULKAN] " __VA_ARGS__); printf("\n")
 #define LOGE(...) fprintf(stderr, "[VULKAN ERROR] " __VA_ARGS__); fprintf(stderr, "\n")
+#define LOGW(...) fprintf(stderr, "[VULKAN WARN] " __VA_ARGS__); fprintf(stderr, "\n")
 #define LOGD(...) /* debug disabled */
 #endif
 
@@ -32,21 +36,49 @@ namespace x360mu {
 // Vulkan Debug Callback
 //=============================================================================
 
-#ifdef X360MU_VULKAN_DEBUG
+// Always compiled - setup_debug_utils() dynamically probes for the extension
 static VKAPI_ATTR VkBool32 VKAPI_CALL vulkan_debug_callback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
     VkDebugUtilsMessageTypeFlagsEXT type,
     const VkDebugUtilsMessengerCallbackDataEXT* callback_data,
     void* user_data)
 {
+    (void)user_data;
+
+    // Classify message type
+    const char* type_str = "GENERAL";
+    if (type & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT)
+        type_str = "VALIDATION";
+    else if (type & VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT)
+        type_str = "PERFORMANCE";
+
+    // Build object list if any are labeled
+    char obj_buf[256] = {};
+    if (callback_data->objectCount > 0) {
+        int pos = 0;
+        pos += snprintf(obj_buf + pos, sizeof(obj_buf) - pos, " [objects:");
+        for (u32 i = 0; i < callback_data->objectCount && i < 4; i++) {
+            const auto& obj = callback_data->pObjects[i];
+            if (obj.pObjectName) {
+                pos += snprintf(obj_buf + pos, sizeof(obj_buf) - pos,
+                               " %s", obj.pObjectName);
+            } else {
+                pos += snprintf(obj_buf + pos, sizeof(obj_buf) - pos,
+                               " 0x%llx", (unsigned long long)obj.objectHandle);
+            }
+        }
+        snprintf(obj_buf + pos, sizeof(obj_buf) - pos, "]");
+    }
+
     if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
-        LOGE("Vulkan: %s", callback_data->pMessage);
+        LOGE("Vulkan %s [%d]: %s%s", type_str,
+             callback_data->messageIdNumber, callback_data->pMessage, obj_buf);
     } else if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
-        LOGI("Vulkan Warning: %s", callback_data->pMessage);
+        LOGI("Vulkan %s WARN [%d]: %s%s", type_str,
+             callback_data->messageIdNumber, callback_data->pMessage, obj_buf);
     }
     return VK_FALSE;
 }
-#endif
 
 //=============================================================================
 // VulkanBackend Implementation
@@ -68,7 +100,10 @@ Status VulkanBackend::initialize(void* native_window, u32 width, u32 height) {
         LOGE("Failed to create Vulkan instance: %d", result);
         return Status::ErrorInit;
     }
-    
+
+    // Set up debug utils (validation messenger, object naming, debug labels)
+    setup_debug_utils();
+
     // Create surface
     result = create_surface(native_window);
     if (result != VK_SUCCESS) {
@@ -90,13 +125,27 @@ Status VulkanBackend::initialize(void* native_window, u32 width, u32 height) {
         return Status::ErrorInit;
     }
     
+    // Create depth resources
+    result = create_depth_resources();
+    if (result != VK_SUCCESS) {
+        LOGE("Failed to create depth resources: %d", result);
+        return Status::ErrorInit;
+    }
+
     // Create render pass
     result = create_render_pass();
     if (result != VK_SUCCESS) {
         LOGE("Failed to create render pass: %d", result);
         return Status::ErrorInit;
     }
-    
+
+    // Create MRT render passes
+    result = create_mrt_render_passes();
+    if (result != VK_SUCCESS) {
+        LOGE("Failed to create MRT render passes: %d", result);
+        return Status::ErrorInit;
+    }
+
     // Create framebuffers
     result = create_framebuffers();
     if (result != VK_SUCCESS) {
@@ -131,7 +180,18 @@ Status VulkanBackend::initialize(void* native_window, u32 width, u32 height) {
         LOGE("Failed to create eDRAM resources: %d", result);
         return Status::ErrorInit;
     }
-    
+
+    // Create Vulkan pipeline cache (accelerates pipeline creation)
+    {
+        VkPipelineCacheCreateInfo cache_info = {};
+        cache_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+        result = vkCreatePipelineCache(device_, &cache_info, nullptr, &vk_pipeline_cache_);
+        if (result != VK_SUCCESS) {
+            LOGW("Failed to create pipeline cache: %d (non-fatal)", result);
+            vk_pipeline_cache_ = VK_NULL_HANDLE;
+        }
+    }
+
     LOGI("Vulkan backend initialized (%ux%u)", width, height);
     return Status::Ok;
 }
@@ -141,6 +201,13 @@ void VulkanBackend::shutdown() {
     
     vkDeviceWaitIdle(device_);
     
+    // Destroy query pool
+    destroy_query_pool();
+
+    // Destroy memexport SSBO
+    destroy_buffer(memexport_buffer_);
+    memexport_descriptor_set_ = VK_NULL_HANDLE;
+
     // Destroy eDRAM resources
     if (edram_buffer_ != VK_NULL_HANDLE) {
         vkDestroyBuffer(device_, edram_buffer_, nullptr);
@@ -162,6 +229,12 @@ void VulkanBackend::shutdown() {
     for (auto& [hash, pipeline] : pipeline_cache_) {
         vkDestroyPipeline(device_, pipeline, nullptr);
     }
+
+    // Destroy Vulkan pipeline cache
+    if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineCache(device_, vk_pipeline_cache_, nullptr);
+        vk_pipeline_cache_ = VK_NULL_HANDLE;
+    }
     
     // Destroy sync objects
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
@@ -177,7 +250,17 @@ void VulkanBackend::shutdown() {
     for (auto fb : framebuffers_) {
         vkDestroyFramebuffer(device_, fb, nullptr);
     }
-    
+
+    // Destroy depth resources
+    destroy_image(depth_image_);
+
+    // Destroy MRT render passes
+    for (u32 i = 0; i < MAX_MRT_TARGETS - 1; i++) {
+        if (mrt_render_passes_[i] != VK_NULL_HANDLE) {
+            vkDestroyRenderPass(device_, mrt_render_passes_[i], nullptr);
+        }
+    }
+
     // Destroy render pass
     vkDestroyRenderPass(device_, render_pass_, nullptr);
     
@@ -194,7 +277,10 @@ void VulkanBackend::shutdown() {
     
     // Destroy surface
     vkDestroySurfaceKHR(instance_, surface_, nullptr);
-    
+
+    // Destroy debug messenger (must be before instance destruction)
+    destroy_debug_utils();
+
     // Destroy instance
     vkDestroyInstance(instance_, nullptr);
     
@@ -379,7 +465,7 @@ VkResult VulkanBackend::create_swapchain() {
     create_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     create_info.preTransform = capabilities.currentTransform;
     create_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR; // V-Sync
+    create_info.presentMode = present_mode_;
     create_info.clipped = VK_TRUE;
     
     VkResult result = vkCreateSwapchainKHR(device_, &create_info, nullptr, &swapchain_);
@@ -410,68 +496,203 @@ VkResult VulkanBackend::create_swapchain() {
         
         result = vkCreateImageView(device_, &view_info, nullptr, &swapchain_image_views_[i]);
         if (result != VK_SUCCESS) return result;
+
+        char sc_name[48];
+        snprintf(sc_name, sizeof(sc_name), "Swapchain_Image_%zu", i);
+        set_object_name(VK_OBJECT_TYPE_IMAGE, reinterpret_cast<u64>(swapchain_images_[i]), sc_name);
     }
-    
+
+    return VK_SUCCESS;
+}
+
+VkFormat VulkanBackend::find_depth_format() {
+    VkFormat candidates[] = {
+        VK_FORMAT_D24_UNORM_S8_UINT,
+        VK_FORMAT_D32_SFLOAT_S8_UINT,
+        VK_FORMAT_D32_SFLOAT
+    };
+    for (auto format : candidates) {
+        VkFormatProperties props;
+        vkGetPhysicalDeviceFormatProperties(physical_device_, format, &props);
+        if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+            return format;
+        }
+    }
+    return VK_FORMAT_D32_SFLOAT;
+}
+
+VkResult VulkanBackend::create_depth_resources() {
+    depth_format_ = find_depth_format();
+    depth_image_ = create_image(swapchain_extent_.width, swapchain_extent_.height,
+                                depth_format_, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    if (depth_image_.image == VK_NULL_HANDLE) {
+        LOGE("Failed to create depth image");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    LOGD("Depth resources created: format=%d", depth_format_);
     return VK_SUCCESS;
 }
 
 VkResult VulkanBackend::create_render_pass() {
-    VkAttachmentDescription color_attachment = {};
-    color_attachment.format = swapchain_format_;
-    color_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
-    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    color_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    color_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    color_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    color_attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    
-    VkAttachmentReference color_ref = {};
-    color_ref.attachment = 0;
-    color_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    
+    // Attachments: color + depth
+    VkAttachmentDescription attachments[2] = {};
+
+    // Color attachment
+    attachments[0].format = swapchain_format_;
+    attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachments[0].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    // Depth attachment
+    attachments[1].format = depth_format_;
+    attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference color_ref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference depth_ref = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+
     VkSubpassDescription subpass = {};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass.colorAttachmentCount = 1;
     subpass.pColorAttachments = &color_ref;
-    
+    subpass.pDepthStencilAttachment = &depth_ref;
+
     VkSubpassDependency dependency = {};
     dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
     dependency.dstSubpass = 0;
-    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                               VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                               VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
     dependency.srcAccessMask = 0;
-    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    
+    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                               VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
     VkRenderPassCreateInfo create_info = {};
     create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    create_info.attachmentCount = 1;
-    create_info.pAttachments = &color_attachment;
+    create_info.attachmentCount = 2;
+    create_info.pAttachments = attachments;
     create_info.subpassCount = 1;
     create_info.pSubpasses = &subpass;
     create_info.dependencyCount = 1;
     create_info.pDependencies = &dependency;
-    
-    return vkCreateRenderPass(device_, &create_info, nullptr, &render_pass_);
+
+    VkResult result = vkCreateRenderPass(device_, &create_info, nullptr, &render_pass_);
+    if (result == VK_SUCCESS) {
+        set_object_name(VK_OBJECT_TYPE_RENDER_PASS,
+                        reinterpret_cast<u64>(render_pass_),
+                        "RenderPass_Main_1Color+Depth");
+    }
+    return result;
+}
+
+VkResult VulkanBackend::create_mrt_render_passes() {
+    // Create render passes for 2, 3, 4 color attachments + depth
+    for (u32 n = 2; n <= MAX_MRT_TARGETS; n++) {
+        u32 total_attachments = n + 1;  // n color + 1 depth
+        std::vector<VkAttachmentDescription> att(total_attachments);
+        std::vector<VkAttachmentReference> color_refs(n);
+
+        // Color attachments (offscreen MRT targets)
+        for (u32 i = 0; i < n; i++) {
+            att[i] = {};
+            att[i].format = swapchain_format_;
+            att[i].samples = VK_SAMPLE_COUNT_1_BIT;
+            att[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            att[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            att[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            att[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            att[i].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            att[i].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+            color_refs[i] = {i, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        }
+
+        // Depth attachment (last)
+        att[n] = {};
+        att[n].format = depth_format_;
+        att[n].samples = VK_SAMPLE_COUNT_1_BIT;
+        att[n].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        att[n].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att[n].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        att[n].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att[n].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        att[n].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+        VkAttachmentReference depth_ref = {n, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+
+        VkSubpassDescription subpass = {};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = n;
+        subpass.pColorAttachments = color_refs.data();
+        subpass.pDepthStencilAttachment = &depth_ref;
+
+        VkSubpassDependency dependency = {};
+        dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependency.dstSubpass = 0;
+        dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                   VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                   VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        dependency.srcAccessMask = 0;
+        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+        VkRenderPassCreateInfo create_info = {};
+        create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        create_info.attachmentCount = total_attachments;
+        create_info.pAttachments = att.data();
+        create_info.subpassCount = 1;
+        create_info.pSubpasses = &subpass;
+        create_info.dependencyCount = 1;
+        create_info.pDependencies = &dependency;
+
+        VkResult result = vkCreateRenderPass(device_, &create_info, nullptr,
+                                              &mrt_render_passes_[n - 2]);
+        if (result != VK_SUCCESS) return result;
+
+        char rp_name[64];
+        snprintf(rp_name, sizeof(rp_name), "RenderPass_MRT_%uColor+Depth", n);
+        set_object_name(VK_OBJECT_TYPE_RENDER_PASS,
+                        reinterpret_cast<u64>(mrt_render_passes_[n - 2]),
+                        rp_name);
+    }
+
+    LOGD("MRT render passes created (2-4 color attachments)");
+    return VK_SUCCESS;
 }
 
 VkResult VulkanBackend::create_framebuffers() {
     framebuffers_.resize(swapchain_image_views_.size());
-    
+
     for (size_t i = 0; i < swapchain_image_views_.size(); i++) {
+        VkImageView fb_attachments[] = {
+            swapchain_image_views_[i],
+            depth_image_.view
+        };
+
         VkFramebufferCreateInfo create_info = {};
         create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         create_info.renderPass = render_pass_;
-        create_info.attachmentCount = 1;
-        create_info.pAttachments = &swapchain_image_views_[i];
+        create_info.attachmentCount = 2;
+        create_info.pAttachments = fb_attachments;
         create_info.width = swapchain_extent_.width;
         create_info.height = swapchain_extent_.height;
         create_info.layers = 1;
-        
+
         VkResult result = vkCreateFramebuffer(device_, &create_info, nullptr, &framebuffers_[i]);
         if (result != VK_SUCCESS) return result;
     }
-    
+
     return VK_SUCCESS;
 }
 
@@ -524,60 +745,104 @@ VkResult VulkanBackend::create_sync_objects() {
 }
 
 VkResult VulkanBackend::create_descriptor_resources() {
-    // Create descriptor set layout for Xbox 360 shader constants
-    VkDescriptorSetLayoutBinding bindings[3] = {};
-    
+    // Set 0: Uniform buffers for Xbox 360 shader constants
+    VkDescriptorSetLayoutBinding uniform_bindings[4] = {};
+
     // Vertex constants (256 vec4)
-    bindings[0].binding = 0;
-    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    bindings[0].descriptorCount = 1;
-    bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    
+    uniform_bindings[0].binding = 0;
+    uniform_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    uniform_bindings[0].descriptorCount = 1;
+    uniform_bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
     // Pixel constants (256 vec4)
-    bindings[1].binding = 1;
-    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    bindings[1].descriptorCount = 1;
-    bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    
-    // Samplers (16 texture units)
-    bindings[2].binding = 2;
-    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    bindings[2].descriptorCount = 16;
-    bindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    
-    VkDescriptorSetLayoutCreateInfo layout_info = {};
-    layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layout_info.bindingCount = 3;
-    layout_info.pBindings = bindings;
-    
-    VkDescriptorSetLayout layout;
-    VkResult result = vkCreateDescriptorSetLayout(device_, &layout_info, nullptr, &layout);
+    uniform_bindings[1].binding = 1;
+    uniform_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    uniform_bindings[1].descriptorCount = 1;
+    uniform_bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    // Bool constants
+    uniform_bindings[2].binding = 2;
+    uniform_bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    uniform_bindings[2].descriptorCount = 1;
+    uniform_bindings[2].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    // Loop constants
+    uniform_bindings[3].binding = 3;
+    uniform_bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    uniform_bindings[3].descriptorCount = 1;
+    uniform_bindings[3].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutCreateInfo uniform_layout_info = {};
+    uniform_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    uniform_layout_info.bindingCount = 4;
+    uniform_layout_info.pBindings = uniform_bindings;
+
+    VkDescriptorSetLayout uniform_layout;
+    VkResult result = vkCreateDescriptorSetLayout(device_, &uniform_layout_info, nullptr, &uniform_layout);
     if (result != VK_SUCCESS) return result;
-    descriptor_set_layouts_.push_back(layout);
-    
-    // Create pipeline layout
+    descriptor_set_layouts_.push_back(uniform_layout);
+
+    // Set 1: Combined image samplers (16 texture units)
+    VkDescriptorSetLayoutBinding sampler_bindings[16] = {};
+    for (u32 i = 0; i < 16; i++) {
+        sampler_bindings[i].binding = i;
+        sampler_bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        sampler_bindings[i].descriptorCount = 1;
+        sampler_bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+
+    VkDescriptorSetLayoutCreateInfo sampler_layout_info = {};
+    sampler_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    sampler_layout_info.bindingCount = 16;
+    sampler_layout_info.pBindings = sampler_bindings;
+
+    VkDescriptorSetLayout sampler_layout;
+    result = vkCreateDescriptorSetLayout(device_, &sampler_layout_info, nullptr, &sampler_layout);
+    if (result != VK_SUCCESS) return result;
+    descriptor_set_layouts_.push_back(sampler_layout);
+
+    // Set 2: Storage buffer for memexport (SSBO)
+    VkDescriptorSetLayoutBinding ssbo_binding{};
+    ssbo_binding.binding = 0;
+    ssbo_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    ssbo_binding.descriptorCount = 1;
+    ssbo_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+    VkDescriptorSetLayoutCreateInfo ssbo_layout_info{};
+    ssbo_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    ssbo_layout_info.bindingCount = 1;
+    ssbo_layout_info.pBindings = &ssbo_binding;
+
+    VkDescriptorSetLayout ssbo_layout;
+    result = vkCreateDescriptorSetLayout(device_, &ssbo_layout_info, nullptr, &ssbo_layout);
+    if (result != VK_SUCCESS) return result;
+    descriptor_set_layouts_.push_back(ssbo_layout);
+
+    // Create pipeline layout with all descriptor set layouts
     VkPipelineLayoutCreateInfo pipeline_layout_info = {};
     pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipeline_layout_info.setLayoutCount = 1;
-    pipeline_layout_info.pSetLayouts = &layout;
-    
+    pipeline_layout_info.setLayoutCount = static_cast<u32>(descriptor_set_layouts_.size());
+    pipeline_layout_info.pSetLayouts = descriptor_set_layouts_.data();
+
     result = vkCreatePipelineLayout(device_, &pipeline_layout_info, nullptr, &pipeline_layout_);
     if (result != VK_SUCCESS) return result;
-    
+
     // Create descriptor pool
     VkDescriptorPoolSize pool_sizes[3] = {};
     pool_sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     pool_sizes[0].descriptorCount = 256;
     pool_sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     pool_sizes[1].descriptorCount = 1024;
-    
+    pool_sizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    pool_sizes[2].descriptorCount = 16;
+
     VkDescriptorPoolCreateInfo pool_info = {};
     pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool_info.poolSizeCount = 2;
+    pool_info.poolSizeCount = 3;
     pool_info.pPoolSizes = pool_sizes;
-    pool_info.maxSets = 128;
+    pool_info.maxSets = 256;
     pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    
+
     return vkCreateDescriptorPool(device_, &pool_info, nullptr, &descriptor_pool_);
 }
 
@@ -618,7 +883,11 @@ VkResult VulkanBackend::create_edram_resources() {
     result = vkAllocateMemory(device_, &alloc_info, nullptr, &edram_memory_);
     if (result != VK_SUCCESS) return result;
     
-    return vkBindBufferMemory(device_, edram_buffer_, edram_memory_, 0);
+    VkResult bind_result = vkBindBufferMemory(device_, edram_buffer_, edram_memory_, 0);
+    if (bind_result == VK_SUCCESS) {
+        set_object_name(VK_OBJECT_TYPE_BUFFER, reinterpret_cast<u64>(edram_buffer_), "eDRAM_10MB");
+    }
+    return bind_result;
 }
 
 //=============================================================================
@@ -630,15 +899,26 @@ Status VulkanBackend::begin_frame() {
     if (swapchain_ == VK_NULL_HANDLE) {
         return Status::ErrorSwapchain;
     }
-    
+
+    // Recreate swapchain if present mode changed
+    if (swapchain_needs_recreation_) {
+        vkDeviceWaitIdle(device_);
+        cleanup_swapchain();
+        create_swapchain();
+        create_depth_resources();
+        create_framebuffers();
+        swapchain_needs_recreation_ = false;
+        LOGI("Swapchain recreated with present mode %d", present_mode_);
+    }
+
     // Wait for previous frame
     vkWaitForFences(device_, 1, &in_flight_fences_[current_frame_], VK_TRUE, UINT64_MAX);
-    
+
     // Acquire next image
     VkResult result = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX,
                                             image_available_semaphores_[current_frame_],
                                             VK_NULL_HANDLE, &current_image_index_);
-    
+
     if (result == VK_ERROR_OUT_OF_DATE_KHR) {
         // Need to recreate swapchain
         return Status::ErrorSwapchain;
@@ -653,7 +933,13 @@ Status VulkanBackend::begin_frame() {
     VkCommandBufferBeginInfo begin_info = {};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     vkBeginCommandBuffer(cmd, &begin_info);
-    
+
+    // Debug label: frame boundary (visible in RenderDoc/AGI)
+    frame_number_++;
+    char frame_label[64];
+    snprintf(frame_label, sizeof(frame_label), "Frame %llu", (unsigned long long)frame_number_);
+    cmd_begin_label(frame_label, 0.2f, 0.8f, 0.2f);
+
     // Begin render pass
     VkRenderPassBeginInfo rp_info = {};
     rp_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -662,12 +948,11 @@ Status VulkanBackend::begin_frame() {
     rp_info.renderArea.offset = {0, 0};
     rp_info.renderArea.extent = swapchain_extent_;
     
-    VkClearValue clear_value = {};
-    // Use a visible purple color so we can see rendering is working
-    // (will be replaced with actual game graphics when GPU emulation is complete)
-    clear_value.color = {{0.2f, 0.0f, 0.3f, 1.0f}};
-    rp_info.clearValueCount = 1;
-    rp_info.pClearValues = &clear_value;
+    VkClearValue clear_values[2] = {};
+    clear_values[0].color = {{0.2f, 0.0f, 0.3f, 1.0f}};
+    clear_values[1].depthStencil = {1.0f, 0};
+    rp_info.clearValueCount = 2;
+    rp_info.pClearValues = clear_values;
     
     vkCmdBeginRenderPass(cmd, &rp_info, VK_SUBPASS_CONTENTS_INLINE);
     
@@ -691,8 +976,14 @@ Status VulkanBackend::begin_frame() {
 
 Status VulkanBackend::end_frame() {
     VkCommandBuffer cmd = command_buffers_[current_frame_];
-    
+
     vkCmdEndRenderPass(cmd);
+
+    // Close frame debug label
+    cmd_end_label();
+
+    cmd_insert_label("Present", 0.8f, 0.8f, 0.2f);
+
     vkEndCommandBuffer(cmd);
     
     // Submit
@@ -755,10 +1046,16 @@ VkPipeline VulkanBackend::get_or_create_pipeline(const PipelineState& state,
     stages[1].module = fragment_shader;
     stages[1].pName = "main";
     
-    // Vertex input - Xbox 360 uses custom vertex formats
+    // Vertex input from Xbox 360 fetch constants
     VkPipelineVertexInputStateCreateInfo vertex_input = {};
     vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    
+    vertex_input.vertexBindingDescriptionCount = state.vertex_input.binding_count;
+    vertex_input.pVertexBindingDescriptions = state.vertex_input.binding_count > 0 ?
+        state.vertex_input.bindings : nullptr;
+    vertex_input.vertexAttributeDescriptionCount = state.vertex_input.attribute_count;
+    vertex_input.pVertexAttributeDescriptions = state.vertex_input.attribute_count > 0 ?
+        state.vertex_input.attributes : nullptr;
+
     VkPipelineInputAssemblyStateCreateInfo input_assembly = {};
     input_assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     input_assembly.topology = state.primitive_topology;
@@ -791,21 +1088,25 @@ VkPipeline VulkanBackend::get_or_create_pipeline(const PipelineState& state,
     depth_stencil.depthCompareOp = state.depth_compare_op;
     depth_stencil.stencilTestEnable = state.stencil_test_enable;
     
-    VkPipelineColorBlendAttachmentState blend_attachment = {};
-    blend_attachment.colorWriteMask = state.color_write_mask;
-    blend_attachment.blendEnable = state.blend_enable;
-    blend_attachment.srcColorBlendFactor = state.src_color_blend;
-    blend_attachment.dstColorBlendFactor = state.dst_color_blend;
-    blend_attachment.colorBlendOp = state.color_blend_op;
-    blend_attachment.srcAlphaBlendFactor = state.src_alpha_blend;
-    blend_attachment.dstAlphaBlendFactor = state.dst_alpha_blend;
-    blend_attachment.alphaBlendOp = state.alpha_blend_op;
-    
+    // MRT support: create blend attachment for each color target
+    std::vector<VkPipelineColorBlendAttachmentState> blend_attachments(state.color_attachment_count);
+    for (u32 i = 0; i < state.color_attachment_count; i++) {
+        blend_attachments[i] = {};
+        blend_attachments[i].colorWriteMask = state.color_write_mask;
+        blend_attachments[i].blendEnable = state.blend_enable;
+        blend_attachments[i].srcColorBlendFactor = state.src_color_blend;
+        blend_attachments[i].dstColorBlendFactor = state.dst_color_blend;
+        blend_attachments[i].colorBlendOp = state.color_blend_op;
+        blend_attachments[i].srcAlphaBlendFactor = state.src_alpha_blend;
+        blend_attachments[i].dstAlphaBlendFactor = state.dst_alpha_blend;
+        blend_attachments[i].alphaBlendOp = state.alpha_blend_op;
+    }
+
     VkPipelineColorBlendStateCreateInfo color_blending = {};
     color_blending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     color_blending.logicOpEnable = VK_FALSE;
-    color_blending.attachmentCount = 1;
-    color_blending.pAttachments = &blend_attachment;
+    color_blending.attachmentCount = state.color_attachment_count;
+    color_blending.pAttachments = blend_attachments.data();
     
     VkDynamicState dynamic_states[] = {
         VK_DYNAMIC_STATE_VIEWPORT,
@@ -829,19 +1130,26 @@ VkPipeline VulkanBackend::get_or_create_pipeline(const PipelineState& state,
     pipeline_info.pDepthStencilState = &depth_stencil;
     pipeline_info.pColorBlendState = &color_blending;
     pipeline_info.pDynamicState = &dynamic_state;
-    pipeline_info.layout = pipeline_layout_;
-    pipeline_info.renderPass = render_pass_;
+    pipeline_info.layout = active_pipeline_layout();
+    pipeline_info.renderPass = get_render_pass(state.color_attachment_count);
     pipeline_info.subpass = 0;
     
     VkPipeline pipeline;
-    VkResult result = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipeline_info,
+    VkResult result = vkCreateGraphicsPipelines(device_, vk_pipeline_cache_, 1, &pipeline_info,
                                                  nullptr, &pipeline);
     
     if (result == VK_SUCCESS) {
         pipeline_cache_[hash] = pipeline;
+
+        // Label pipeline for debugger (hash identifies shader combination)
+        char name[64];
+        snprintf(name, sizeof(name), "Pipeline %016llx", (unsigned long long)hash);
+        set_object_name(VK_OBJECT_TYPE_PIPELINE,
+                       reinterpret_cast<u64>(pipeline), name);
+
         return pipeline;
     }
-    
+
     LOGE("Failed to create pipeline: %d", result);
     return VK_NULL_HANDLE;
 }
@@ -892,14 +1200,39 @@ void VulkanBackend::bind_vertex_buffer(VkBuffer buffer, VkDeviceSize offset) {
     vkCmdBindVertexBuffers(cmd, 0, 1, &buffer, &offset);
 }
 
+void VulkanBackend::bind_vertex_buffers(u32 first_binding, u32 count,
+                                         const VkBuffer* buffers, const VkDeviceSize* offsets) {
+    VkCommandBuffer cmd = command_buffers_[current_frame_];
+    vkCmdBindVertexBuffers(cmd, first_binding, count, buffers, offsets);
+}
+
 void VulkanBackend::bind_index_buffer(VkBuffer buffer, VkDeviceSize offset, VkIndexType type) {
     VkCommandBuffer cmd = command_buffers_[current_frame_];
     vkCmdBindIndexBuffer(cmd, buffer, offset, type);
 }
 
-void VulkanBackend::bind_descriptor_set(VkDescriptorSet set) {
+void VulkanBackend::bind_descriptor_set(VkDescriptorSet set, u32 first_set) {
     VkCommandBuffer cmd = command_buffers_[current_frame_];
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, active_pipeline_layout(), first_set, 1, &set, 0, nullptr);
+}
+
+void VulkanBackend::set_viewport(float x, float y, float w, float h,
+                                  float min_depth, float max_depth) {
+    VkCommandBuffer cmd = command_buffers_[current_frame_];
+    VkViewport viewport = {x, y, w, h, min_depth, max_depth};
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+}
+
+void VulkanBackend::set_scissor(s32 x, s32 y, u32 w, u32 h) {
+    VkCommandBuffer cmd = command_buffers_[current_frame_];
+    VkRect2D scissor = {{x, y}, {w, h}};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+}
+
+VkRenderPass VulkanBackend::get_render_pass(u32 color_attachment_count) const {
+    if (color_attachment_count <= 1) return render_pass_;
+    if (color_attachment_count > MAX_MRT_TARGETS) return render_pass_;
+    return mrt_render_passes_[color_attachment_count - 2];
 }
 
 //=============================================================================
@@ -971,6 +1304,17 @@ VulkanBuffer VulkanBackend::create_buffer(u64 size, VkBufferUsageFlags usage,
         vkMapMemory(device_, buffer.memory, 0, size, 0, &buffer.mapped);
     }
     
+    // Label buffer for GPU captures
+    const char* usage_str = "Buffer";
+    if (usage & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) usage_str = "VertexBuffer";
+    else if (usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT) usage_str = "IndexBuffer";
+    else if (usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) usage_str = "UniformBuffer";
+    else if (usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) usage_str = "StorageBuffer";
+    else if (usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) usage_str = "StagingBuffer";
+    char buf_name[64];
+    snprintf(buf_name, sizeof(buf_name), "%s_%lluB", usage_str, (unsigned long long)size);
+    set_object_name(VK_OBJECT_TYPE_BUFFER, reinterpret_cast<u64>(buffer.buffer), buf_name);
+
     LOGD("Created buffer: size=%llu, usage=%u", (unsigned long long)size, usage);
     return buffer;
 }
@@ -989,6 +1333,61 @@ void VulkanBackend::destroy_buffer(VulkanBuffer& buffer) {
     buffer.buffer = VK_NULL_HANDLE;
     buffer.memory = VK_NULL_HANDLE;
     buffer.size = 0;
+}
+
+VkDescriptorSet VulkanBackend::get_memexport_descriptor_set() {
+    // Lazy init: create buffer and descriptor set on first use
+    if (memexport_descriptor_set_ != VK_NULL_HANDLE) {
+        return memexport_descriptor_set_;
+    }
+
+    // Create SSBO buffer for memexport writes
+    memexport_buffer_ = create_buffer(
+        MEMEXPORT_BUFFER_SIZE,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    if (memexport_buffer_.buffer == VK_NULL_HANDLE) {
+        LOGE("Failed to create memexport SSBO buffer");
+        return VK_NULL_HANDLE;
+    }
+
+    // Allocate descriptor set from set layout index 2 (SSBO layout)
+    if (descriptor_set_layouts_.size() < 3) {
+        LOGE("SSBO descriptor set layout not available (need set index 2)");
+        return VK_NULL_HANDLE;
+    }
+
+    VkDescriptorSetAllocateInfo alloc_info{};
+    alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    alloc_info.descriptorPool = descriptor_pool_;
+    alloc_info.descriptorSetCount = 1;
+    alloc_info.pSetLayouts = &descriptor_set_layouts_[2];
+
+    if (vkAllocateDescriptorSets(device_, &alloc_info, &memexport_descriptor_set_) != VK_SUCCESS) {
+        LOGE("Failed to allocate memexport descriptor set");
+        return VK_NULL_HANDLE;
+    }
+
+    // Write SSBO binding
+    VkDescriptorBufferInfo buffer_info{};
+    buffer_info.buffer = memexport_buffer_.buffer;
+    buffer_info.offset = 0;
+    buffer_info.range = MEMEXPORT_BUFFER_SIZE;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = memexport_descriptor_set_;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &buffer_info;
+
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+
+    LOGI("Memexport SSBO initialized (%llu bytes)", (unsigned long long)MEMEXPORT_BUFFER_SIZE);
+    return memexport_descriptor_set_;
 }
 
 VulkanImage VulkanBackend::create_image(u32 width, u32 height, VkFormat format,
@@ -1076,6 +1475,11 @@ VulkanImage VulkanBackend::create_image(u32 width, u32 height, VkFormat format,
         return image;
     }
     
+    // Label image for GPU captures
+    char img_name[64];
+    snprintf(img_name, sizeof(img_name), "Image_%ux%u_fmt%d", width, height, format);
+    set_object_name(VK_OBJECT_TYPE_IMAGE, reinterpret_cast<u64>(image.image), img_name);
+
     LOGD("Created image: %ux%u, format=%d", width, height, format);
     return image;
 }
@@ -1317,7 +1721,10 @@ void VulkanBackend::cleanup_swapchain() {
         vkDestroyFramebuffer(device_, fb, nullptr);
     }
     framebuffers_.clear();
-    
+
+    // Destroy depth resources
+    destroy_image(depth_image_);
+
     // Destroy image views
     for (auto view : swapchain_image_views_) {
         vkDestroyImageView(device_, view, nullptr);
@@ -1335,12 +1742,13 @@ void VulkanBackend::cleanup_swapchain() {
 
 Status VulkanBackend::resize(u32 width, u32 height) {
     if (device_ == VK_NULL_HANDLE) return Status::Error;
-    
+
     // Wait for device idle
     vkDeviceWaitIdle(device_);
-    
-    width_ = width;
-    height_ = height;
+
+    // 0,0 means recreate at current dimensions (swapchain error recovery)
+    if (width > 0) width_ = width;
+    if (height > 0) height_ = height;
     
     // Cleanup old swapchain resources
     cleanup_swapchain();
@@ -1351,7 +1759,14 @@ Status VulkanBackend::resize(u32 width, u32 height) {
         LOGE("Failed to recreate swapchain: %d", result);
         return Status::ErrorSwapchain;
     }
-    
+
+    // Recreate depth resources
+    result = create_depth_resources();
+    if (result != VK_SUCCESS) {
+        LOGE("Failed to recreate depth resources: %d", result);
+        return Status::ErrorSwapchain;
+    }
+
     // Recreate framebuffers
     result = create_framebuffers();
     if (result != VK_SUCCESS) {
@@ -1366,6 +1781,14 @@ Status VulkanBackend::resize(u32 width, u32 height) {
 //=============================================================================
 // Test/Debug Functions
 //=============================================================================
+
+void VulkanBackend::set_present_mode(VkPresentModeKHR mode) {
+    if (present_mode_ != mode) {
+        present_mode_ = mode;
+        swapchain_needs_recreation_ = true;
+        LOGI("Present mode changed to %d, swapchain will be recreated", mode);
+    }
+}
 
 void VulkanBackend::clear_screen(float r, float g, float b) {
     // Wait for previous frame
@@ -1448,6 +1871,327 @@ void VulkanBackend::clear_screen(float r, float g, float b) {
     
     current_frame_ = (current_frame_ + 1) % MAX_FRAMES_IN_FLIGHT;
 }
+
+//=============================================================================
+// Occlusion Query Management
+//=============================================================================
+
+Status VulkanBackend::create_query_pool(u32 max_queries) {
+    if (device_ == VK_NULL_HANDLE) return Status::Error;
+    if (query_pool_ != VK_NULL_HANDLE) destroy_query_pool();
+
+    VkQueryPoolCreateInfo pool_info = {};
+    pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    pool_info.queryType = VK_QUERY_TYPE_OCCLUSION;
+    pool_info.queryCount = max_queries;
+
+    VkResult result = vkCreateQueryPool(device_, &pool_info, nullptr, &query_pool_);
+    if (result != VK_SUCCESS) {
+        LOGE("Failed to create occlusion query pool: %d", result);
+        return Status::Error;
+    }
+
+    query_pool_size_ = max_queries;
+    LOGI("Created occlusion query pool with %u queries", max_queries);
+
+    // Create result buffer for conditional rendering fallback
+    query_result_buffer_ = create_buffer(
+        max_queries * sizeof(u64),
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    // Probe for VK_EXT_conditional_rendering
+    pfn_begin_conditional_ = reinterpret_cast<PFN_vkCmdBeginConditionalRenderingEXT>(
+        vkGetDeviceProcAddr(device_, "vkCmdBeginConditionalRenderingEXT"));
+    pfn_end_conditional_ = reinterpret_cast<PFN_vkCmdEndConditionalRenderingEXT>(
+        vkGetDeviceProcAddr(device_, "vkCmdEndConditionalRenderingEXT"));
+    has_conditional_rendering_ext_ = (pfn_begin_conditional_ != nullptr &&
+                                       pfn_end_conditional_ != nullptr);
+
+    if (has_conditional_rendering_ext_) {
+        LOGI("VK_EXT_conditional_rendering available");
+    } else {
+        LOGI("VK_EXT_conditional_rendering not available, using CPU fallback");
+    }
+
+    return Status::Ok;
+}
+
+void VulkanBackend::destroy_query_pool() {
+    if (device_ == VK_NULL_HANDLE) return;
+    if (query_pool_ != VK_NULL_HANDLE) {
+        vkDestroyQueryPool(device_, query_pool_, nullptr);
+        query_pool_ = VK_NULL_HANDLE;
+        query_pool_size_ = 0;
+    }
+    if (query_result_buffer_.buffer != VK_NULL_HANDLE) {
+        destroy_buffer(query_result_buffer_);
+    }
+}
+
+void VulkanBackend::begin_occlusion_query(u32 query_index) {
+    if (query_pool_ == VK_NULL_HANDLE || query_index >= query_pool_size_) return;
+    VkCommandBuffer cmd = current_command_buffer();
+    if (cmd == VK_NULL_HANDLE) return;
+
+    vkCmdBeginQuery(cmd, query_pool_, query_index, VK_QUERY_CONTROL_PRECISE_BIT);
+}
+
+void VulkanBackend::end_occlusion_query(u32 query_index) {
+    if (query_pool_ == VK_NULL_HANDLE || query_index >= query_pool_size_) return;
+    VkCommandBuffer cmd = current_command_buffer();
+    if (cmd == VK_NULL_HANDLE) return;
+
+    vkCmdEndQuery(cmd, query_pool_, query_index);
+}
+
+void VulkanBackend::reset_queries(u32 first_query, u32 count) {
+    if (query_pool_ == VK_NULL_HANDLE) return;
+    if (first_query + count > query_pool_size_) {
+        count = query_pool_size_ - first_query;
+    }
+    VkCommandBuffer cmd = current_command_buffer();
+    if (cmd == VK_NULL_HANDLE) return;
+
+    vkCmdResetQueryPool(cmd, query_pool_, first_query, count);
+}
+
+bool VulkanBackend::get_query_result(u32 query_index, u64& result) {
+    if (query_pool_ == VK_NULL_HANDLE || query_index >= query_pool_size_) return false;
+
+    VkResult vk_result = vkGetQueryPoolResults(
+        device_, query_pool_, query_index, 1,
+        sizeof(u64), &result, sizeof(u64),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+
+    return vk_result == VK_SUCCESS;
+}
+
+void VulkanBackend::begin_conditional_rendering(u32 query_index, bool inverted) {
+    if (query_pool_ == VK_NULL_HANDLE || query_index >= query_pool_size_) return;
+    VkCommandBuffer cmd = current_command_buffer();
+    if (cmd == VK_NULL_HANDLE) return;
+
+    if (has_conditional_rendering_ext_ && query_result_buffer_.buffer != VK_NULL_HANDLE) {
+        // Copy query result to the conditional rendering buffer
+        vkCmdCopyQueryPoolResults(cmd, query_pool_, query_index, 1,
+                                   query_result_buffer_.buffer,
+                                   query_index * sizeof(u64),
+                                   sizeof(u64),
+                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+
+        // Memory barrier: transfer write → conditional read
+        VkBufferMemoryBarrier barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT;
+        barrier.buffer = query_result_buffer_.buffer;
+        barrier.offset = query_index * sizeof(u64);
+        barrier.size = sizeof(u64);
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT,
+                             0, 0, nullptr, 1, &barrier, 0, nullptr);
+
+        VkConditionalRenderingBeginInfoEXT cond_info = {};
+        cond_info.sType = VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT;
+        cond_info.buffer = query_result_buffer_.buffer;
+        cond_info.offset = query_index * sizeof(u64);
+        if (inverted) {
+            cond_info.flags = VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT;
+        }
+        pfn_begin_conditional_(cmd, &cond_info);
+    }
+    // CPU fallback is handled by CommandProcessor checking query results directly
+}
+
+void VulkanBackend::end_conditional_rendering() {
+    if (!has_conditional_rendering_ext_) return;
+    VkCommandBuffer cmd = current_command_buffer();
+    if (cmd == VK_NULL_HANDLE) return;
+
+    pfn_end_conditional_(cmd);
+}
+
+bool VulkanBackend::save_pipeline_cache(const std::string& path) {
+    if (device_ == VK_NULL_HANDLE || vk_pipeline_cache_ == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    size_t data_size = 0;
+    VkResult result = vkGetPipelineCacheData(device_, vk_pipeline_cache_, &data_size, nullptr);
+    if (result != VK_SUCCESS || data_size == 0) {
+        LOGW("Failed to get pipeline cache size: %d", result);
+        return false;
+    }
+
+    std::vector<u8> data(data_size);
+    result = vkGetPipelineCacheData(device_, vk_pipeline_cache_, &data_size, data.data());
+    if (result != VK_SUCCESS) {
+        LOGW("Failed to get pipeline cache data: %d", result);
+        return false;
+    }
+
+    std::ofstream file(path, std::ios::binary);
+    if (!file) {
+        LOGW("Failed to open pipeline cache file for writing: %s", path.c_str());
+        return false;
+    }
+
+    file.write(reinterpret_cast<const char*>(data.data()), data_size);
+    LOGI("Saved pipeline cache: %zu bytes to %s", data_size, path.c_str());
+    return true;
+}
+
+bool VulkanBackend::load_pipeline_cache(const std::string& path) {
+    if (device_ == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        return false;  // No cache file yet, not an error
+    }
+
+    size_t data_size = static_cast<size_t>(file.tellg());
+    if (data_size == 0) {
+        return false;
+    }
+
+    file.seekg(0);
+    std::vector<u8> data(data_size);
+    file.read(reinterpret_cast<char*>(data.data()), data_size);
+
+    // Destroy old cache and create new one with loaded data
+    if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineCache(device_, vk_pipeline_cache_, nullptr);
+    }
+
+    VkPipelineCacheCreateInfo cache_info = {};
+    cache_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    cache_info.initialDataSize = data_size;
+    cache_info.pInitialData = data.data();
+
+    VkResult result = vkCreatePipelineCache(device_, &cache_info, nullptr, &vk_pipeline_cache_);
+    if (result != VK_SUCCESS) {
+        LOGW("Failed to create pipeline cache from file: %d", result);
+        // Create empty cache as fallback
+        cache_info.initialDataSize = 0;
+        cache_info.pInitialData = nullptr;
+        vkCreatePipelineCache(device_, &cache_info, nullptr, &vk_pipeline_cache_);
+        return false;
+    }
+
+    LOGI("Loaded pipeline cache: %zu bytes from %s", data_size, path.c_str());
+    return true;
+}
+
+//=============================================================================
+// Debug Utils Implementation
+//=============================================================================
+
+void VulkanBackend::setup_debug_utils() {
+    if (instance_ == VK_NULL_HANDLE) return;
+
+    // Load debug utils function pointers (available when VK_EXT_debug_utils is enabled)
+    pfn_create_debug_messenger_ = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+        vkGetInstanceProcAddr(instance_, "vkCreateDebugUtilsMessengerEXT"));
+    pfn_destroy_debug_messenger_ = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+        vkGetInstanceProcAddr(instance_, "vkDestroyDebugUtilsMessengerEXT"));
+    pfn_set_debug_name_ = reinterpret_cast<PFN_vkSetDebugUtilsObjectNameEXT>(
+        vkGetInstanceProcAddr(instance_, "vkSetDebugUtilsObjectNameEXT"));
+    pfn_cmd_begin_label_ = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(
+        vkGetInstanceProcAddr(instance_, "vkCmdBeginDebugUtilsLabelEXT"));
+    pfn_cmd_end_label_ = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(
+        vkGetInstanceProcAddr(instance_, "vkCmdEndDebugUtilsLabelEXT"));
+    pfn_cmd_insert_label_ = reinterpret_cast<PFN_vkCmdInsertDebugUtilsLabelEXT>(
+        vkGetInstanceProcAddr(instance_, "vkCmdInsertDebugUtilsLabelEXT"));
+
+    if (!pfn_create_debug_messenger_) {
+        LOGD("VK_EXT_debug_utils not available (release build or unsupported driver)");
+        return;
+    }
+
+    // Create debug messenger with comprehensive severity/type filtering
+    VkDebugUtilsMessengerCreateInfoEXT messenger_info = {};
+    messenger_info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+    messenger_info.messageSeverity =
+        VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT |
+        VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT;
+    messenger_info.messageType =
+        VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+        VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+        VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+    messenger_info.pfnUserCallback = vulkan_debug_callback;
+    messenger_info.pUserData = nullptr;
+
+    VkResult result = pfn_create_debug_messenger_(instance_, &messenger_info, nullptr, &debug_messenger_);
+    if (result != VK_SUCCESS) {
+        LOGW("Failed to create debug messenger: %d", result);
+        debug_messenger_ = VK_NULL_HANDLE;
+    } else {
+        LOGI("Vulkan debug messenger created (validation errors + warnings)");
+    }
+}
+
+void VulkanBackend::destroy_debug_utils() {
+    if (debug_messenger_ != VK_NULL_HANDLE && pfn_destroy_debug_messenger_) {
+        pfn_destroy_debug_messenger_(instance_, debug_messenger_, nullptr);
+        debug_messenger_ = VK_NULL_HANDLE;
+    }
+    pfn_set_debug_name_ = nullptr;
+    pfn_cmd_begin_label_ = nullptr;
+    pfn_cmd_end_label_ = nullptr;
+    pfn_cmd_insert_label_ = nullptr;
+    pfn_create_debug_messenger_ = nullptr;
+    pfn_destroy_debug_messenger_ = nullptr;
+}
+
+void VulkanBackend::set_object_name(VkObjectType type, u64 handle, const char* name) {
+    if (!pfn_set_debug_name_ || device_ == VK_NULL_HANDLE || !name) return;
+
+    VkDebugUtilsObjectNameInfoEXT name_info = {};
+    name_info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+    name_info.objectType = type;
+    name_info.objectHandle = handle;
+    name_info.pObjectName = name;
+
+    pfn_set_debug_name_(device_, &name_info);
+}
+
+void VulkanBackend::cmd_begin_label(const char* label, float r, float g, float b, float a) {
+    if (!pfn_cmd_begin_label_ || current_frame_ >= command_buffers_.size()) return;
+
+    VkDebugUtilsLabelEXT label_info = {};
+    label_info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+    label_info.pLabelName = label;
+    label_info.color[0] = r;
+    label_info.color[1] = g;
+    label_info.color[2] = b;
+    label_info.color[3] = a;
+
+    pfn_cmd_begin_label_(command_buffers_[current_frame_], &label_info);
+}
+
+void VulkanBackend::cmd_end_label() {
+    if (!pfn_cmd_end_label_ || current_frame_ >= command_buffers_.size()) return;
+    pfn_cmd_end_label_(command_buffers_[current_frame_]);
+}
+
+void VulkanBackend::cmd_insert_label(const char* label, float r, float g, float b, float a) {
+    if (!pfn_cmd_insert_label_ || current_frame_ >= command_buffers_.size()) return;
+
+    VkDebugUtilsLabelEXT label_info = {};
+    label_info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+    label_info.pLabelName = label;
+    label_info.color[0] = r;
+    label_info.color[1] = g;
+    label_info.color[2] = b;
+    label_info.color[3] = a;
+
+    pfn_cmd_insert_label_(command_buffers_[current_frame_], &label_info);
+}
+
 
 } // namespace x360mu
 

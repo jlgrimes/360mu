@@ -77,7 +77,19 @@ public:
     
     bool is_valid() const { return swapchain_ != VK_NULL_HANDLE; }
     bool needs_recreation() const { return needs_recreation_; }
-    
+
+    /**
+     * Set the desired present mode and mark for recreation
+     */
+    void set_present_mode(VkPresentModeKHR mode) {
+        if (config_.present_mode != mode) {
+            config_.present_mode = mode;
+            needs_recreation_ = true;
+        }
+    }
+
+    VkPresentModeKHR present_mode() const { return config_.present_mode; }
+
 private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;

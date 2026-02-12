@@ -86,35 +86,49 @@ ObjectTable::~ObjectTable() {
     objects_.clear();
 }
 
+u32 ObjectTable::allocate_handle() {
+    // NT-style handle allocation: 4-byte aligned incrementing
+    u32 handle = next_handle_;
+    next_handle_ += 4;
+    return handle;
+}
+
 u32 ObjectTable::add_object(std::shared_ptr<XObject> object) {
     std::lock_guard<std::mutex> lock(mutex_);
-    
-    u32 handle = next_handle_++;
+
+    u32 handle = allocate_handle();
     object->set_handle(handle);
+    // The object starts with refcount 1 (from construction).
+    // The handle table holds a shared_ptr which keeps it alive.
     objects_[handle] = object;
-    
+
     LOGD("Added object: handle=0x%08X, type=%u, name=%s",
          handle, static_cast<u32>(object->type()), object->name().c_str());
-    
+
     return handle;
 }
 
 bool ObjectTable::remove_handle(u32 handle) {
     std::lock_guard<std::mutex> lock(mutex_);
-    
+
     auto it = objects_.find(handle);
     if (it == objects_.end()) {
         return false;
     }
-    
-    LOGD("Removed object: handle=0x%08X", handle);
+
+    auto obj = it->second;
     objects_.erase(it);
+    // Release the handle's reference on the Xbox-side refcount
+    obj->release();
+
+    LOGD("Removed object: handle=0x%08X (refcount now %u)",
+         handle, obj->ref_count());
     return true;
 }
 
 std::shared_ptr<XObject> ObjectTable::lookup(u32 handle) {
     std::lock_guard<std::mutex> lock(mutex_);
-    
+
     auto it = objects_.find(handle);
     if (it == objects_.end()) {
         return nullptr;
@@ -122,11 +136,109 @@ std::shared_ptr<XObject> ObjectTable::lookup(u32 handle) {
     return it->second;
 }
 
+std::shared_ptr<XObject> ObjectTable::lookup_typed(u32 handle, XObjectType expected_type, u32* status_out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto it = objects_.find(handle);
+    if (it == objects_.end()) {
+        if (status_out) *status_out = nt_obj::STATUS_INVALID_HANDLE;
+        return nullptr;
+    }
+
+    auto& obj = it->second;
+    if (expected_type != XObjectType::None && obj->type() != expected_type) {
+        if (status_out) *status_out = nt_obj::STATUS_OBJECT_TYPE_MISMATCH;
+        LOGW("Type mismatch: handle=0x%08X, expected=%u, actual=%u",
+             handle, static_cast<u32>(expected_type), static_cast<u32>(obj->type()));
+        return nullptr;
+    }
+
+    if (status_out) *status_out = nt_obj::STATUS_SUCCESS;
+    return obj;
+}
+
+u32 ObjectTable::reference_object_by_handle(u32 handle, XObjectType expected_type,
+                                             std::shared_ptr<XObject>* out_object) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto it = objects_.find(handle);
+    if (it == objects_.end()) {
+        LOGW("ObReferenceObjectByHandle: invalid handle 0x%08X", handle);
+        return nt_obj::STATUS_INVALID_HANDLE;
+    }
+
+    auto& obj = it->second;
+    if (expected_type != XObjectType::None && obj->type() != expected_type) {
+        LOGW("ObReferenceObjectByHandle: type mismatch handle=0x%08X (expected=%u, got=%u)",
+             handle, static_cast<u32>(expected_type), static_cast<u32>(obj->type()));
+        return nt_obj::STATUS_OBJECT_TYPE_MISMATCH;
+    }
+
+    // Increment Xbox-side refcount (caller must eventually call release/ObDereferenceObject)
+    obj->retain();
+
+    if (out_object) {
+        *out_object = obj;
+    }
+
+    LOGD("ObReferenceObjectByHandle: handle=0x%08X, refcount=%u",
+         handle, obj->ref_count());
+    return nt_obj::STATUS_SUCCESS;
+}
+
+u32 ObjectTable::close_handle(u32 handle) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto it = objects_.find(handle);
+    if (it == objects_.end()) {
+        LOGW("NtClose: invalid handle 0x%08X", handle);
+        return nt_obj::STATUS_INVALID_HANDLE;
+    }
+
+    auto obj = it->second;
+    objects_.erase(it);
+
+    // Release the handle's reference. The object may still be alive
+    // if other references exist (e.g., wait list, ObReferenceObjectByHandle).
+    obj->release();
+
+    LOGD("NtClose: handle=0x%08X closed (refcount now %u)",
+         handle, obj->ref_count());
+    return nt_obj::STATUS_SUCCESS;
+}
+
+u32 ObjectTable::duplicate_handle(u32 source_handle, u32* target_handle_out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto it = objects_.find(source_handle);
+    if (it == objects_.end()) {
+        LOGW("NtDuplicateObject: invalid source handle 0x%08X", source_handle);
+        return nt_obj::STATUS_INVALID_HANDLE;
+    }
+
+    auto obj = it->second;
+
+    // Allocate new handle pointing to same object
+    u32 new_handle = allocate_handle();
+    objects_[new_handle] = obj;
+
+    // Increment Xbox-side refcount for the new handle
+    obj->retain();
+
+    if (target_handle_out) {
+        *target_handle_out = new_handle;
+    }
+
+    LOGD("NtDuplicateObject: 0x%08X -> 0x%08X (refcount=%u)",
+         source_handle, new_handle, obj->ref_count());
+    return nt_obj::STATUS_SUCCESS;
+}
+
 std::shared_ptr<XObject> ObjectTable::lookup_by_name(const std::string& name) {
     if (name.empty()) return nullptr;
-    
+
     std::lock_guard<std::mutex> lock(mutex_);
-    
+
     for (const auto& pair : objects_) {
         if (pair.second->name() == name) {
             return pair.second;
@@ -136,14 +248,18 @@ std::shared_ptr<XObject> ObjectTable::lookup_by_name(const std::string& name) {
 }
 
 size_t ObjectTable::object_count() const {
-    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex_));
+    std::lock_guard<std::mutex> lock(mutex_);
     return objects_.size();
 }
 
 void ObjectTable::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
+    // Release all handle references before clearing
+    for (auto& pair : objects_) {
+        pair.second->release();
+    }
     objects_.clear();
-    next_handle_ = 0x10000;
+    next_handle_ = 4;
 }
 
 //=============================================================================

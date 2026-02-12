@@ -7,6 +7,8 @@
 #include "render_target.h"
 #include "vulkan/vulkan_backend.h"
 #include "memory/memory.h"
+#include "xenos/gpu.h"
+#include "xenos/edram.h"
 #include <cstring>
 
 #ifdef __ANDROID__
@@ -661,19 +663,18 @@ void RenderTargetManager::resolve_to_memory(u32 rt_index, GuestAddr dest_address
                                              u32 dest_pitch, u32 width, u32 height) {
     if (rt_index >= MAX_COLOR_TARGETS || !color_targets_[rt_index].is_valid()) return;
     if (!memory_ || dest_address == 0) return;
-    
+
     const auto& rt = color_targets_[rt_index];
-    
+
     // Resolve Vulkan image to staging buffer
     resolve_render_target_to_buffer(rt, staging_buffer_, 0);
-    
+
     // Copy from staging to guest memory
     void* dest = memory_->get_host_ptr(dest_address);
     if (dest && staging_mapped_) {
-        // Handle pitch difference
-        u32 bytes_per_pixel = 4;  // Assume RGBA8 for now
+        u32 bytes_per_pixel = get_format_bytes_per_pixel(config_.color_format[rt_index]);
         u32 row_size = width * bytes_per_pixel;
-        
+
         if (dest_pitch == row_size) {
             memcpy(dest, staging_mapped_, row_size * height);
         } else {
@@ -684,7 +685,7 @@ void RenderTargetManager::resolve_to_memory(u32 rt_index, GuestAddr dest_address
             }
         }
     }
-    
+
     LOGD("Resolved RT%u to %08X (%ux%u)", rt_index, dest_address, width, height);
 }
 
@@ -692,14 +693,14 @@ void RenderTargetManager::copy_from_memory(u32 rt_index, GuestAddr src_address,
                                             u32 src_pitch, u32 width, u32 height) {
     if (rt_index >= MAX_COLOR_TARGETS || !color_targets_[rt_index].is_valid()) return;
     if (!memory_ || src_address == 0) return;
-    
+
     // Read from guest memory to staging buffer
     const void* src = memory_->get_host_ptr(src_address);
     if (!src || !staging_mapped_) return;
-    
-    u32 bytes_per_pixel = 4;
+
+    u32 bytes_per_pixel = get_format_bytes_per_pixel(config_.color_format[rt_index]);
     u32 row_size = width * bytes_per_pixel;
-    
+
     if (src_pitch == row_size) {
         memcpy(staging_mapped_, src, row_size * height);
     } else {
@@ -709,10 +710,10 @@ void RenderTargetManager::copy_from_memory(u32 rt_index, GuestAddr src_address,
                    row_size);
         }
     }
-    
-    // Upload to Vulkan image
-    // TODO: Implement buffer to image copy
-    
+
+    // Upload staging buffer to Vulkan image
+    copy_buffer_to_image(color_targets_[rt_index], staging_buffer_, 0);
+
     LOGD("Copied memory %08X to RT%u (%ux%u)", src_address, rt_index, width, height);
 }
 
@@ -766,6 +767,263 @@ void RenderTargetManager::resolve_render_target_to_buffer(const VulkanRenderTarg
     vkCmdPipelineBarrier(cmd,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+
+u32 RenderTargetManager::get_format_bytes_per_pixel(SurfaceFormat format) {
+    switch (format) {
+        case SurfaceFormat::k_5_6_5:
+        case SurfaceFormat::k_6_5_5:
+        case SurfaceFormat::k_1_5_5_5:
+        case SurfaceFormat::k_4_4_4_4:
+            return 2;
+
+        case SurfaceFormat::k_8_8_8_8:
+        case SurfaceFormat::k_8_8_8_8_GAMMA:
+        case SurfaceFormat::k_2_10_10_10:
+        case SurfaceFormat::k_2_10_10_10_FLOAT:
+        case SurfaceFormat::k_32_FLOAT:
+            return 4;
+
+        case SurfaceFormat::k_16_16:
+        case SurfaceFormat::k_16_16_FLOAT:
+            return 4;
+
+        case SurfaceFormat::k_16_16_16_16:
+        case SurfaceFormat::k_16_16_16_16_FLOAT:
+        case SurfaceFormat::k_32_32_FLOAT:
+            return 8;
+
+        case SurfaceFormat::k_32_32_32_32_FLOAT:
+            return 16;
+
+        default:
+            return 4;
+    }
+}
+
+void RenderTargetManager::update_from_registers(const u32* registers) {
+    using namespace xenos_reg;
+
+    // Parse RB_SURFACE_INFO for surface dimensions
+    u32 surface_info = registers[RB_SURFACE_INFO];
+    u32 surface_pitch = surface_info & 0x3FFF;  // bits 0-13: pitch in pixels
+    u32 msaa_mode = (surface_info >> 16) & 0x3; // bits 16-17: MSAA mode
+
+    // Parse RB_COLOR_INFO for RT0
+    u32 color_info[MAX_COLOR_TARGETS];
+    color_info[0] = registers[RB_COLOR_INFO];
+    color_info[1] = registers[RB_COLOR1_INFO];
+    color_info[2] = registers[RB_COLOR2_INFO];
+    color_info[3] = registers[RB_COLOR3_INFO];
+
+    for (u32 i = 0; i < MAX_COLOR_TARGETS; i++) {
+        u32 ci = color_info[i];
+        if (ci == 0) {
+            // Disabled
+            if (config_.color_enabled[i]) {
+                config_.color_enabled[i] = false;
+                current_framebuffer_ = nullptr;
+            }
+            continue;
+        }
+
+        // RB_COLOR_INFO format:
+        // bits 0-11: eDRAM base (in tiles, each tile = 5120 bytes)
+        // bits 16-19: color format
+        u32 edram_base = ci & 0xFFF;
+        SurfaceFormat format = static_cast<SurfaceFormat>((ci >> 16) & 0xF);
+
+        // Surface dimensions from RB_SURFACE_INFO
+        u32 width = surface_pitch;
+        u32 height = surface_pitch > 0 ? 720 : 0;  // Default to 720p height
+
+        // MSAA affects the effective resolution in eDRAM
+        u32 msaa_scale_x = (msaa_mode >= 2) ? 2 : 1;
+        u32 msaa_scale_y = (msaa_mode >= 1) ? 2 : 1;
+        (void)msaa_scale_x;
+        (void)msaa_scale_y;
+
+        set_color_target(i, edram_base, surface_pitch, format, width, height);
+    }
+
+    // Parse RB_DEPTH_INFO
+    u32 depth_info = registers[RB_DEPTH_INFO];
+    if (depth_info != 0) {
+        u32 depth_base = depth_info & 0xFFF;
+        // Depth format: bit 16 = 0 for D24S8, 1 for D24FS8
+        SurfaceFormat depth_format = SurfaceFormat::k_8_8_8_8;  // D24S8 placeholder
+        u32 width = surface_pitch;
+        u32 height = surface_pitch > 0 ? 720 : 0;
+
+        set_depth_target(depth_base, surface_pitch, depth_format, width, height);
+    }
+
+    // Also update EdramManager if available
+    if (edram_) {
+        for (u32 i = 0; i < MAX_COLOR_TARGETS; i++) {
+            if (config_.color_enabled[i]) {
+                RenderTargetConfig rt_config{};
+                rt_config.enabled = true;
+                rt_config.edram_base = config_.color_edram_base[i];
+                rt_config.edram_pitch = config_.color_pitch[i];
+                rt_config.format = static_cast<EdramSurfaceFormat>(
+                    static_cast<u32>(config_.color_format[i]));
+                rt_config.msaa = static_cast<EdramMsaaMode>(msaa_mode);
+                edram_->set_render_target(i, rt_config);
+            }
+        }
+
+        if (config_.depth_enabled) {
+            DepthStencilConfig ds_config{};
+            ds_config.enabled = true;
+            ds_config.edram_base = config_.depth_edram_base;
+            ds_config.edram_pitch = config_.depth_pitch;
+            ds_config.format = ((depth_info >> 16) & 0x1) ?
+                EdramDepthFormat::kD24FS8 : EdramDepthFormat::kD24S8;
+            ds_config.msaa = static_cast<EdramMsaaMode>(msaa_mode);
+            edram_->set_depth_stencil(ds_config);
+        }
+    }
+}
+
+void RenderTargetManager::resolve_edram_to_memory(const u32* registers) {
+    using namespace xenos_reg;
+
+    // Parse RB_COPY_CONTROL
+    u32 copy_control = registers[RB_COPY_CONTROL];
+    u32 copy_src_select = copy_control & 0x7;        // bits 0-2: source RT index (0-3=color, 4=depth)
+    u32 copy_command = (copy_control >> 20) & 0x3;   // bits 20-21: command (0=resolve, 1=convert, 2=clear)
+
+    // Parse RB_COPY_DEST_BASE - destination address in main memory
+    u32 copy_dest_base = registers[RB_COPY_DEST_BASE];
+    GuestAddr dest_address = copy_dest_base;
+
+    // Parse RB_COPY_DEST_PITCH
+    u32 copy_dest_pitch_reg = registers[RB_COPY_DEST_PITCH];
+    u32 dest_pitch = copy_dest_pitch_reg & 0x3FFF;         // bits 0-13: pitch in pixels
+    u32 dest_height = (copy_dest_pitch_reg >> 16) & 0x3FFF; // bits 16-29: height
+
+    // Parse RB_COPY_DEST_INFO
+    u32 copy_dest_info = registers[RB_COPY_DEST_INFO];
+    // bits 0-5: destination format (SurfaceFormat)
+    // bit 8: dest endian swap
+
+    if (dest_address == 0 || dest_pitch == 0) {
+        LOGD("Resolve: invalid dest (addr=%08X, pitch=%u)", dest_address, dest_pitch);
+        return;
+    }
+
+    if (copy_command == 2) {
+        // Clear command
+        if (copy_src_select < MAX_COLOR_TARGETS) {
+            clear_color_target(copy_src_select, 0.0f, 0.0f, 0.0f, 0.0f);
+        } else if (copy_src_select == 4) {
+            clear_depth_stencil(1.0f, 0);
+        }
+        return;
+    }
+
+    // Resolve command
+    u32 width = dest_pitch;
+    u32 height = dest_height > 0 ? dest_height : 720;
+
+    if (copy_src_select < MAX_COLOR_TARGETS) {
+        // Color RT resolve
+        SurfaceFormat fmt = config_.color_format[copy_src_select];
+        u32 bpp = get_format_bytes_per_pixel(fmt);
+        u32 dest_row_bytes = dest_pitch * bpp;
+
+        // First resolve via eDRAM if available
+        if (edram_) {
+            RenderTargetConfig rt_cfg = edram_->get_render_target(copy_src_select);
+            if (rt_cfg.enabled) {
+                rt_cfg.resolve_address = dest_address;
+                rt_cfg.resolve_pitch = dest_row_bytes;
+                rt_cfg.resolve_width = width;
+                rt_cfg.resolve_height = height;
+                edram_->set_render_target(copy_src_select, rt_cfg);
+                edram_->resolve_render_target(copy_src_select, memory_);
+                LOGI("eDRAM resolve RT%u → %08X (%ux%u, bpp=%u)",
+                     copy_src_select, dest_address, width, height, bpp);
+                return;
+            }
+        }
+
+        // Fallback: Vulkan RT resolve via staging buffer
+        resolve_to_memory(copy_src_select, dest_address, dest_row_bytes, width, height);
+        LOGI("Vulkan resolve RT%u → %08X (%ux%u)", copy_src_select, dest_address, width, height);
+
+    } else if (copy_src_select == 4) {
+        // Depth buffer resolve
+        if (edram_) {
+            edram_->resolve_depth_stencil(memory_);
+        }
+        LOGD("Depth resolve → %08X", dest_address);
+    }
+}
+
+void RenderTargetManager::copy_buffer_to_image(const VulkanRenderTarget& rt,
+                                                VkBuffer src, u64 offset) {
+    VkCommandBuffer cmd = vulkan_->current_command_buffer();
+
+    // Transition image to transfer destination
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = rt.image;
+    barrier.subresourceRange.aspectMask = rt.is_depth ?
+        VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    // Copy buffer to image
+    VkBufferImageCopy region{};
+    region.bufferOffset = offset;
+    region.bufferRowLength = 0;  // Tightly packed
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = rt.is_depth ?
+        VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {rt.width, rt.height, 1};
+
+    vkCmdCopyBufferToImage(cmd, src, rt.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &region);
+
+    // Transition to attachment layout
+    VkImageLayout final_layout = rt.is_depth ?
+        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL :
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAccessFlags final_access = rt.is_depth ?
+        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT :
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    VkPipelineStageFlags final_stage = rt.is_depth ?
+        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT :
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = final_layout;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = final_access;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        final_stage,
         0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
