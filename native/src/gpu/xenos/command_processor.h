@@ -359,6 +359,11 @@ private:
     size_t direct_buffer_size_ = 0;
     size_t direct_buffer_pos_ = 0;
 
+    // Active packet stream context for wrapped ring-buffer payload reads.
+    // Non-zero only while executing a packet sourced from a circular ring.
+    GuestAddr stream_base_ = 0;
+    u32 stream_size_bytes_ = 0;
+
     // Indirect buffer recursion guard
     u32 ib_depth_ = 0;
     static constexpr u32 kMaxIBDepth = 4;
@@ -404,7 +409,10 @@ private:
     ShaderMicrocodeSlot pending_shader_;
     
     // Packet processing
-    u32 execute_packet(GuestAddr addr, u32& packets_consumed);
+    // stream_base/stream_size_bytes are optional ring-stream context used to
+    // wrap packet payload reads when a packet straddles the end of the ring.
+    u32 execute_packet(GuestAddr addr, u32& packets_consumed,
+                       GuestAddr stream_base = 0, u32 stream_size_bytes = 0);
     u32 execute_packet_direct(const u32* packet, u32& packets_consumed);
     void execute_type0(u32 header, GuestAddr data_addr);
     void execute_type0_direct(u32 header, const u32* data);

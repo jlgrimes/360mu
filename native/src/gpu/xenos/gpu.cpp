@@ -91,7 +91,11 @@ Status Gpu::initialize(Memory* memory, const GpuConfig& config) {
 
     // Create command processor
     command_processor_ = std::make_unique<CommandProcessor>();
-    
+    if (!command_processor_ || command_processor_->initialize(memory_, nullptr, nullptr, nullptr) != Status::Ok) {
+        LOGE("Failed to initialize headless command processor");
+        return Status::ErrorInit;
+    }
+
     // Initialize ring buffer state to 0 (game will configure it)
     ring_buffer_base_.store(0, std::memory_order_relaxed);
     ring_buffer_size_.store(0, std::memory_order_relaxed);
@@ -210,6 +214,9 @@ void Gpu::set_surface(void* native_window) {
 
         if (command_processor_) {
             command_processor_->shutdown();
+            if (memory_ && command_processor_->initialize(memory_, nullptr, nullptr, nullptr) != Status::Ok) {
+                LOGE("Failed to reinitialize headless command processor after surface loss");
+            }
         }
         if (render_target_manager_) {
             render_target_manager_->shutdown();

@@ -222,13 +222,26 @@ void CommandProcessor::shutdown() {
     current_vertex_shader_ = nullptr;
     current_pixel_shader_ = nullptr;
     current_pipeline_ = VK_NULL_HANDLE;
+    stream_base_ = 0;
+    stream_size_bytes_ = 0;
 }
 
 u32 CommandProcessor::read_cmd(GuestAddr addr) {
-    if (memory_) {
-        return memory_->read_u32(addr);
+    if (!memory_) {
+        return 0;
     }
-    return 0;
+
+    // If currently parsing a circular ring stream, wrap packet payload reads
+    // that cross the ring end back to the beginning.
+    if (stream_size_bytes_ != 0 && addr >= stream_base_) {
+        u64 byte_offset = static_cast<u64>(addr - stream_base_);
+        if (byte_offset >= stream_size_bytes_) {
+            byte_offset %= stream_size_bytes_;
+            addr = stream_base_ + static_cast<GuestAddr>(byte_offset);
+        }
+    }
+
+    return memory_->read_u32(addr);
 }
 
 void CommandProcessor::reset() {
@@ -254,6 +267,8 @@ void CommandProcessor::reset() {
     direct_buffer_ = nullptr;
     direct_buffer_size_ = 0;
     direct_buffer_pos_ = 0;
+    stream_base_ = 0;
+    stream_size_bytes_ = 0;
 
     ib_depth_ = 0;
     scratch_ram_.fill(0);
@@ -277,30 +292,42 @@ void CommandProcessor::write_register(u32 index, u32 value) {
 
 bool CommandProcessor::process(GuestAddr ring_base, u32 ring_size, u32& read_ptr, u32 write_ptr) {
     frame_complete_ = false;
-    
+
+    // Ring size from CP_RB_CNTL is in bytes, while read/write pointers are in dwords.
+    // Convert once so pointer wrap math stays in pointer units.
+    const u32 ring_size_dwords = ring_size / sizeof(u32);
+    if (ring_size_dwords == 0) {
+        LOGE("Invalid ring size (bytes=%u)", ring_size);
+        return false;
+    }
+
+    // Hardware pointers should already be in-range, but normalize defensively.
+    read_ptr %= ring_size_dwords;
+    write_ptr %= ring_size_dwords;
+
     // Process packets until read catches up to write
     while (read_ptr != write_ptr) {
         // Calculate address in ring buffer (ring buffer wraps)
-        GuestAddr packet_addr = ring_base + (read_ptr * 4);
-        
+        GuestAddr packet_addr = ring_base + (read_ptr * sizeof(u32));
+
         // Execute packet and get number of dwords consumed
         u32 packets_consumed = 0;
-        execute_packet(packet_addr, packets_consumed);
-        
+        execute_packet(packet_addr, packets_consumed, ring_base, ring_size);
+
         if (packets_consumed == 0) {
             LOGE("Packet processing stalled at %08X", packet_addr);
             packets_consumed = 1;  // Skip to prevent infinite loop
         }
-        
-        // Advance read pointer (with wrap)
-        read_ptr = (read_ptr + packets_consumed) % ring_size;
+
+        // Advance read pointer (with wrap in dword units)
+        read_ptr = (read_ptr + packets_consumed) % ring_size_dwords;
         packets_processed_++;
-        
+
         if (frame_complete_) {
             break;
         }
     }
-    
+
     return frame_complete_;
 }
 
@@ -480,8 +507,7 @@ void CommandProcessor::execute_type3_direct(u32 header, const u32* data) {
 
         case PM4Opcode::SURFACE_SYNC:
         case PM4Opcode::ME_INIT:
-        case PM4Opcode::CP_INVALIDATE_STATE:
-        case PM4Opcode::INVALIDATE_STATE:
+        case PM4Opcode::CP_INVALIDATE_STATE:  // INVALIDATE_STATE is an enum alias
         case PM4Opcode::CONTEXT_UPDATE:
             break;
 
@@ -572,38 +598,49 @@ void CommandProcessor::process_type0_write(u32 base_reg, const u32* data, u32 co
     }
 }
 
-u32 CommandProcessor::execute_packet(GuestAddr addr, u32& packets_consumed) {
+u32 CommandProcessor::execute_packet(GuestAddr addr, u32& packets_consumed,
+                                   GuestAddr stream_base, u32 stream_size_bytes) {
+    // Preserve outer context (nested execution can happen via INDIRECT_BUFFER).
+    const GuestAddr prev_stream_base = stream_base_;
+    const u32 prev_stream_size_bytes = stream_size_bytes_;
+    stream_base_ = stream_base;
+    stream_size_bytes_ = stream_size_bytes;
+
     u32 header = read_cmd(addr);
     PacketType type = get_packet_type(header);
-    
+
     switch (type) {
         case PacketType::Type0:
             execute_type0(header, addr + 4);
             packets_consumed = 1 + type0_count(header);
             break;
-            
+
         case PacketType::Type1:
             // Reserved - shouldn't encounter
             LOGE("Type 1 packet encountered (reserved)");
             packets_consumed = 1;
             break;
-            
+
         case PacketType::Type2:
             execute_type2(header);
             packets_consumed = 1;
             break;
-            
+
         case PacketType::Type3:
             execute_type3(header, addr + 4);
             packets_consumed = 1 + type3_count(header);
             break;
-            
+
         default:
             LOGE("Unknown packet type %d", static_cast<int>(type));
             packets_consumed = 1;
             break;
     }
-    
+
+    // Restore previous stream context.
+    stream_base_ = prev_stream_base;
+    stream_size_bytes_ = prev_stream_size_bytes;
+
     return packets_consumed;
 }
 
@@ -744,8 +781,7 @@ void CommandProcessor::execute_type3(u32 header, GuestAddr data_addr) {
             LOGD("ME_INIT");
             break;
 
-        case PM4Opcode::CP_INVALIDATE_STATE:
-        case PM4Opcode::INVALIDATE_STATE:
+        case PM4Opcode::CP_INVALIDATE_STATE:  // INVALIDATE_STATE is an enum alias
             LOGD("INVALIDATE_STATE");
             break;
 
@@ -1173,7 +1209,7 @@ void CommandProcessor::handle_event_write(GuestAddr data_addr, u32 count) {
         case EVENT_CACHE_FLUSH_TS:
         case EVENT_CACHE_FLUSH_AND_INV:
             if (texture_cache_) {
-                texture_cache_->invalidate_all();
+                texture_cache_->clear();
             }
             LOGD("Cache flush event (type=%u)", event_type);
             break;
@@ -2041,9 +2077,9 @@ bool CommandProcessor::prepare_shaders() {
     }
 
     GPU_TRACE_SHADER(vs_addr, ShaderType::Vertex, current_vertex_shader_->hash, true, false,
-                     current_vertex_shader_->spirv_size / 4);
+                     static_cast<u32>(current_vertex_shader_->spirv.size()));
     GPU_TRACE_SHADER(ps_addr, ShaderType::Pixel, current_pixel_shader_->hash, true, false,
-                     current_pixel_shader_->spirv_size / 4);
+                     static_cast<u32>(current_pixel_shader_->spirv.size()));
     LOGD("Using game shaders (vs=%08x, ps=%08x)", vs_addr, ps_addr);
     return true;
 }

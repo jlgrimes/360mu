@@ -451,6 +451,20 @@ protected:
         gpu_->shutdown();
         memory_->shutdown();
     }
+
+    void WriteSingleType0Packet(GuestAddr ring_base, u32 reg, u32 value) {
+        memory_->write_u32(ring_base + 0, (0u << 30) | (0u << 16) | reg);
+        memory_->write_u32(ring_base + 4, value);
+    }
+
+    void ConfigureAndProcessRing(GuestAddr ring_base, GuestAddr readback_addr, u32 wptr_dwords) {
+        gpu_->write_register(xenos_reg::CP_RB_BASE, ring_base);
+        gpu_->write_register(xenos_reg::CP_RB_CNTL, 3);  // 16-byte ring buffer
+        gpu_->write_register(xenos_reg::CP_RB_RPTR_ADDR, readback_addr);
+        gpu_->write_register(xenos_reg::CP_RB_RPTR, 0);
+        gpu_->write_register(xenos_reg::CP_RB_WPTR, wptr_dwords);
+        gpu_->process_commands();
+    }
 };
 
 TEST_F(GpuIntegrationTest, Initialize_RegistersReady) {
@@ -517,6 +531,39 @@ TEST_F(GpuIntegrationTest, ProcessCommands_NoRingBuffer) {
     gpu_->process_commands();
     // No frames should have completed
     EXPECT_FALSE(gpu_->frame_complete());
+}
+
+TEST_F(GpuIntegrationTest, ProcessCommands_HeadlessParsesRingBuffer) {
+    static constexpr GuestAddr kRingBase = 0x00800000;
+    static constexpr GuestAddr kReadbackAddr = 0x00801000;
+    static constexpr u32 kColorInfoValue = 0x00ABCDEF;
+
+    WriteSingleType0Packet(kRingBase, xenos_reg::RB_COLOR_INFO, kColorInfoValue);
+    memory_->write_u32(kReadbackAddr, 0);
+
+    ConfigureAndProcessRing(kRingBase, kReadbackAddr, 2);  // header + 1 data dword
+
+    EXPECT_EQ(gpu_->read_register(xenos_reg::RB_COLOR_INFO), kColorInfoValue);
+    EXPECT_EQ(memory_->read_u32(kReadbackAddr), 2u);
+}
+
+TEST_F(GpuIntegrationTest, ProcessCommands_AfterSurfaceLoss_StillParsesRingBuffer) {
+    static constexpr GuestAddr kRingBase = 0x00802000;
+    static constexpr GuestAddr kReadbackAddr = 0x00803000;
+    static constexpr u32 kColorInfoValue = 0x00123456;
+
+    // Simulate Android surface teardown (app background / rotation).
+    // Regression: this used to shut down command_processor_ without reinitializing
+    // it for headless mode, so ring packets stopped being consumed.
+    gpu_->set_surface(nullptr);
+
+    WriteSingleType0Packet(kRingBase, xenos_reg::RB_COLOR_INFO, kColorInfoValue);
+    memory_->write_u32(kReadbackAddr, 0);
+
+    ConfigureAndProcessRing(kRingBase, kReadbackAddr, 2);
+
+    EXPECT_EQ(gpu_->read_register(xenos_reg::RB_COLOR_INFO), kColorInfoValue);
+    EXPECT_EQ(memory_->read_u32(kReadbackAddr), 2u);
 }
 
 // ============================================================================
@@ -591,6 +638,25 @@ TEST_F(RenderPipelineTest, MultiDraw_TwoTriangles) {
     // Surface info should be set
     EXPECT_EQ(cp_->get_register(xenos_reg::RB_SURFACE_INFO), 1280u);
     EXPECT_GT(cp_->packets_processed(), 3u);
+}
+
+TEST_F(RenderPipelineTest, RingPointersWrapByDwordsNotBytes) {
+    // 4-dword ring. Header is at the final dword, payload wraps to dword 0.
+    constexpr u32 kRingSizeBytes = 16;
+    constexpr u32 kStartReadPtr = 3;
+    constexpr u32 kWritePtr = 1;
+    constexpr u32 kColorInfo = 0xDEADBEEF;
+
+    memory_->write_u32(CMD_BASE + (kStartReadPtr * 4), pm4_type0(xenos_reg::RB_COLOR_INFO, 1));
+    memory_->write_u32(CMD_BASE + 0, kColorInfo);
+
+    u32 rp = kStartReadPtr;
+    bool frame_done = cp_->process(CMD_BASE, kRingSizeBytes, rp, kWritePtr);
+
+    EXPECT_FALSE(frame_done);
+    EXPECT_EQ(cp_->get_register(xenos_reg::RB_COLOR_INFO), kColorInfo);
+    EXPECT_EQ(rp, kWritePtr);
+    EXPECT_EQ(cp_->packets_processed(), 1u);
 }
 
 // ============================================================================
